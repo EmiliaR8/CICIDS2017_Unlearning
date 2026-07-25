@@ -1,0 +1,149 @@
+{
+  "config": {
+    "DATASET_PATH": "./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset.pkl",
+    "LABEL_COLUMN": "label_binary",
+    "NUM_TASKS": 10,
+    "TASK0_ROW_FRACTION": 0.35,
+    "DIAG_AGENT_ID": 0,
+    "REQUIRE_EVASION_SUCCESS": true,
+    "REFERENCE_TRAIN_EPOCHS": 5,
+    "BATCH_SIZE": 256,
+    "FEATURE_CLIP": 10.0,
+    "KL_HIST_BINS": 50,
+    "SEED": 42,
+    "INPUT_DIM": 1530,
+    "NUM_CLASSES": 2
+  },
+  "results": {
+    "clean": {
+      "1": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.8454051453561616,
+        "grad_cosine_reference_point": 0.9047154024119712,
+        "kl_divergence": 0.0271813108662277,
+        "wasserstein_distance": 0.030202817326414964
+      },
+      "2": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.7064763595861804,
+        "grad_cosine_reference_point": 0.6908917558546293,
+        "kl_divergence": 0.11824816802543543,
+        "wasserstein_distance": 0.20784870662011853
+      },
+      "3": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.6368413821016126,
+        "grad_cosine_reference_point": 0.8857511233613236,
+        "kl_divergence": 0.03789752000674662,
+        "wasserstein_distance": 0.08798196278356823
+      },
+      "4": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.6756323707313056,
+        "grad_cosine_reference_point": 0.6997132882553726,
+        "kl_divergence": 0.11722828455705818,
+        "wasserstein_distance": 0.21897550468170693
+      },
+      "5": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": -0.129213540163725,
+        "grad_cosine_reference_point": 0.5839915211427934,
+        "kl_divergence": 0.18696125189209667,
+        "wasserstein_distance": 0.5318898462265479
+      },
+      "6": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.6343869949952156,
+        "grad_cosine_reference_point": 0.758217105278102,
+        "kl_divergence": 0.08762380078574829,
+        "wasserstein_distance": 0.3117646922317099
+      },
+      "7": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.6112868541168421,
+        "grad_cosine_reference_point": 0.7496649702978715,
+        "kl_divergence": 0.09208823472273675,
+        "wasserstein_distance": 0.17012061571629475
+      },
+      "8": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.44125730015195397,
+        "grad_cosine_reference_point": 0.8050172403731125,
+        "kl_divergence": 0.06031072239503615,
+        "wasserstein_distance": 0.08354670837200404
+      },
+      "9": {
+        "n_samples": 1955,
+        "grad_cosine_no_reference_fix": -0.6226765566169116,
+        "grad_cosine_reference_point": 0.7128938135201507,
+        "kl_divergence": 0.06982082394203094,
+        "wasserstein_distance": 0.05787786490316603
+      }
+    },
+    "perturbed": {
+      "1": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.8969546167629587,
+        "grad_cosine_reference_point": 0.9702598922933081,
+        "kl_divergence": 0.028789858119622227,
+        "wasserstein_distance": 0.035183177242888344
+      },
+      "2": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.019674969537004507,
+        "grad_cosine_reference_point": 0.7564565256306218,
+        "kl_divergence": 0.15623992681554671,
+        "wasserstein_distance": 0.22853384427374632
+      },
+      "3": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.5603305288495412,
+        "grad_cosine_reference_point": 0.9476589169879026,
+        "kl_divergence": 0.04441808930050088,
+        "wasserstein_distance": 0.0936778140990227
+      },
+      "4": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.0015708747099058733,
+        "grad_cosine_reference_point": 0.7504341320258033,
+        "kl_divergence": 0.16345573691342197,
+        "wasserstein_distance": 0.23977408636650735
+      },
+      "5": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.05090945377460237,
+        "grad_cosine_reference_point": 0.5115140541597746,
+        "kl_divergence": 0.20398325424609814,
+        "wasserstein_distance": 0.5351127100845259
+      },
+      "6": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.46111743180433573,
+        "grad_cosine_reference_point": 0.8005459681731948,
+        "kl_divergence": 0.09142014292938648,
+        "wasserstein_distance": 0.30309241911101836
+      },
+      "7": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.06956844788332336,
+        "grad_cosine_reference_point": 0.8320278683578656,
+        "kl_divergence": 0.11945099398163161,
+        "wasserstein_distance": 0.1849400713185931
+      },
+      "8": {
+        "n_samples": 1953,
+        "grad_cosine_no_reference_fix": 0.3019482423310191,
+        "grad_cosine_reference_point": 0.8476289402524134,
+        "kl_divergence": 0.09662788359795058,
+        "wasserstein_distance": 0.11436928775202888
+      },
+      "9": {
+        "n_samples": 1955,
+        "grad_cosine_no_reference_fix": 0.1280541908148282,
+        "grad_cosine_reference_point": 0.7157078128133171,
+        "kl_divergence": 0.15688781912951516,
+        "wasserstein_distance": 0.11553631165905533
+      }
+    }
+  }
+}

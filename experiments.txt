@@ -1,0 +1,54 @@
+Experimentname      Notes                                                                       Result Notes: 
+0722_650            Baseline Naive, with 0.8 perts, mixed                                       
+0722_655            Baseline Naive, with 0.0 perts,                         
+0722_800            Baseline Naive, with 0.8 perts, uniform                                     
+0722_830            Baseline Naive, with 0.8 perts, mixed, task 0 pert//Compare against 650     
+0724_100            Baseline Naive, with 0.8 perts, mixed, 6 tasks
+
+0722_700            Baseline Joint, with 0.8 perts, uniform
+0722_730            Baseline Joint, with 0.0 perts
+0722_735            Baseline Joint, with 0.8 perts, mixed 
+0723_250            Baseline Joint, with 0.8 perts, mixed, Task 0 pert // compare to 735
+0724_000            Baseline Joint, with 0.8 perts, 
+
+*Uniform v mixed does give different results, for more diversity between tasks, keep mixed
+*Task 0 clean v dirty is inconclusive, will check after MADAR
+
+All these only have six tasks lmao vv
+0723_315            Baseline MADAR, with 0.8 perts, uniform
+0723_330            Baseline MADAR, with 0.8 perts, mixed
+0723_350            Baseline MADAR, with 0.8 perts, mixed, Task 0 pert // compare to 315
+0723_400            Baseline MADAR, with 0.0 perts, 
+
+
+*MADAR Uniform v mixed gives similar accuracy trend, should retest
+*MADAR confirms that task 0 clean gives the model more time to adjust to pertrubations
+
+*Not much space to be better, might need to create stronger perturbations
+
+*Because the pertrubations are linear per agent, there is not retraining or redirection after classifier is retrained, the performance of the pertrubations are not as dramatic as previous papers. this makes sense and is noticable in the results
+Going to test what happens if we give only n tasks for n agents in the next batch of data
+
+0723_700            MADAR + Unlearning, 0.0 perts, 
+0723_705            MADAR + Unlearning, 0.8 perts, uniform
+0723_710            MADAR + Unlearning, 0.8 perts, mixed
+0723_730            MADAR + Unlearning, 0.8 perts, mixed, Task 0 pert 
+0724_930            MADAR + Unlearning, 0.8 perts, mixed, 6 tasks
+
+***As a backup, we might do kl divergence 
+
+REQUIRE_EVASION_SUCCESS check how much this affects 
+check how much it affects if we lower the number of tasks to = number of agents
+
+FILE NOTES:
+ON MY SERVER  ./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset.pkl has the dummy data from Tuesday.csv
+ON MY SERVER ./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset2.pkl has the smoketest of the bigdata
+
+
+
+SMokeTEST975 Experiments 
+0725_pert2        MADAR + Unlearning, 0.8 perts, mixed, 6 tasks//comparable to 0724_930 
+0725_pert2        Baseline MADAR, with 0.8 perts, mixed 6 tasks//comparable to 0723_330 
+0725_pert2        Baseline Naive, with 0.8 perts, mixed 6 tasks//comparable to 0722_650   
+
+

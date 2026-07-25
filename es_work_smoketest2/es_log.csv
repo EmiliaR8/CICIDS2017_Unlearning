@@ -1,0 +1,4 @@
+generation,window_start,theta_reward,pop_mean,pop_max,sigma,lr
+generation,window_start,theta_reward,pop_mean,pop_max,sigma,lr
+0,0,97.0305,97.0305,97.0305,0.1,0.05
+1,8250,98.8111,98.8111,98.8111,0.1,0.05
