@@ -105,8 +105,11 @@ def encode_labels(df: pd.DataFrame, label_column: str):
 
 
 def assign_task_windows(df: pd.DataFrame, num_tasks: int, task0_fraction: float) -> pd.DataFrame:
+    """Sorted by TIMESTAMP (true chronological order) -- source_row_id/orig_row_id are
+    per-day counters that reset to 0 for each source_range, so sorting by them directly
+    would interleave rows from different days by coincidence of row number instead of time."""
     originals = df[df["row_type"] == "original"].copy()
-    originals = originals.sort_values("source_row_id").reset_index(drop=True)
+    originals = originals.sort_values("timestamp").reset_index(drop=True)
     n = len(originals)
     n_task0 = int(round(n * task0_fraction))
     n_task0 = max(1, min(n_task0, n - (num_tasks - 1)))
@@ -125,9 +128,13 @@ def assign_task_windows(df: pd.DataFrame, num_tasks: int, task0_fraction: float)
 
 
 def assign_perturbed_task_ids(df: pd.DataFrame, originals_with_task: pd.DataFrame) -> pd.DataFrame:
-    task_lookup = originals_with_task.set_index("orig_row_id")["task_id"]
+    """orig_row_id/source_row_id are only unique WITHIN one day's source file (they reset to
+    0 per source_range), so a multi-day dataset needs (source_range, row_id) as the join
+    key -- row_id alone collides across days."""
+    task_lookup = originals_with_task.set_index(["source_range", "orig_row_id"])["task_id"]
     perturbed = df[df["row_type"] == "perturbed"].copy()
-    perturbed["task_id"] = perturbed["source_row_id"].map(task_lookup)
+    keys = pd.MultiIndex.from_arrays([perturbed["source_range"], perturbed["source_row_id"]])
+    perturbed["task_id"] = task_lookup.reindex(keys).to_numpy()
     perturbed = perturbed.dropna(subset=["task_id"]).copy()
     perturbed["task_id"] = perturbed["task_id"].astype(int)
     return perturbed
@@ -135,7 +142,12 @@ def assign_perturbed_task_ids(df: pd.DataFrame, originals_with_task: pd.DataFram
 
 def build_task_subset(originals_with_task, perturbed_with_task, task_id, mode, agent_id, require_evasion_success):
     """mode='clean' -> benign + malicious_clean only. mode='perturbed' -> benign + malicious
-    replaced by agent_id's perturbed version (falls back to clean if no valid substitute)."""
+    replaced by agent_id's perturbed version (falls back to clean if no valid substitute).
+
+    Identity here keys on (source_range, row_id), not the bare row id: orig_row_id/
+    source_row_id reset per source_range (day), and a single task CAN span more than one
+    day's rows, so a bare-id match risks pairing a Tuesday original with a Wednesday
+    perturbation that happens to share the same in-day row number."""
     subset = originals_with_task[originals_with_task["task_id"] == task_id]
     if mode == "clean":
         return subset
@@ -149,10 +161,14 @@ def build_task_subset(originals_with_task, perturbed_with_task, task_id, mode, a
     if require_evasion_success:
         pert_pool = pert_pool[pert_pool["evasion_success"] == True]  # noqa: E712
 
-    eligible_ids = set(pert_pool["source_row_id"].tolist())
-    eligible_mal = malicious[malicious["orig_row_id"].isin(eligible_ids)]
-    fallback_mal = malicious[~malicious["orig_row_id"].isin(eligible_ids)]
-    substituted = pert_pool[pert_pool["source_row_id"].isin(eligible_mal["orig_row_id"])]
+    eligible_ids = set(zip(pert_pool["source_range"], pert_pool["source_row_id"]))
+    mal_keys = pd.Series(list(zip(malicious["source_range"], malicious["orig_row_id"])), index=malicious.index)
+    eligible_mal = malicious[mal_keys.isin(eligible_ids)]
+    fallback_mal = malicious[~mal_keys.isin(eligible_ids)]
+
+    elig_mal_ids = set(zip(eligible_mal["source_range"], eligible_mal["orig_row_id"]))
+    pert_keys = pd.Series(list(zip(pert_pool["source_range"], pert_pool["source_row_id"])), index=pert_pool.index)
+    substituted = pert_pool[pert_keys.isin(elig_mal_ids)]
 
     return pd.concat([benign, fallback_mal, substituted], ignore_index=True)
 
