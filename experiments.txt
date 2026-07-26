@@ -49,6 +49,14 @@ ON MY SERVER ./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset2.p
 SMokeTEST975 Experiments 
 0725_pert2        MADAR + Unlearning, 0.8 perts, mixed, 6 tasks//comparable to 0724_930 
 0725_pert2        Baseline MADAR, with 0.8 perts, mixed 6 tasks//comparable to 0723_330 
-0725_pert2        Baseline Naive, with 0.8 perts, mixed 6 tasks//comparable to 0722_650   
+0725_pert2        Baseline Naive, with 0.8 perts, mixed 6 tasks//comparable to 0722_650  
+
+**experiments after fixing MADAR buffer bug
+0725_pert22       MADAR + Unlearning, 0.8 perts, mixed, 6 tasks//comparable to 0724_930 
+0725_pert22        Baseline MADAR, with 0.8 perts, mixed 6 tasks//comparable to 0723_330 
+0725_pert22        Baseline Naive, with 0.8 perts, mixed 6 tasks//comparable to 0722_650  
+0725_pert23       MADAR + Unlearning, 0.8 perts, mixed, 6 tasks, Task 0 pert
+0725_pert23        Baseline Naive, with 0.8 perts, mixed 6 tasks, Task 0 pert 
 
 
+SmokeTest4500 Experiments

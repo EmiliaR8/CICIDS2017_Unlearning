@@ -90,7 +90,7 @@ CL_ITERS = 2000                # tasks 1+ mix current-task and replay-buffer bat
                                 # used instead of "epochs over the current task's own loader"
 BATCH_SIZE = 256
 
-MEM_SIZE = 5000                # total replay buffer budget, split across label groups
+MEM_SIZE = 1000                # total replay buffer budget, split across label groups
 MADAR_CONTAMINATION = 0.1      # only shifts IsolationForest's decision threshold; selection
                                 # is purely rank-based on decision_function scores, so this
                                 # does not affect which samples get chosen (kept for API compat)

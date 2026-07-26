@@ -81,7 +81,7 @@ DEVICE = torch.device(TRAIN_DEVICE)
 # ==========================================
 #       HYPERPARAMETERS & CONFIGURATION
 # ==========================================
-DATASET_PATH = "./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset2.pkl"
+DATASET_PATH = "./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset_4500.pkl"
 
 # Which column the model is trained/evaluated against. Binary today; point this at
 # e.g. "attack_family" once that data exists -- num_classes and the active-class mask

@@ -43,7 +43,7 @@ import numpy as np
 import nn1_scorer
 
 parser = argparse.ArgumentParser(description="ES meta-training for NN-1 forget-set selection (CICIDS)")
-parser.add_argument('--dataset_path', type=str, default="./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset.pkl")
+parser.add_argument('--dataset_path', type=str, default="./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset2.pkl")
 parser.add_argument('--workers', type=int, default=4, help='Max CICIDS inner-loop subprocesses running at once')
 parser.add_argument('--pop', type=int, default=8, help='Population size (must be even; mirrored pairs)')
 parser.add_argument('--generations', type=int, default=10)

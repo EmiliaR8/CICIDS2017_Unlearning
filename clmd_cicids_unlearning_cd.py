@@ -122,7 +122,7 @@ TASK0_ROW_FRACTION = 0.35
 TASK_TEST_FRAC = 0.20
 
 # --- Poisoning scenario ---
-TASK0_CLEAN_ONLY = True     # FIXME 
+TASK0_CLEAN_ONLY = False     # FIXME 
 AGENT_MODE = "mixed"      # FIXME 
 FIXED_AGENT_ID = 0
 REQUIRE_EVASION_SUCCESS = True
