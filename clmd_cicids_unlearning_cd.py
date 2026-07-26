@@ -103,7 +103,7 @@ TASK0_EPOCHS = 30
 CL_ITERS = 2000
 BATCH_SIZE = 256
 
-MEM_SIZE = 50
+MEM_SIZE = 20
 MADAR_CONTAMINATION = 0.1      # rank-based selection; this only shifts IsolationForest's
                                 # internal threshold, not which samples get chosen
 
