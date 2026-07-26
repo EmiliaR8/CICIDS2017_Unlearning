@@ -1,5 +1,5 @@
 """
-Run with python clmd_cicids_unlearning_cd.py --seed 42 --log_name <>
+Run with python clmd_cicids_unlearning_cd.py --seed 42 --log_name 0725_0.6_perturbed
 Continual Learning Experiment (CICIDS MADAR + Targeted Unlearning)
 
 Builds directly on clmd_cicids_madar_cd.py -- identical data construction, evaluation
@@ -95,7 +95,7 @@ DEVICE = torch.device(TRAIN_DEVICE)
 # ==========================================
 #       HYPERPARAMETERS & CONFIGURATION
 # ==========================================
-DATASET_PATH = "./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset2.pkl"
+DATASET_PATH = "./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset_4500.pkl"
 LABEL_COLUMN = "label_binary"
 
 FEATURE_CLIP = 10.0
@@ -103,7 +103,7 @@ TASK0_EPOCHS = 30
 CL_ITERS = 2000
 BATCH_SIZE = 256
 
-MEM_SIZE = 20
+MEM_SIZE = 800
 MADAR_CONTAMINATION = 0.1      # rank-based selection; this only shifts IsolationForest's
                                 # internal threshold, not which samples get chosen
 
@@ -126,7 +126,7 @@ TASK0_CLEAN_ONLY = True     # FIXME
 AGENT_MODE = "mixed"      # FIXME 
 FIXED_AGENT_ID = 0
 REQUIRE_EVASION_SUCCESS = True
-POISON_FRACTION = 0.8          # 0.0 always means "never poison", regardless of diversity flag
+POISON_FRACTION = 0.6          # 0.0 always means "never poison", regardless of diversity flag
 
 # --- Category diversity floor ---
 ENSURE_CATEGORY_DIVERSITY = True

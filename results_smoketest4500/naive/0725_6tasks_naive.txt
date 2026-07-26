@@ -1,0 +1,47 @@
+Task 1: agent=0 | train poisoned=484 clean=139 | test poisoned=123 clean=33
+Task 2: agent=1 | train poisoned=2304 clean=576 | test poisoned=576 clean=144
+Task 3: agent=2 | train poisoned=77 clean=19 | test poisoned=20 clean=5
+Task 4: agent=3 | train poisoned=533 clean=133 | test poisoned=134 clean=33
+Task 5: agent=0 | train poisoned=2326 clean=607 | test poisoned=585 clean=149
+
+=== Training Task 0 | train_samples=9449 | active_count=2 ===
+    [Eval Task 0] acc=95.30%  n=2363
+  -> Mean-per-task acc: 95.30%  | Pooled acc: 95.30%
+
+=== Training Task 1 | train_samples=3509 | active_count=2 ===
+    [Eval Task 0] acc=71.98%  n=2363
+    [Eval Task 1] acc=87.02%  n=878
+  -> Mean-per-task acc: 79.50%  | Pooled acc: 76.06%
+
+=== Training Task 2 | train_samples=3509 | active_count=2 ===
+    [Eval Task 0] acc=64.83%  n=2363
+    [Eval Task 1] acc=97.38%  n=878
+    [Eval Task 2] acc=88.61%  n=878
+  -> Mean-per-task acc: 83.61%  | Pooled acc: 76.84%
+
+=== Training Task 3 | train_samples=3508 | active_count=2 ===
+    [Eval Task 0] acc=45.11%  n=2363
+    [Eval Task 1] acc=61.28%  n=878
+    [Eval Task 2] acc=13.33%  n=878
+    [Eval Task 3] acc=77.82%  n=879
+  -> Mean-per-task acc: 49.38%  | Pooled acc: 48.12%
+
+=== Training Task 4 | train_samples=3509 | active_count=2 ===
+    [Eval Task 0] acc=62.46%  n=2363
+    [Eval Task 1] acc=89.64%  n=878
+    [Eval Task 2] acc=83.60%  n=878
+    [Eval Task 3] acc=99.20%  n=879
+    [Eval Task 4] acc=99.66%  n=878
+  -> Mean-per-task acc: 86.91%  | Pooled acc: 80.74%
+
+=== Training Task 5 | train_samples=3511 | active_count=2 ===
+    [Eval Task 0] acc=56.62%  n=2363
+    [Eval Task 1] acc=86.22%  n=878
+    [Eval Task 2] acc=47.72%  n=878
+    [Eval Task 3] acc=87.94%  n=879
+    [Eval Task 4] acc=89.18%  n=878
+    [Eval Task 5] acc=97.95%  n=879
+  -> Mean-per-task acc: 77.61%  | Pooled acc: 73.00%
+
+Saved log to 0725_6tasks_naive_Task0Clean_True_mixed.json
+Saved plot to 0725_6tasks_seed42.png

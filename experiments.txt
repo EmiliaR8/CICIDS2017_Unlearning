@@ -46,7 +46,7 @@ ON MY SERVER ./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset2.p
 
 
 
-SMokeTEST975 Experiments 
+***** SMokeTEST975 Experiments ******* 
 0725_pert2        MADAR + Unlearning, 0.8 perts, mixed, 6 tasks//comparable to 0724_930 
 0725_pert2        Baseline MADAR, with 0.8 perts, mixed 6 tasks//comparable to 0723_330 
 0725_pert2        Baseline Naive, with 0.8 perts, mixed 6 tasks//comparable to 0722_650  
@@ -62,15 +62,35 @@ SMokeTEST975 Experiments
 **experiment after MEM_SIZE is fixed 
 0725_pert24      MADAR + Unlearning, 0.8 perts, mixed, 6 tasks, MEM_SIZE = 50
 
-SmokeTest4500 Experiments
 
 
-**Need to fix joint
-**rerun after MEM_SIZE fixe (meta and unlearn)
-**pull claude fixes for new data
+
 
 clean
-python plot_accuracy_comparison.py results_smoketest975/naive/0725_pert22_naive_Task0Clean_True_mixed.json  results_smoketest975/MADAR/0725_pert22_MADAR_Task0Clean_True_mixed.json  results_smoketest975/MADAR+Unlearn/0725_pert22_MadarUNLEARN_Task0Clean_True_mixed_seed42.json
+python plot_accuracy_comparison.py results_smoketest975/naive/0725_pert22_naive_Task0Clean_True_mixed.json  results_smoketest975/MADAR/0725_pert22_MADAR_Task0Clean_True_mixed.json  results_smoketest975/MADAR+Unlearn/0725_pert24_MadarUNLEARN_Task0Clean_True_mixed_seed42.json
 
 dirty
 python plot_accuracy_comparison.py results_smoketest975/naive/0725_pert23_naive_Task0Clean_False_mixed.json  results_smoketest975/MADAR/0725_pert23_MADAR_Task0Clean_False_mixed.json  results_smoketest975/MADAR+Unlearn/0725_pert23_MadarUNLEARN_Task0Clean_False_mixed_seed42.json
+
+
+
+
+
+***** SmokeTest4500 Experiments *******                         RESULT NOTES
+
+0725_6tasks   Naive, Task 0 clean , mixed, 6 tasks     
+0725_10tasks  Naive, Task 0 clean , mixed, 10 tasks 
+0725_6tasks   MADAR, Task 0 clean, mixed , 6 tasks
+0725_6tasks   MADAR+U, Task 0 clean, mixed, 6 tasks
+
+Lowered poison percentage
+0725_0.6_perturbed      Naive,              Task 0 clean, moxed, 6 tasks, 0.6 poison
+0725_0.6_perturbed      MADAR,              Task 0 clean, mixed, 6 tasks, 0.6 poison
+0725_0.6_perturbed      MADAR+Unlearning,   Task 0 clean, mixed, 6 tasks, 0.6 poison
+0725_0.6_perturbed      Joint               Task 0 clean, mixed, 6 tasks, 0.6 poison
+
+
+Tried 
+
+python plot_accuracy_comparison.py results_smoketest4500/naive/0725_0.6_perturbed_naive_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0725_0.6_perturbed_MADAR_Task0Clean_True_mixed.json results_smoketest4500/MADAR_Unlearn/0725_0.6_perturbed_MadarUNLEARN_Task0Clean_True_mixed_seed42.json results_smoketest4500/joint/0725_0.6_perturbed_joint_Task0Clean_True_mixed.json
+

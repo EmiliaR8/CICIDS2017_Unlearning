@@ -1,5 +1,5 @@
 """
-Run with python clmd_cicids_madar_cd.py --seed 42 --log_name 0725_pert2
+Run with python clmd_cicids_madar_cd.py --seed 42 --log_name 0725_0.6_perturbed
 Continual Learning Experiment (CICIDS MADAR: Experience Replay + Knowledge Distillation +
 Synaptic Intelligence)
 
@@ -80,7 +80,7 @@ DEVICE = torch.device(TRAIN_DEVICE)
 # ==========================================
 #       HYPERPARAMETERS & CONFIGURATION
 # ==========================================
-DATASET_PATH = "./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset2.pkl"
+DATASET_PATH = "./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset_4500.pkl"
 LABEL_COLUMN = "label_binary"
 
 FEATURE_CLIP = 10.0
@@ -90,7 +90,7 @@ CL_ITERS = 2000                # tasks 1+ mix current-task and replay-buffer bat
                                 # used instead of "epochs over the current task's own loader"
 BATCH_SIZE = 256
 
-MEM_SIZE = 10                # total replay buffer budget, split across label groups
+MEM_SIZE = 800                # total replay buffer budget, split across label groups
 MADAR_CONTAMINATION = 0.1      # only shifts IsolationForest's decision threshold; selection
                                 # is purely rank-based on decision_function scores, so this
                                 # does not affect which samples get chosen (kept for API compat)
@@ -105,11 +105,11 @@ TASK0_ROW_FRACTION = 0.35
 TASK_TEST_FRAC = 0.20
 
 # --- Poisoning scenario ---
-TASK0_CLEAN_ONLY = False         # FIXME 
+TASK0_CLEAN_ONLY = True         # FIXME 
 AGENT_MODE = "mixed"          # FIXME 
 FIXED_AGENT_ID = 0
 REQUIRE_EVASION_SUCCESS = True
-POISON_FRACTION = 0.8          # 0.0 always means "never poison", regardless of diversity flag
+POISON_FRACTION = 0.6          # 0.0 always means "never poison", regardless of diversity flag
 
 # --- Category diversity floor ---
 ENSURE_CATEGORY_DIVERSITY = True
