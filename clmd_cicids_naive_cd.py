@@ -81,7 +81,7 @@ DEVICE = torch.device(TRAIN_DEVICE)
 # ==========================================
 #       HYPERPARAMETERS & CONFIGURATION
 # ==========================================
-DATASET_PATH = "./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset_4500.pkl"
+DATASET_PATH = "./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset2.pkl"
 
 # Which column the model is trained/evaluated against. Binary today; point this at
 # e.g. "attack_family" once that data exists -- num_classes and the active-class mask
@@ -100,7 +100,7 @@ TASK0_ROW_FRACTION = 0.35      # share of ORIGINAL (benign+clean-malicious) rows
 TASK_TEST_FRAC = 0.20          # each task's own local held-out test subbatch
 
 # --- Poisoning scenario ---
-TASK0_CLEAN_ONLY = True  # FIXME      # task 0 = benign + clean malicious only, zero perturbed rows
+TASK0_CLEAN_ONLY = False  # FIXME      # task 0 = benign + clean malicious only, zero perturbed rows
 AGENT_MODE = "mixed"         # "uniform" -> always FIXED_AGENT_ID; "mixed" -> cycles agents per task
 FIXED_AGENT_ID = 0
 REQUIRE_EVASION_SUCCESS = True # only substitute a perturbed row if it actually evaded the

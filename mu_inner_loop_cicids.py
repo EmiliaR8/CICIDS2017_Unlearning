@@ -78,7 +78,7 @@ parser.add_argument('--n_tasks', type=int, default=6, help='Total tasks includin
 parser.add_argument('--cl_iters', type=int, default=2000)
 parser.add_argument('--unlearn_epochs', type=int, default=3)
 parser.add_argument('--alpha', type=float, default=0.2, help='Weight of the forget loss during unlearning')
-parser.add_argument('--out', type=str, default=None, help='Write reward JSON here')
+parser.add_argument('--out', type=str, default='reward_json.json', help='Write reward JSON here')
 parser.add_argument('--quiet', action='store_true')
 args = parser.parse_args()
 
@@ -102,7 +102,7 @@ FEATURE_CLIP = 10.0
 TASK0_EPOCHS = 30
 BATCH_SIZE = 256
 
-MEM_SIZE = 5000
+MEM_SIZE = 50
 MADAR_CONTAMINATION = 0.1
 
 KD_TEMP = 2.0

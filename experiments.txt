@@ -56,7 +56,21 @@ SMokeTEST975 Experiments
 0725_pert22        Baseline MADAR, with 0.8 perts, mixed 6 tasks//comparable to 0723_330 
 0725_pert22        Baseline Naive, with 0.8 perts, mixed 6 tasks//comparable to 0722_650  
 0725_pert23       MADAR + Unlearning, 0.8 perts, mixed, 6 tasks, Task 0 pert
-0725_pert23        Baseline Naive, with 0.8 perts, mixed 6 tasks, Task 0 pert 
+0725_pert23        Baseline Naive, with 0.8 perts, mixed 6 tasks, Task 0 pert
+0725_pert23        Baseline Naive, with 0.8 perts, mixed 6 tasks, Task 0 pert
 
+**experiment after MEM_SIZE is fixed 
+0725_pert24      MADAR + Unlearning, 0.8 perts, mixed, 6 tasks, MEM_SIZE = 50
 
 SmokeTest4500 Experiments
+
+
+**Need to fix joint
+**rerun after MEM_SIZE fixe (meta and unlearn)
+**pull claude fixes for new data
+
+clean
+python plot_accuracy_comparison.py results_smoketest975/naive/0725_pert22_naive_Task0Clean_True_mixed.json  results_smoketest975/MADAR/0725_pert22_MADAR_Task0Clean_True_mixed.json  results_smoketest975/MADAR+Unlearn/0725_pert22_MadarUNLEARN_Task0Clean_True_mixed_seed42.json
+
+dirty
+python plot_accuracy_comparison.py results_smoketest975/naive/0725_pert23_naive_Task0Clean_False_mixed.json  results_smoketest975/MADAR/0725_pert23_MADAR_Task0Clean_False_mixed.json  results_smoketest975/MADAR+Unlearn/0725_pert23_MadarUNLEARN_Task0Clean_False_mixed_seed42.json

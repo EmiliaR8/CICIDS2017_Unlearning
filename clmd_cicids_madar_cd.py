@@ -90,7 +90,7 @@ CL_ITERS = 2000                # tasks 1+ mix current-task and replay-buffer bat
                                 # used instead of "epochs over the current task's own loader"
 BATCH_SIZE = 256
 
-MEM_SIZE = 1000                # total replay buffer budget, split across label groups
+MEM_SIZE = 10                # total replay buffer budget, split across label groups
 MADAR_CONTAMINATION = 0.1      # only shifts IsolationForest's decision threshold; selection
                                 # is purely rank-based on decision_function scores, so this
                                 # does not affect which samples get chosen (kept for API compat)
@@ -105,7 +105,7 @@ TASK0_ROW_FRACTION = 0.35
 TASK_TEST_FRAC = 0.20
 
 # --- Poisoning scenario ---
-TASK0_CLEAN_ONLY = True         # FIXME 
+TASK0_CLEAN_ONLY = False         # FIXME 
 AGENT_MODE = "mixed"          # FIXME 
 FIXED_AGENT_ID = 0
 REQUIRE_EVASION_SUCCESS = True
