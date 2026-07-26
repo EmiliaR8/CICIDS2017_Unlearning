@@ -105,7 +105,8 @@ Tried Claude edit on branch
 0726_5task_0.3_perturbed MADAR+Unlearning,   Task 0 clean, mixed, 5 tasks, 0.3 poison
 0726_5task_0.8_perturbed MADAR+Unlearning,   Task 0 clean, mixed, 5 tasks, 0.8 poison
 
-
+0726_5task_0.3_perturbed Naive               Task 0 clean, mixed, 5 tasks, 0.8 poison
+0726_5task_0.8_perturbed Naive               Task 0 clean, mixed, 5 tasks, 0.3 poison
 
 
 
@@ -120,4 +121,4 @@ Including the changes that Claude suggested, does not really mattter or change t
 *try multiple seeds
 *try claude suggestion 
 
-python plot_accuracy_comparison.py results_smoketest4500/MADAR/0726_5task_MADAR_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0726_5task_0.6_perturbed_MADAR_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0726_5task_0.5_perturbed_MADAR_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0726_5task_0.3_perturbed_MADAR_Task0Clean_True_mixed.json 0726_5task_0.3_perturbed_MadarUNLEARN_Task0Clean_True_mixed_seed42.json 0726_5task_0.8_perturbed_MadarUNLEARN_Task0Clean_True_mixed_seed42.json
+python plot_accuracy_comparison.py results_smoketest4500/MADAR/0726_5task_MADAR_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0726_5task_0.6_perturbed_MADAR_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0726_5task_0.5_perturbed_MADAR_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0726_5task_0.3_perturbed_MADAR_Task0Clean_True_mixed.json results_smoketest4500/MADAR_Unlearn/0726_5task_0.3_perturbed_MadarUNLEARN_Task0Clean_True_mixed_seed42.json results_smoketest4500/MADAR_Unlearn/0726_5task_0.8_perturbed_MadarUNLEARN_Task0Clean_True_mixed_seed42.json 0726_5task_0.3_perturbed_naive_Task0Clean_True_mixed.json  0726_5task_0.8_perturbed_naive_Task0Clean_True_mixed.json

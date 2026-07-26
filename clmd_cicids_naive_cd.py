@@ -1,5 +1,5 @@
 """
-Run with: python clmd_cicids_naive_cd.py --seed 42 --log_name 0725_new
+Run with: python clmd_cicids_naive_cd.py --seed 42 --log_name 0726_5task_0.8_perturbed
 Continual Learning Experiment (CICIDS Naive Baseline)
 
 Adapts the EMBER naive baseline (clmd_ember18_naive_cd.py) to the perturbed CICIDS
@@ -93,7 +93,7 @@ EPOCHS_PER_TASK = 30
 BATCH_SIZE = 256
 
 # --- Task construction (time-based, not class-based) ---
-NUM_TASKS = 6
+NUM_TASKS = 5
 TASK0_ROW_FRACTION = 0.35      # share of ORIGINAL (benign+clean-malicious) rows, sorted by
                                 # source_row_id, assigned to task 0; remaining rows split
                                 # evenly across the other NUM_TASKS - 1 tasks
