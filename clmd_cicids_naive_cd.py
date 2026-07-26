@@ -1,5 +1,5 @@
 """
-Run with: python clmd_cicids_naive_cd.py --seed 42 --log_name 0725_0.6_perturbed
+Run with: python clmd_cicids_naive_cd.py --seed 42 --log_name 0725_new
 Continual Learning Experiment (CICIDS Naive Baseline)
 
 Adapts the EMBER naive baseline (clmd_ember18_naive_cd.py) to the perturbed CICIDS
@@ -105,7 +105,7 @@ AGENT_MODE = "mixed"         # "uniform" -> always FIXED_AGENT_ID; "mixed" -> cy
 FIXED_AGENT_ID = 0
 REQUIRE_EVASION_SUCCESS = True # only substitute a perturbed row if it actually evaded the
                                 # red agent's target classifier (evasion_success == True)
-POISON_FRACTION = 0.6 # FIXME 0.8 for full run          # share of a poisoned task's malicious originals replaced by
+POISON_FRACTION = 0.8 # FIXME 0.8 for full run          # share of a poisoned task's malicious originals replaced by
                                 # their assigned agent's perturbed version; the rest stay
                                 # malicious_clean (never both for the same sample)
 

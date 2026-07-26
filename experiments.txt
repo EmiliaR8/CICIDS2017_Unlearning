@@ -80,8 +80,8 @@ python plot_accuracy_comparison.py results_smoketest975/naive/0725_pert23_naive_
 
 0725_6tasks   Naive, Task 0 clean , mixed, 6 tasks     
 0725_10tasks  Naive, Task 0 clean , mixed, 10 tasks 
-0725_6tasks   MADAR, Task 0 clean, mixed , 6 tasks
-0725_6tasks   MADAR+U, Task 0 clean, mixed, 6 tasks
+0725_6tasks   MADAR, Task 0 clean, mixed , 6 tasks                                          
+0725_6tasks   MADAR+U, Task 0 clean, mixed, 6 tasks         
 
 Lowered poison percentage
 0725_0.6_perturbed      Naive,              Task 0 clean, moxed, 6 tasks, 0.6 poison
@@ -90,7 +90,29 @@ Lowered poison percentage
 0725_0.6_perturbed      Joint               Task 0 clean, mixed, 6 tasks, 0.6 poison
 
 
-Tried 
+Tried Claude edit on branch
+0725_new                Naive               Task 0 clean, moxed, 6 tasks, 0.8 poison
+0725_new                MADAR,              Task 0 clean, mixed, 6 tasks, 0.8 poison 
+0725_new                MADAR+Unlearning,   Task 0 clean, mixed, 6 tasks, 0.8 poison
+0725_new                Joint               Task 0 clean, mixed, 6 tasks, 0.8 poison
 
-python plot_accuracy_comparison.py results_smoketest4500/naive/0725_0.6_perturbed_naive_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0725_0.6_perturbed_MADAR_Task0Clean_True_mixed.json results_smoketest4500/MADAR_Unlearn/0725_0.6_perturbed_MadarUNLEARN_Task0Clean_True_mixed_seed42.json results_smoketest4500/joint/0725_0.6_perturbed_joint_Task0Clean_True_mixed.json
 
+0726_5task               MADAR,              Task 0 clean, mixed, 5 tasks, 0.8 poison        
+0726_5task_0.6_perturbed MADAR,              Task 0 clean, mixed, 5 tasks, 0.6 poison
+0726_5task_0.5_perturbed MADAR,              Task 0 clean, mixed, 5 tasks, 0.5 poison
+0726_5task_0.3_perturbed MADAR,              Task 0 clean, mixed, 5 tasks, 0.3 poison
+
+
+
+Notes:
+Lowering to 5 tasks does slightly affect the trajectory of the accuracy
+Including the changes that Claude suggested, does not really mattter or change the results, keep them
+
+
+
+
+*lower winrate even more
+*try multiple seeds
+*try claude suggestion 
+
+python plot_accuracy_comparison.py results_smoketest4500/MADAR/0726_5task_MADAR_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0726_5task_0.6_perturbed_MADAR_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0726_5task_0.5_perturbed_MADAR_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0726_5task_0.3_perturbed_MADAR_Task0Clean_True_mixed.json

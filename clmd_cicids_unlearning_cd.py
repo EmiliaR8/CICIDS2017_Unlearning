@@ -1,5 +1,5 @@
 """
-Run with python clmd_cicids_unlearning_cd.py --seed 42 --log_name 0725_0.6_perturbed
+Run with python clmd_cicids_unlearning_cd.py --seed 42 --log_name 0725_new
 Continual Learning Experiment (CICIDS MADAR + Targeted Unlearning)
 
 Builds directly on clmd_cicids_madar_cd.py -- identical data construction, evaluation
@@ -126,7 +126,7 @@ TASK0_CLEAN_ONLY = True     # FIXME
 AGENT_MODE = "mixed"      # FIXME 
 FIXED_AGENT_ID = 0
 REQUIRE_EVASION_SUCCESS = True
-POISON_FRACTION = 0.6          # 0.0 always means "never poison", regardless of diversity flag
+POISON_FRACTION = 0.8          # 0.0 always means "never poison", regardless of diversity flag
 
 # --- Category diversity floor ---
 ENSURE_CATEGORY_DIVERSITY = True

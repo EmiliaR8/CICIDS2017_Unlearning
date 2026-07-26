@@ -1,5 +1,5 @@
 """
-Run with python clmd_cicids_madar_cd.py --seed 42 --log_name 0725_0.6_perturbed
+Run with python clmd_cicids_madar_cd.py --seed 42 --log_name 0726_5task
 Continual Learning Experiment (CICIDS MADAR: Experience Replay + Knowledge Distillation +
 Synaptic Intelligence)
 
@@ -100,7 +100,7 @@ SI_C = 1.0
 SI_EPS = 0.1
 
 # --- Task construction (time-based, not class-based) ---
-NUM_TASKS = 6
+NUM_TASKS = 5
 TASK0_ROW_FRACTION = 0.35
 TASK_TEST_FRAC = 0.20
 
@@ -109,7 +109,7 @@ TASK0_CLEAN_ONLY = True         # FIXME
 AGENT_MODE = "mixed"          # FIXME 
 FIXED_AGENT_ID = 0
 REQUIRE_EVASION_SUCCESS = True
-POISON_FRACTION = 0.6          # 0.0 always means "never poison", regardless of diversity flag
+POISON_FRACTION = 0.3          # 0.0 always means "never poison", regardless of diversity flag
 
 # --- Category diversity floor ---
 ENSURE_CATEGORY_DIVERSITY = True

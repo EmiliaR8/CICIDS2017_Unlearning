@@ -1,5 +1,5 @@
 """
-Run with: python clmd_cicids_joint_cd.py --seed 42 --log_name 0725_0.6_perturbed
+Run with: python clmd_cicids_joint_cd.py --seed 42 --log_name 0725_new
 Continual Learning Experiment (CICIDS Joint Retraining Oracle)
 
 Same CICIDS adaptation as clmd_cicids_naive_cd.py (see that file's docstring for the full
@@ -77,7 +77,7 @@ EPOCHS_PER_TASK = 30
 BATCH_SIZE = 256
 
 # --- Task construction (time-based, not class-based) ---
-NUM_TASKS = 10 
+NUM_TASKS = 6 
 TASK0_ROW_FRACTION = 0.35      # share of ORIGINAL (benign+clean-malicious) rows, sorted by
                                 # source_row_id, assigned to task 0; remaining rows split
                                 # evenly across the other NUM_TASKS - 1 tasks
@@ -89,7 +89,7 @@ AGENT_MODE = "mixed"         # "uniform" -> always FIXED_AGENT_ID; "mixed" -> cy
 FIXED_AGENT_ID = 0
 REQUIRE_EVASION_SUCCESS = True # only substitute a perturbed row if it actually evaded the
                                 # red agent's target classifier (evasion_success == True)
-POISON_FRACTION = 0.6           # share of a poisoned task's malicious originals replaced by
+POISON_FRACTION = 0.8           # share of a poisoned task's malicious originals replaced by
                                 # their assigned agent's perturbed version; the rest stay
                                 # malicious_clean (never both for the same sample). 0.0 always
                                 # means "never poison", regardless of ENSURE_CATEGORY_DIVERSITY.
