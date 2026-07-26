@@ -257,25 +257,33 @@ def loss_fn_kd(scores, target_scores, T=2.0):
     return F.kl_div(log_scores_norm, targets_norm, reduction='batchmean') * (T ** 2)
 
 
+def _embed(model, Xt: torch.Tensor, device):
+    loader = data.DataLoader(data.TensorDataset(Xt), batch_size=EVAL_BATCH_SIZE, shuffle=False)
+    parts = []
+    with torch.no_grad():
+        for (v,) in loader:
+            _, latent = model(v.to(device), return_latent=True)
+            parts.append(latent.cpu())
+    return torch.cat(parts).numpy()
+
+
 def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, model, device):
     """Selects, per label (0/1), an interleaved anomalies+inliers sample (by IsolationForest
     decision_function over the model's LATENT space) to keep in that label's buffer slot.
+    Re-ranks the UNION of that label's EXISTING buffer entries (re-embedded under the CURRENT
+    model, since weights have moved since they were last selected) and this task's new
+    same-label samples, so exemplars from earlier tasks can survive across updates instead of
+    being discarded every call (as a prior version of this function did -- see git history).
     category is attached to each stored sample purely for the post-hoc composition diagnostic
     -- it plays no role in selection, which sees only the latent vectors."""
     global label_buffers, replay_buffer
     model.eval()
 
-    loader = data.DataLoader(data.TensorDataset(X, y), batch_size=EVAL_BATCH_SIZE, shuffle=False)
-    all_latents = []
-    with torch.no_grad():
-        for v, l in loader:
-            v = v.to(device)
-            _, latent = model(v, return_latent=True)
-            all_latents.append(latent.cpu())
-    L_np = torch.cat(all_latents).numpy()
     X_np = X.numpy()
     Y_np = y.numpy()
     cat_np = np.asarray(category)
+    L_np = _embed(model, X, device)
+    latent_dim = L_np.shape[1]
 
     current_labels = np.unique(Y_np).tolist()
     # UNION, not sum: unlike EMBER's ever-growing, non-overlapping family set, our label
@@ -284,27 +292,32 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
     all_group_keys = set(label_buffers.keys()) | set(current_labels)
     budget_per_label = MEM_SIZE // max(len(all_group_keys), 1)
 
-    for key in list(label_buffers.keys()):
-        if len(label_buffers[key]) > budget_per_label:
-            current_buffer = label_buffers[key]
-            half_budget = budget_per_label // 2
-            anomalies = current_buffer[::2]
-            inliers = current_buffer[1::2]
-            new_buffer = [val for pair in zip(anomalies[:half_budget], inliers[:half_budget]) for val in pair]
-            if budget_per_label % 2 != 0 and len(anomalies) > half_budget:
-                new_buffer.append(anomalies[half_budget])
-            label_buffers[key] = new_buffer
+    for lbl in all_group_keys:
+        old_entries = label_buffers.get(lbl, [])
+        if old_entries:
+            old_X = np.stack([e[0].numpy() for e in old_entries])
+            old_Y = np.array([e[1].item() for e in old_entries], dtype=Y_np.dtype)
+            old_cat = np.array([e[2] for e in old_entries], dtype=object)
+            old_L = _embed(model, torch.tensor(old_X), device)
+        else:
+            old_X = np.empty((0, X_np.shape[1]), dtype=X_np.dtype)
+            old_Y = np.empty((0,), dtype=Y_np.dtype)
+            old_cat = np.empty((0,), dtype=object)
+            old_L = np.empty((0, latent_dim), dtype=np.float32)
 
-    for lbl in current_labels:
         mask = (Y_np == lbl)
-        X_lbl, Y_lbl, L_lbl, cat_lbl = X_np[mask], Y_np[mask], L_np[mask], cat_np[mask]
-        n_select = min(budget_per_label, len(X_lbl))
+        pool_X = np.concatenate([old_X, X_np[mask]], axis=0)
+        pool_Y = np.concatenate([old_Y, Y_np[mask]], axis=0)
+        pool_L = np.concatenate([old_L, L_np[mask]], axis=0)
+        pool_cat = np.concatenate([old_cat, cat_np[mask]], axis=0)
+
+        n_select = min(budget_per_label, len(pool_X))
         if n_select == 0:
             continue
 
         iso = IsolationForest(contamination=MADAR_CONTAMINATION, n_jobs=-1, random_state=SEED)
-        iso.fit(L_lbl)
-        scores = iso.decision_function(L_lbl)
+        iso.fit(pool_L)
+        scores = iso.decision_function(pool_L)
         sorted_idx = np.argsort(scores)
 
         half = n_select // 2
@@ -315,7 +328,7 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
             interleaved_idx.append(inliers_idx[-1])
 
         label_buffers[lbl] = [
-            (torch.tensor(X_lbl[i]), torch.tensor(Y_lbl[i]), cat_lbl[i]) for i in interleaved_idx
+            (torch.tensor(pool_X[i]), torch.tensor(pool_Y[i]), pool_cat[i]) for i in interleaved_idx
         ]
 
     replay_buffer.clear()
