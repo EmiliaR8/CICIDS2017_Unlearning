@@ -399,9 +399,16 @@ if __name__ == "__main__":
                 poison_task_index = tid - (1 if TASK0_CLEAN_ONLY else 0)
                 agent_for_task = n_agents[poison_task_index % len(n_agents)]
 
+            # source_row_id resets per source_range (day) -- must key on (source_range, row_id),
+            # not the bare id, or a perturbed row from one day can land in the wrong split
+            # because another day's train/test malicious sample shares its in-day row number.
             pert_pool = perturbed_with_task[perturbed_with_task["task_id"] == tid]
-            train_pert_pool = pert_pool[pert_pool["source_row_id"].isin(mal_train_orig["orig_row_id"])]
-            test_pert_pool = pert_pool[pert_pool["source_row_id"].isin(mal_test_orig["orig_row_id"])]
+            pert_pool_keys = pd.Series(list(zip(pert_pool["source_range"], pert_pool["source_row_id"])),
+                                        index=pert_pool.index)
+            train_keys = set(zip(mal_train_orig["source_range"], mal_train_orig["orig_row_id"]))
+            test_keys = set(zip(mal_test_orig["source_range"], mal_test_orig["orig_row_id"]))
+            train_pert_pool = pert_pool[pert_pool_keys.isin(train_keys)]
+            test_pert_pool = pert_pool[pert_pool_keys.isin(test_keys)]
 
             mal_train_final, n_p, n_c = poison_and_diversify(
                 mal_train_orig, train_pert_pool, agent_for_task, POISON_FRACTION,
