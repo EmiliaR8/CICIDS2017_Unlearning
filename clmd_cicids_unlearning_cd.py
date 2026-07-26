@@ -161,8 +161,11 @@ def encode_labels(df: pd.DataFrame, label_column: str):
 # --- 2. Task Windowing (time-based) ---
 
 def assign_task_windows(df: pd.DataFrame, num_tasks: int, task0_fraction: float) -> pd.DataFrame:
+    """Sorted by TIMESTAMP (true chronological order) -- source_row_id/orig_row_id are
+    per-day counters that reset to 0 for each source_range, so sorting by them directly
+    would interleave rows from different days by coincidence of row number instead of time."""
     originals = df[df["row_type"] == "original"].copy()
-    originals = originals.sort_values("source_row_id").reset_index(drop=True)
+    originals = originals.sort_values("timestamp").reset_index(drop=True)
     n = len(originals)
 
     n_task0 = int(round(n * task0_fraction))
@@ -183,9 +186,13 @@ def assign_task_windows(df: pd.DataFrame, num_tasks: int, task0_fraction: float)
 
 
 def assign_perturbed_task_ids(df: pd.DataFrame, originals_with_task: pd.DataFrame) -> pd.DataFrame:
-    task_lookup = originals_with_task.set_index("orig_row_id")["task_id"]
+    """orig_row_id/source_row_id are only unique WITHIN one day's source file (they reset to
+    0 per source_range), so a multi-day dataset needs (source_range, row_id) as the join
+    key -- row_id alone collides across days."""
+    task_lookup = originals_with_task.set_index(["source_range", "orig_row_id"])["task_id"]
     perturbed = df[df["row_type"] == "perturbed"].copy()
-    perturbed["task_id"] = perturbed["source_row_id"].map(task_lookup)
+    keys = pd.MultiIndex.from_arrays([perturbed["source_range"], perturbed["source_row_id"]])
+    perturbed["task_id"] = task_lookup.reindex(keys).to_numpy()
     perturbed = perturbed.dropna(subset=["task_id"]).copy()
     perturbed["task_id"] = perturbed["task_id"].astype(int)
     return perturbed
@@ -196,13 +203,17 @@ def assign_perturbed_task_ids(df: pd.DataFrame, originals_with_task: pd.DataFram
 def poison_and_diversify(malicious_orig_subset: pd.DataFrame, perturbed_pool: pd.DataFrame,
                           agent_for_task: int, poison_fraction: float, require_evasion_success: bool,
                           ensure_diversity: bool, min_category_count: int, rng: random.Random):
+    """Identity here keys on (source_range, row_id), not the bare row id: orig_row_id/
+    source_row_id reset per source_range (day), and a single task CAN span more than one
+    day's rows, so a bare-id match risks pairing a Tuesday original with a Wednesday
+    perturbation that happens to share the same in-day row number."""
     cand = perturbed_pool[perturbed_pool["agent_id"] == agent_for_task]
     if require_evasion_success:
         cand = cand[cand["evasion_success"] == True]  # noqa: E712
-    eligible_ids = set(cand["source_row_id"].tolist())
+    eligible_ids = set(zip(cand["source_range"], cand["source_row_id"]))
 
-    all_ids = malicious_orig_subset["orig_row_id"].tolist()
-    eligible = [i for i in all_ids if i in eligible_ids]
+    all_ids = list(zip(malicious_orig_subset["source_range"], malicious_orig_subset["orig_row_id"]))
+    eligible = [k for k in all_ids if k in eligible_ids]
     n_elig = len(eligible)
 
     n_poison = int(round(poison_fraction * n_elig))
@@ -219,11 +230,13 @@ def poison_and_diversify(malicious_orig_subset: pd.DataFrame, perturbed_pool: pd
     poison_ids = set(eligible[:n_poison])
     clean_ids = set(all_ids) - poison_ids
 
-    clean_rows = malicious_orig_subset[malicious_orig_subset["orig_row_id"].isin(clean_ids)].copy()
+    mal_keys = pd.Series(all_ids, index=malicious_orig_subset.index)
+    clean_rows = malicious_orig_subset[mal_keys.isin(clean_ids)].copy()
     clean_rows["category"] = "malicious_clean"
     clean_rows["poison_agent_id"] = -1
 
-    poison_rows = cand[cand["source_row_id"].isin(poison_ids)].copy()
+    cand_keys = pd.Series(list(zip(cand["source_range"], cand["source_row_id"])), index=cand.index)
+    poison_rows = cand[cand_keys.isin(poison_ids)].copy()
     poison_rows["category"] = "malicious_perturbed"
     poison_rows["poison_agent_id"] = poison_rows["agent_id"]
 
