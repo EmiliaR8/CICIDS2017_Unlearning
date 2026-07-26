@@ -1,5 +1,5 @@
 """
-Run with python clmd_cicids_unlearning_cd.py --seed 42 --log_name 0725_new
+Run with python clmd_cicids_unlearning_cd.py --seed 42 --log_name 0726_5task_0.8_perturbed
 Continual Learning Experiment (CICIDS MADAR + Targeted Unlearning)
 
 Builds directly on clmd_cicids_madar_cd.py -- identical data construction, evaluation
@@ -117,7 +117,7 @@ UNLEARN_ALPHA = 0.2            # weight of the forget loss; 0.0 = extra-training
                                 # ablation (same steps/optimizer, no forget objective)
 
 # --- Task construction (time-based, not class-based) ---
-NUM_TASKS = 6
+NUM_TASKS = 5
 TASK0_ROW_FRACTION = 0.35
 TASK_TEST_FRAC = 0.20
 
