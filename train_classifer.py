@@ -5,8 +5,7 @@ import xgboost as xgb
 from collections import Counter
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import balanced_accuracy_score, classification_report, accuracy_score
-from model import XGBoostIDSWrapper  
-from data_loader import load_data, get_batch_data  # Assuming these functions are available
+from model import XGBoostIDSWrapper
 
 def update_xgboost(model, X_new, y_new, num_new_trees=10):
     """
@@ -69,15 +68,3 @@ def train_model(X, y):
     # breakpoint()
     
     return model, acc
-
-if __name__ == "__main__":
-    # Load data from CSV
-    X, y, A, b = load_data("all_groups_training_normalized(1).csv")  # Adjust file path if needed
-    
-    # Combine or batch the data as needed; here we assume get_batch_data returns the batch training data
-    X_train, y_train = get_batch_data((X, y), (A, b), 1, n_batches=3)
-
-    model, acc = train_model(X_train, y_train)
-    # Save the entire wrapper (model plus label mappings)
-    model.save("nids_xgboost_model.pkl")
-    print("Model saved as nids_xgboost_model.pkl")
