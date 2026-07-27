@@ -1,0 +1,12 @@
+# Dependencies for naive_cl_pipeline.py and its modules (adversary_env.py,
+# model.py, train_classifer.py, h5_data_loader.py).
+numpy
+pandas
+h5py
+scikit-learn
+xgboost
+matplotlib
+joblib
+gym==0.26.2
+stable-baselines3>=2.0
+shimmy>=2.0
