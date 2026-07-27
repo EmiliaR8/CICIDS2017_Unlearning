@@ -78,13 +78,13 @@ REQUIRE_EVASION_SUCCESS = True  # only successfully-evasive perturbations poison
 
 RED_EPSILON = 0.25
 RED_MAX_STEPS = 25
-RED_TIMESTEPS_PER_TASK = 1000  #FIXME 10_000 fresh SAC agent trained this many steps per task boundary
+RED_TIMESTEPS_PER_TASK = 2500  #FIXME 10_000 fresh SAC agent trained this many steps per task boundary
 ALPHA_CONTRAST = 0.5
 CONTRASTIVE_EMA = 0.95
 CONTRASTIVE_RECENCY_DECAY = 0.5  # weight of task (k-1) vs (k-2) vs ... in the diversity reward
 
 # Caps evaluate_agent_on_batch's per-task episode count for runtime; None = every malicious sample.
-MAX_EVAL_SAMPLES_PER_TASK = 100 #FIXME 1000 
+MAX_EVAL_SAMPLES_PER_TASK = 500 #FIXME 1000 
 
 SAC_POLICY_KWARGS = dict(net_arch=[512, 256, 128], optimizer_kwargs={"weight_decay": 1e-4})
 SAC_KWARGS = dict(
@@ -385,6 +385,7 @@ def plot_episode_clouds(bank, out_path):
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    start_time = time.perf_counter()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log_name", type=str, default="naive_cl_run")
