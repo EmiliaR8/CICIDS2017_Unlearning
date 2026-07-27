@@ -251,7 +251,19 @@ class XGBoostIDSWrapper:
         # Step 1: Refresh (fast)
         rounds_before = booster.num_boosted_rounds()
         if rounds_before > 0:
-            refresh_params = dict(params, process_type="update", updater="refresh", refresh_leaf=True)
+            # Tree-growth params (tree_method, max_depth, max_bin, subsample,
+            # colsample_bytree) don't apply to a leaf-only refresh -- no new
+            # splits are grown here. Passing tree_method alongside an explicit
+            # updater is exactly what XGBoost's "DANGER AHEAD" warning flags
+            # ("tree_method will be ignored... undefined behavior"), so this
+            # refresh call gets its own minimal params instead of inheriting
+            # params wholesale.
+            refresh_params = {
+                "process_type": "update",
+                "updater": "refresh",
+                "refresh_leaf": True,
+                "nthread": params["nthread"],
+            }
             t1 = time.time()
             xgb.train(refresh_params, dtrain, num_boost_round=0, xgb_model=booster)
             # print(f"[xgb] refresh in {time.time()-t1:.3f}s (trees={rounds_before})", flush=True)
