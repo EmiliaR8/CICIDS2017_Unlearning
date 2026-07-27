@@ -211,7 +211,7 @@ def run_single_agent_attack(env, model, start_index, benign_label, deterministic
 def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
                              deterministic=True, max_test=None):
     """
-    Runs the agent over (a prefix of) the batch. Returns
+    Runs the agent over (up to max_test of) the malicious samples. Returns
     (X_pert, evasion_rate, rewards, avg_pert_norm, n_attacked, evaded_mask).
     evaded_mask[i] is True only for samples where the attack succeeded --
     this is the exact set poisoning should draw from, so callers don't need
@@ -223,14 +223,19 @@ def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
     evasion = 0
     attacked = 0
 
-    indices = range(X.shape[0])
+    # Filter to the samples actually eligible for attack BEFORE capping by
+    # max_test, not after -- capping a raw range(X.shape[0]) first and only
+    # then filtering out benign rows made max_test cap "rows scanned" rather
+    # than "malicious samples attacked", starving poisoning on any task where
+    # malicious samples aren't already in the first max_test rows.
+    if only_malicious:
+        indices = np.where(y != benign_label)[0]
+    else:
+        indices = np.arange(X.shape[0])
     if max_test is not None:
-        indices = list(indices)[:max_test]
+        indices = indices[:max_test]
 
     for i in indices:
-        if only_malicious and y[i] == benign_label:
-            continue
-
         final_obs, total_reward, pred_label, cum_pert = run_single_agent_attack(
             env, model, start_index=i, benign_label=benign_label, deterministic=deterministic
         )
