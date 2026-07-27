@@ -24,29 +24,40 @@ Outline this implements (task loop, for each task t with a red agent):
   1. Train on Tt via MADAR's existing ER+KD+SI step (train_cl_er, unchanged).
   2/6. Update replay buffer P -- see "buffer ordering" below for the one change
        from the outline's literal order.
-  3. Detect poison in Tt -> Df_t -- see "poison detection" below; NOT designed
-     yet, stubbed for this draft.
+  3. Detect poison in Tt -> Df_t -- see "poison detection" below.
   4. If Df_t is empty, skip unlearning for this task.
   5. Unlearn Df_t (unlearn_teacher_guided) -- SI-protected, KD-anchored on the
      retain set + replay buffer, forget loss pushes Df_t toward uniform.
-  7. Verify recovery -- see "verify recovery" below for what's newly logged.
+  7. Verify recovery -- see "verify recovery" below for what's logged.
   8. Move to task t+1.
 
-Four decisions made for this first draft (not silently assumed -- flag anything
-you want changed):
+Four decisions made, not silently assumed (flag anything you want changed):
 
-  - POISON DETECTION (step 3) is explicitly NOT designed here -- it's the
-    component you asked to discuss and finetune separately. This draft uses
-    ORACLE ground truth instead: Df_t = poison_idx, the exact set of samples
-    the red-agent poisoning step already substituted with evaded perturbations
-    (available for free -- madar_cl_pipeline.py already builds this for the
-    buffer's category diagnostic). detect_poison_oracle() below is a thin,
-    clearly-labeled wrapper around that, so it's a one-function swap once a
-    real detector is designed. Using the oracle here deliberately separates
-    "does the unlearning mechanism work" (testable now) from "can we detect
-    poison without ground truth" (the open question) -- an oracle-detector run
-    is not the same experiment as a real one and should never be reported as
-    such; every place this run's provenance matters says "oracle" explicitly.
+  - POISON DETECTION (step 3) is being built iteratively, on purpose, rather
+    than landing fully-formed. This is ITERATION 1: phi1 only -- an
+    IsolationForest decision_function score over the CURRENT model's latent
+    embedding of this task's malicious-labeled training samples, forgetting
+    the MIDDLE band (DONUT_FORGET_RATIO of the population) rather than the
+    extremes. Ported from split_option_b_donut_hole in the EMBER unlearning
+    reference (clmdu_ember18_mk6B_cd.py), with its per-malware-family
+    joint-fit machinery dropped: that reference fits IF jointly across
+    several concurrent "families"; CICIDS poisoning only ever touches the
+    malicious-labeled population (benign is never poisoned -- see
+    madar_cl_pipeline.py), so there is exactly one population to search and
+    no family-level joint fit is meaningful. detect_poison_if_latent() below
+    never reads poison_idx or any ground truth -- Df_t is chosen purely from
+    the classifier's own latent geometry, unlike the oracle stand-in this
+    file used before phi1 was implemented (see git history for that version).
+    ITERATION 2 (not yet built) adds phi3 (per-sample CE loss), phi4
+    (normalized predictive entropy), and phi5 (top-two probability margin) --
+    model-behavior features, from the same paper's feature list, expected to
+    matter more than phi1/phi2's raw/latent geometry alone against this
+    pipeline's evasion-crafted poisoning specifically (minimal, decision-
+    boundary-targeted perturbations are optimized to NOT look geometrically
+    anomalous -- see discussion in commit history / conversation). phi6
+    (distance to family centroid) and phi7 (log family size) from that same
+    paper are EMBER-specific (malware-family concept) and don't transfer to
+    CICIDS's flat binary labeling -- not planned for any iteration here.
 
   - WEIGHT PROTECTION during unlearning uses the existing SI (omega/p_old_task)
     machinery already implemented and validated in madar_cl_pipeline.py, not
@@ -173,8 +184,13 @@ UNLEARN_ALPHA = 0.2      # weight of the forget loss; 0.0 = extra-training contr
                           # ablation (identical steps/optimizer/data flow, no forget
                           # objective -- isolates "more training" from "actually
                           # targeting forgetting")
-POISON_DETECTOR = "oracle_ground_truth"  # logged into config/results for provenance;
-                                          # see module docstring's "poison detection" note
+POISON_DETECTOR = "if_latent_phi1_donut_hole"  # logged into config/results for
+                                                # provenance; see module docstring's
+                                                # "poison detection" note
+DONUT_FORGET_RATIO = 0.1  # fraction of this task's malicious-labeled samples
+                           # forgotten (the middle band of the phi1 IF-score
+                           # distribution) -- value carried over unchanged from
+                           # split_option_b_donut_hole's forget_ratio default
 
 
 # ---------------------------------------------------------------------------
@@ -621,27 +637,50 @@ def evaluate_classifier(classifier, X, y):
 
 
 # ---------------------------------------------------------------------------
-# Step 3 (STUB -- explicitly not the real detector, see module docstring) +
+# Step 3 -- poison detection, iteration 1 (phi1 only; see module docstring) +
 # unlearning phase itself.
 # ---------------------------------------------------------------------------
-def detect_poison_oracle(n_samples, poison_idx):
+def detect_poison_if_latent(Xtr, ytr, mal_label, model, device, forget_ratio=DONUT_FORGET_RATIO):
     """
-    Placeholder for step 3 (poison detection), NOT the real detector -- that's
-    the component still to be designed together. Returns (forget_idx,
-    retain_idx) as sorted int64 index arrays into this task's own
-    X_train_for_classifier/y_train, using the ground-truth poison_idx the
-    red-agent poisoning step already produced this task (main() computes this
-    for free as part of substituting evaded perturbations into training data --
-    see madar_cl_pipeline.py's category-tracking block, which this mirrors).
+    Step 3, iteration 1: phi1 -- IsolationForest decision_function score over
+    the CURRENT model's latent embedding of this task's malicious-labeled
+    training samples, forgetting the MIDDLE band of that score distribution
+    (neither the strongest anomalies nor the strongest inliers). Ported from
+    split_option_b_donut_hole in the EMBER unlearning reference
+    (clmdu_ember18_mk6B_cd.py); the reference's per-malware-family joint IF
+    fit is dropped -- CICIDS poisoning only ever touches the malicious-labeled
+    population (benign is never poisoned), so there's exactly one population
+    to search, not several families to fit jointly over.
 
-    forget_idx = exactly the samples that were poisoned this task.
-    retain_idx = everything else (all benign + unpoisoned malicious).
+    Reads NO ground truth -- Df_t is chosen purely from the classifier's own
+    latent geometry (unlike this file's earlier oracle stand-in, kept in git
+    history). Benign samples are never candidates and are always retained.
 
-    Swap this function out once a real detector exists; the only contract the
-    rest of the pipeline depends on is this (forget_idx, retain_idx) return
-    shape.
+    Returns (forget_idx, retain_idx) as sorted int64 index arrays into this
+    task's own Xtr/ytr -- the contract the rest of the pipeline depends on,
+    so iteration 2 (phi3/phi4/phi5 folded in) is a same-shape swap here.
     """
-    forget_idx = np.asarray(sorted(poison_idx), dtype=np.int64)
+    mal_idx = np.where(ytr.numpy() == mal_label)[0]
+    n_samples = len(ytr)
+    if len(mal_idx) == 0:
+        return np.array([], dtype=np.int64), np.arange(n_samples, dtype=np.int64)
+
+    L_np = _embed(model, Xtr[mal_idx], device)
+    iso = IsolationForest(contamination=MADAR_CONTAMINATION, n_jobs=-1, random_state=SEED)
+    iso.fit(L_np)
+    scores = iso.decision_function(L_np)
+    sorted_local = np.argsort(scores)
+
+    n_total = len(sorted_local)
+    n_forget = int(n_total * forget_ratio)
+    if n_forget == 0:
+        return np.array([], dtype=np.int64), np.arange(n_samples, dtype=np.int64)
+
+    mid_start = (n_total // 2) - (n_forget // 2)
+    mid_end = mid_start + n_forget
+    forget_local = sorted_local[mid_start:mid_end]
+
+    forget_idx = np.sort(mal_idx[forget_local])
     retain_idx = np.setdiff1d(np.arange(n_samples, dtype=np.int64), forget_idx)
     return forget_idx, retain_idx
 
@@ -1048,8 +1087,8 @@ def main():
                       f"(poison_fraction={POISON_FRACTION})")
 
         # Category tracking (identical to madar_cl_pipeline.py) -- feeds the
-        # buffer composition diagnostic AND, in this file, doubles as the
-        # oracle ground truth detect_poison_oracle() reads below.
+        # buffer composition diagnostic only in this file; detect_poison_if_latent()
+        # below reads no ground truth from this array (see its docstring).
         category = np.full(len(y_train), "malicious_clean", dtype=object)
         category[y_train == benign_label] = "benign"
         if len(poison_idx) > 0:
@@ -1121,9 +1160,9 @@ def main():
                     omega[n_key] += W[n_key] / ((p_post_cl - p_old_task[n_key]) ** 2 + SI_EPS)
                     W[n_key].zero_()
 
-            # --- Steps 3 (STUB) + 4: detect poison, skip unlearning if empty ---
-            forget_idx, retain_idx = detect_poison_oracle(len(Xtr), poison_idx)
-            print(f"    [Detect] Df_t (oracle ground truth) = {len(forget_idx)} samples, "
+            # --- Steps 3 + 4: detect poison (phi1, iteration 1), skip if empty ---
+            forget_idx, retain_idx = detect_poison_if_latent(Xtr, ytr, mal_label, model, DEVICE)
+            print(f"    [Detect] Df_t (phi1 latent-IF donut-hole) = {len(forget_idx)} samples, "
                   f"retain = {len(retain_idx)}")
 
             if len(forget_idx) == 0:
