@@ -122,3 +122,18 @@ Including the changes that Claude suggested, does not really mattter or change t
 *try claude suggestion 
 
 python plot_accuracy_comparison.py results_smoketest4500/MADAR/0726_5task_MADAR_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0726_5task_0.6_perturbed_MADAR_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0726_5task_0.5_perturbed_MADAR_Task0Clean_True_mixed.json  results_smoketest4500/MADAR/0726_5task_0.3_perturbed_MADAR_Task0Clean_True_mixed.json results_smoketest4500/MADAR_Unlearn/0726_5task_0.3_perturbed_MadarUNLEARN_Task0Clean_True_mixed_seed42.json results_smoketest4500/MADAR_Unlearn/0726_5task_0.8_perturbed_MadarUNLEARN_Task0Clean_True_mixed_seed42.json 0726_5task_0.3_perturbed_naive_Task0Clean_True_mixed.json  0726_5task_0.8_perturbed_naive_Task0Clean_True_mixed.json
+
+
+
+
+python3 -c "
+import json
+with open('friday_packets.json') as f:
+    data = json.load(f)
+print('type:', type(data), 'len:', len(data))
+print('sample record:', json.dumps(data[0], indent=2)[:2000])
+if isinstance(data, list):
+    from collections import Counter
+    labels = Counter(r.get('label') for r in data)
+    print('label counts:', labels)
+"

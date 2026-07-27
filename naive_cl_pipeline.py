@@ -1,6 +1,10 @@
 """
 naive_cl_pipeline.py
 
+Usage:
+    python naive_cl_pipeline.py --seed 42 --log_name naive_10task_run \\
+        --h5-path /mnt/processed_data/subsampled_dataset.h5
+
 NEW naive continual-learning pipeline over the pooled/chronological 10-task
 split of subsampled_dataset.h5 / full_dataset.h5 (see h5_data_loader.py's
 load_pooled_chronological_tasks). Two learners run task-by-task:
@@ -35,9 +39,6 @@ rather than collapsing onto one strategy) before building the next phases
 (joint, MADAR, MADAR+Unlearning) on top. See the run's plots/prototype_heatmap.png
 and plots/episode_clouds.png for the direct read on that question.
 
-Usage:
-    python naive_cl_pipeline.py --seed 42 --log_name naive_10task_run \\
-        --h5-path /mnt/processed_data/subsampled_dataset.h5
 """
 import argparse
 import json
@@ -77,13 +78,13 @@ REQUIRE_EVASION_SUCCESS = True  # only successfully-evasive perturbations poison
 
 RED_EPSILON = 0.25
 RED_MAX_STEPS = 25
-RED_TIMESTEPS_PER_TASK = 10_000  # fresh SAC agent trained this many steps per task boundary
+RED_TIMESTEPS_PER_TASK = 1000  #FIXME 10_000 fresh SAC agent trained this many steps per task boundary
 ALPHA_CONTRAST = 0.5
 CONTRASTIVE_EMA = 0.95
 CONTRASTIVE_RECENCY_DECAY = 0.5  # weight of task (k-1) vs (k-2) vs ... in the diversity reward
 
 # Caps evaluate_agent_on_batch's per-task episode count for runtime; None = every malicious sample.
-MAX_EVAL_SAMPLES_PER_TASK = 1000
+MAX_EVAL_SAMPLES_PER_TASK = 100 #FIXME 1000 
 
 SAC_POLICY_KWARGS = dict(net_arch=[512, 256, 128], optimizer_kwargs={"weight_decay": 1e-4})
 SAC_KWARGS = dict(
@@ -387,7 +388,7 @@ def main():
 
     np.random.seed(args.seed)
 
-    out_dir = os.path.join("runs", args.log_name)
+    out_dir = os.path.join("runs", "naive" ,args.log_name)
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
 
@@ -522,6 +523,7 @@ def main():
     plot_episode_clouds(bank, os.path.join(out_dir, "plots", "episode_clouds.png"))
 
     print(f"\nDone. Results + plots written to {out_dir}/")
+    print("full time elapsed: %.2f seconds" % (time.perf_counter() - start_time))
 
 
 if __name__ == "__main__":
