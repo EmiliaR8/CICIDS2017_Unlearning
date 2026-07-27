@@ -152,6 +152,20 @@ MADAR_CONTAMINATION = 0.1  # only shifts IsolationForest's decision threshold; s
 KD_TEMP = 2.0
 SI_C = 1.0
 SI_EPS = 0.1
+# rnt = max(1/(tid+1), RNT_FLOOR): weight of current-task hard-label loss vs.
+# replay KD loss (see train_cl_er). Unfloored 1/(tid+1) (borrowed from the
+# EMBER class-incremental reference, where "new" each round is a handful of
+# brand-new classes on top of a large stable set) decays to ~0.1 by task 9,
+# which -- in this fixed 2-class, concept-drift setting where every task can
+# be a large, informative new slice of malicious traffic -- suppresses
+# learning of new tasks rather than protecting old ones (confirmed via
+# madar1.json: task 0's held-out accuracy barely moves, 99.4%->97.8% over 9
+# more tasks, while tasks 8/9's OWN fresh-eval accuracy collapses to ~0.52
+# despite abundant current-task data, tracking rnt's decay almost exactly).
+# Floored at 0.3 so current-task loss never drops below ~3x its unfloored
+# tail-end weight, while leaving the early-task decay (task 1: 0.5, task 2:
+# 0.33) that's still above the floor untouched.
+RNT_FLOOR = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +524,9 @@ def train_cl_er(model, teacher_model, optimizer, loader, iters, W, omega, p_old_
     teacher (the model as it stood at the end of the previous task) instead of
     their stored hard labels, so the model doesn't just re-memorize the buffer's
     literal contents. `rnt` shifts weight from current-task loss toward replay KD
-    as tasks accumulate (1/(tid+1)). SI adds a per-parameter quadratic penalty
+    as tasks accumulate (1/(tid+1), floored at RNT_FLOOR -- see its definition
+    above for why the unfloored schedule was suppressing new-task learning).
+    SI adds a per-parameter quadratic penalty
     against drifting from p_old_task, weighted by omega (importance accumulated
     over all previous tasks' training).
 
@@ -543,7 +559,7 @@ def train_cl_er(model, teacher_model, optimizer, loader, iters, W, omega, p_old_
         combined_l = torch.cat([l, mem_l], dim=0)
         loss_cur = nn.CrossEntropyLoss()(model(combined_v), combined_l)
 
-        rnt = 1.0 / (tid + 1)
+        rnt = max(1.0 / (tid + 1), RNT_FLOOR)
         outputs_mem = model(mem_v)
         with torch.no_grad():
             teacher_logits = teacher_model(mem_v)
@@ -919,7 +935,7 @@ def main():
         "day_mapping": day_mapping,
         "mem_size": MEM_SIZE, "buffer_strategy": "uniform_50_50",
         "madar_contamination": MADAR_CONTAMINATION, "kd_temp": KD_TEMP,
-        "si_c": SI_C, "si_eps": SI_EPS, "task0_epochs": TASK0_EPOCHS,
+        "si_c": SI_C, "si_eps": SI_EPS, "rnt_floor": RNT_FLOOR, "task0_epochs": TASK0_EPOCHS,
         "cl_iters": CL_ITERS, "batch_size": BATCH_SIZE, "feature_clip": FEATURE_CLIP,
     }
     with open(os.path.join(out_dir, f"{args.log_name}.json"), "w") as f:
