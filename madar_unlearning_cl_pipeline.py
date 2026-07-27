@@ -54,10 +54,27 @@ Four decisions made, not silently assumed (flag anything you want changed):
     matter more than phi1/phi2's raw/latent geometry alone against this
     pipeline's evasion-crafted poisoning specifically (minimal, decision-
     boundary-targeted perturbations are optimized to NOT look geometrically
-    anomalous -- see discussion in commit history / conversation). phi6
-    (distance to family centroid) and phi7 (log family size) from that same
-    paper are EMBER-specific (malware-family concept) and don't transfer to
-    CICIDS's flat binary labeling -- not planned for any iteration here.
+    anomalous -- see discussion in commit history / conversation). Critically,
+    phi3-5 need to be computed against the PRE-task-t snapshot of the model
+    (teacher_model, as captured before this task's train_cl_er call), not the
+    post-CL-training model detect_poison_if_latent() reads today -- by the
+    time detection runs post-training, the model has already been fit to
+    Tt's labels (poison included), so forget_set's acc_before=1.0 in most
+    tasks of the first smoke test just reflects "training memorized this,"
+    not "this looks confident/typical." Computing loss/entropy/margin against
+    teacher_model instead directly asks "did this fool the classifier as it
+    stood when the red agent attacked it" -- the actual definition of poison
+    here (REQUIRE_EVASION_SUCCESS=True) -- without reading poison_idx itself.
+    phi6 (distance to family centroid) and phi7 (log family size) from that
+    same paper are EMBER-specific (malware-family concept) and don't transfer
+    to CICIDS's flat binary labeling -- not planned for any iteration here.
+
+    Every detect_poison_if_latent() call is now also scored (evaluation only,
+    never fed back into the detector) against poison_idx ground truth --
+    detector_eval in each checkpoint's "unlearning" block logs precision
+    (fraction of Df_t that's true poison) and recall (fraction of true poison
+    caught), so detector quality is measurable directly instead of inferred
+    from downstream accuracy deltas.
 
   - WEIGHT PROTECTION during unlearning uses the existing SI (omega/p_old_task)
     machinery already implemented and validated in madar_cl_pipeline.py, not
@@ -66,7 +83,21 @@ Four decisions made, not silently assumed (flag anything you want changed):
     wording -- MAS is a different importance computation (gradient of squared
     output-norm, not SI's path integral) that neither reference implements and
     that would need to be built and validated from scratch for no
-    demonstrated benefit yet.
+    demonstrated benefit yet. The first smoke test (madar_u1.json) showed
+    forget-set accuracy completely unmoved on several tasks (2/3/4: exactly
+    1.000 -> 1.000 despite real gradient steps) alongside catastrophic
+    prior-task collateral damage on another (task 7: -0.17 balanced accuracy
+    on task 0, isolated to the unlearning phase specifically by
+    prior_tasks_recovery) -- inconsistent, task-dependent symptoms consistent
+    with SI's diagonal per-parameter penalty sometimes freezing the forget
+    objective and sometimes failing to protect against it, rather than a
+    single miscalibration to fix with one number. Rather than swap frameworks
+    on a hypothesis, unlearn_teacher_guided now returns raw (pre-weighting)
+    loss-component magnitudes and omega's L2 norm every call (see its
+    docstring) so this can be checked directly, and UNLEARN_SI_C decouples
+    unlearning's SI weight from CL training's SI_C (still 1.0, unchanged) --
+    set to 0.1 as a first-pass guess, meant to be tuned against the next
+    smoke test's diagnostics rather than treated as settled.
 
   - BUFFER ORDERING deviates from the outline's literal steps 2/6 (add Tt to
     the buffer in full, forget-detect, then filter Df_t back out afterward).
@@ -184,6 +215,15 @@ UNLEARN_ALPHA = 0.2      # weight of the forget loss; 0.0 = extra-training contr
                           # ablation (identical steps/optimizer/data flow, no forget
                           # objective -- isolates "more training" from "actually
                           # targeting forgetting")
+UNLEARN_SI_C = 0.1  # SI penalty weight during UNLEARNING ONLY -- deliberately
+                     # decoupled from SI_C (still 1.0 for ordinary CL training,
+                     # unchanged). First smoke test (madar_u1.json) showed forget-set
+                     # accuracy completely unmoved on several tasks despite real
+                     # gradient steps, consistent with SI's accumulated-omega penalty
+                     # dominating the forget objective's gradient at si_c=1.0 -- this
+                     # is a first-pass guess at a softer value, NOT yet tuned; see the
+                     # loss-component diagnostics logged in unlearn_teacher_guided's
+                     # return value for the data to tune it against.
 POISON_DETECTOR = "if_latent_phi1_donut_hole"  # logged into config/results for
                                                 # provenance; see module docstring's
                                                 # "poison detection" note
@@ -705,6 +745,12 @@ def unlearn_teacher_guided(model, teacher_model, forget_loader, retain_loader, o
     alpha=0 is the extra-training control ablation: identical steps, optimizer,
     and data flow, with zero forget-loss weight -- isolates "does more training
     alone help" from "does actually targeting the forget set help".
+
+    Returns a diagnostics dict (raw, PRE-weighting loss component magnitudes,
+    averaged across all steps, plus omega's L2 norm at call time) -- added after
+    the first smoke test showed forget-set accuracy completely unmoved on
+    several tasks despite real gradient steps, to see directly whether the SI
+    term is dominating the forget objective rather than just hypothesizing it.
     """
     global replay_buffer
     model.train()
@@ -716,6 +762,8 @@ def unlearn_teacher_guided(model, teacher_model, forget_loader, retain_loader, o
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
+    omega_l2_norm = float(torch.sqrt(sum((v ** 2).sum() for v in omega.values())).item())
+
     retain_iter = iter(cycle(retain_loader))
     if replay_buffer:
         b_v = torch.stack([entry[0] for entry in replay_buffer])
@@ -724,6 +772,8 @@ def unlearn_teacher_guided(model, teacher_model, forget_loader, retain_loader, o
         buf_iter = iter(cycle(buf_loader))
     else:
         buf_iter = None
+
+    raw_forget_losses, raw_retain_losses, raw_si_losses = [], [], []
 
     for epoch in range(epochs):
         for f_v, f_l in forget_loader:
@@ -769,6 +819,18 @@ def unlearn_teacher_guided(model, teacher_model, forget_loader, retain_loader, o
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
+
+            raw_forget_losses.append(forget_loss.item())
+            raw_retain_losses.append(retain_loss.item())
+            raw_si_losses.append(float(si_loss.item()) if torch.is_tensor(si_loss) else float(si_loss))
+
+    return {
+        "omega_l2_norm": omega_l2_norm,
+        "n_steps": len(raw_forget_losses),
+        "raw_forget_loss_mean": float(np.mean(raw_forget_losses)) if raw_forget_losses else None,
+        "raw_retain_loss_mean": float(np.mean(raw_retain_losses)) if raw_retain_losses else None,
+        "raw_si_loss_mean": float(np.mean(raw_si_losses)) if raw_si_losses else None,
+    }
 
 
 def measure_unlearning_efficacy(model_before, model_after, loader, device):
@@ -862,10 +924,11 @@ def plot_unlearning_metrics(results, out_path):
     unlearning, and step 7's prior-task recovery check (mean held-out balanced
     accuracy across every earlier task, before vs. after THIS task's unlearning
     phase specifically -- isolating unlearning's own effect from CL training's).
-    Tasks with no unlearning this run (task 0, or an empty oracle Df_t) simply
-    don't appear on the x-axis.
+    Tasks with no unlearning this run (task 0, or an empty Df_t -- the latter
+    now still logs a "detector_eval"-only entry, so filter on "forget_set"
+    specifically, not just truthiness) simply don't appear on the x-axis.
     """
-    unl_tasks = [r for r in results if r.get("unlearning")]
+    unl_tasks = [r for r in results if r.get("unlearning") and "forget_set" in r["unlearning"]]
     if not unl_tasks:
         print("[Plot] No tasks ran unlearning yet -- skipping unlearning_metrics plot.")
         return
@@ -1165,9 +1228,28 @@ def main():
             print(f"    [Detect] Df_t (phi1 latent-IF donut-hole) = {len(forget_idx)} samples, "
                   f"retain = {len(retain_idx)}")
 
+            # Evaluation-only: how much of Df_t is ACTUALLY poison, per ground
+            # truth. Never fed back into the detector's own decision (that would
+            # be the oracle again) -- purely for scoring detector quality this run.
+            poison_set = set(int(i) for i in poison_idx)
+            forget_set_idx = set(int(i) for i in forget_idx)
+            overlap = poison_set & forget_set_idx
+            detector_eval = {
+                "n_poison_true": len(poison_set),
+                "n_forget_poison_overlap": len(overlap),
+                "precision": (len(overlap) / len(forget_set_idx)) if forget_set_idx else None,
+                "recall": (len(overlap) / len(poison_set)) if poison_set else None,
+            }
+            if detector_eval["precision"] is not None and detector_eval["recall"] is not None:
+                print(f"    [Detect eval, oracle-scored] precision={detector_eval['precision']:.3f} "
+                      f"recall={detector_eval['recall']:.3f} "
+                      f"({len(overlap)}/{len(forget_set_idx)} forgotten samples were true poison, "
+                      f"{len(overlap)}/{len(poison_set)} true poison samples were caught)")
+
             if len(forget_idx) == 0:
                 print("    [Unlearning] Df_t empty -- skipping unlearning phase for this task.")
                 Xtr_for_buffer, ytr_for_buffer, category_for_buffer = Xtr, ytr, category
+                unlearning_metrics = {"detector": POISON_DETECTOR, "n_forget": 0, "detector_eval": detector_eval}
             else:
                 forget_idx_t = torch.tensor(forget_idx, dtype=torch.long)
                 retain_idx_t = torch.tensor(retain_idx, dtype=torch.long)
@@ -1185,15 +1267,19 @@ def main():
                 }
 
                 model_pre_unlearn = copy.deepcopy(model)
-                print(f"    [Unlearn] task {t} (alpha={UNLEARN_ALPHA}, "
+                print(f"    [Unlearn] task {t} (alpha={UNLEARN_ALPHA}, si_c={UNLEARN_SI_C}, "
                       f"n_forget={len(forget_idx)}, n_retain={len(retain_idx)})...")
-                unlearn_teacher_guided(
+                unlearn_diag = unlearn_teacher_guided(
                     model=model, teacher_model=model_pre_unlearn,
                     forget_loader=forget_loader, retain_loader=retain_loader,
-                    omega=omega, p_old_task=p_old_task, si_c=SI_C,
+                    omega=omega, p_old_task=p_old_task, si_c=UNLEARN_SI_C,
                     epochs=UNLEARN_EPOCHS, lr=UNLEARN_LR, alpha=UNLEARN_ALPHA, device=DEVICE,
                 )
                 grad_steps += UNLEARN_EPOCHS * len(forget_loader)
+                print(f"    [Unlearn diag] omega_l2={unlearn_diag['omega_l2_norm']:.3f}, raw losses "
+                      f"forget={unlearn_diag['raw_forget_loss_mean']:.4f} "
+                      f"retain={unlearn_diag['raw_retain_loss_mean']:.4f} "
+                      f"si={unlearn_diag['raw_si_loss_mean']:.4f} (unweighted, before alpha/si_c)")
 
                 f_m = measure_unlearning_efficacy(model_pre_unlearn, model, forget_loader, DEVICE)
                 r_m = measure_unlearning_efficacy(model_pre_unlearn, model, retain_loader, DEVICE)
@@ -1215,6 +1301,8 @@ def main():
                 unlearning_metrics = {
                     "detector": POISON_DETECTOR,
                     "n_forget": int(len(forget_idx)), "n_retain": int(len(retain_idx)),
+                    "detector_eval": detector_eval,
+                    "unlearn_diagnostics": unlearn_diag,
                     "forget_set": f_m, "retain_set": r_m,
                     "prior_tasks_recovery": {
                         "pre_unlearn": pre_unlearn_prior_eval,
@@ -1282,6 +1370,7 @@ def main():
         "si_c": SI_C, "si_eps": SI_EPS, "rnt_floor": RNT_FLOOR, "task0_epochs": TASK0_EPOCHS,
         "cl_iters": CL_ITERS, "batch_size": BATCH_SIZE, "feature_clip": FEATURE_CLIP,
         "unlearn_epochs": UNLEARN_EPOCHS, "unlearn_lr": UNLEARN_LR, "unlearn_alpha": UNLEARN_ALPHA,
+        "unlearn_si_c": UNLEARN_SI_C, "donut_forget_ratio": DONUT_FORGET_RATIO,
     }
     with open(os.path.join(out_dir, f"{args.log_name}.json"), "w") as f:
         json.dump({"config": config, "warnings": warnings_log, "results": results}, f, indent=2)
