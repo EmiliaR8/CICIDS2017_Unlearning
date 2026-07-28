@@ -283,6 +283,13 @@ POISON_TEST_DATA = True  # BRANCH-SPECIFIC divergence from naive/joint/madar_cl_
 # Identical to madar_cl_pipeline.py's, so both pipelines see the SAME
 # poisoned data each task -- any difference in outcomes is attributable to
 # the STRATEGY, not to one pipeline facing easier/harder data.
+POISON_SCHEDULE_ENABLED = True  # toggle: True = the linear train/test schedule below.
+                                 # False = flat POISON_FRACTION_FLAT for BOTH train and
+                                 # test, every task -- restores pre-schedule behavior.
+POISON_FRACTION_FLAT = 0.30  # fallback fraction (both train and test) when
+                              # POISON_SCHEDULE_ENABLED is False. Matches the old flat
+                              # POISON_FRACTION this schedule replaced, and the
+                              # schedule's own midpoint/crossing value.
 POISON_FRACTION_TRAIN_START = 0.50  # task 1
 POISON_FRACTION_TRAIN_END = 0.10    # task NUM_TASKS-1
 POISON_FRACTION_TEST_START = 0.10   # task 1
@@ -291,7 +298,11 @@ POISON_FRACTION_TEST_END = 0.50     # task NUM_TASKS-1
 
 def poison_fraction_for_task(t, start, end, num_tasks=NUM_TASKS):
     """Linear interpolation from `start` (task 1) to `end` (task num_tasks-1).
-    t=0 is never called (task 0 has no red agent / no poisoning)."""
+    t=0 is never called (task 0 has no red agent / no poisoning). Returns
+    POISON_FRACTION_FLAT instead, ignoring start/end, whenever
+    POISON_SCHEDULE_ENABLED is False."""
+    if not POISON_SCHEDULE_ENABLED:
+        return POISON_FRACTION_FLAT
     if num_tasks <= 2:
         return start
     frac = (t - 1) / (num_tasks - 2)
@@ -1700,6 +1711,7 @@ def main():
         "poison_detector": POISON_DETECTOR,
         "h5_path": args.h5_path, "seed": args.seed, "num_tasks": NUM_TASKS,
         "task_fractions": TASK_FRACTIONS, "task_test_frac": TASK_TEST_FRAC,
+        "poison_schedule_enabled": POISON_SCHEDULE_ENABLED, "poison_fraction_flat": POISON_FRACTION_FLAT,
         "poison_fraction_train_start": POISON_FRACTION_TRAIN_START,
         "poison_fraction_train_end": POISON_FRACTION_TRAIN_END,
         "poison_fraction_test_start": POISON_FRACTION_TEST_START,
