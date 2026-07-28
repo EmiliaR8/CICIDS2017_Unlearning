@@ -52,6 +52,22 @@ Unlearning stays scoped to training data only -- Df_t is never drawn from
 test, since there's nothing to "forget" from data never trained on; this
 only changes what per_task_eval/pooled_eval/prior_tasks_recovery measure.
 
+UPDATE 2: per-task component order changed. Previously: train -> detect ->
+unlearn -> IsolationForest/buffer -> test (test was LAST, so per_task_eval/
+pooled_eval always reflected the POST-unlearning model). Now: train -> TEST
+-> detect -> unlearn -> IsolationForest/buffer, so per_task_eval/pooled_eval
+are the model's PRE-unlearning snapshot for task t, and that buffer refresh
+is what task t+1's training reads next iteration (unchanged -- buffer was
+always "this task's refresh feeds next task's training", moving test earlier
+doesn't touch that). detect_poison_oracle was already maximally targeted at
+this task's own perturbation samples (Df_t = poison_idx, drawn only from
+Xtr/ytr, never broader) before this change and still is -- nothing to adjust
+there. To avoid losing the post-unlearning view of THIS task's own numbers
+(previously the headline; useful for exactly the kind of before/after
+analysis done on madar_u1-u4), unlearning_metrics now separately logs
+post_unlearn_this_task_eval alongside the existing prior_tasks_recovery
+bracket (which still covers OLDER tasks and is untouched by this reorder).
+
 Outline this implements (task loop, for each task t with a red agent):
   1. Train on Tt via MADAR's existing ER+KD+SI step (train_cl_er, unchanged).
   2/6. Update replay buffer P -- see "buffer ordering" below for the one change
@@ -907,7 +923,7 @@ def plot_task_metrics(results, out_path):
     ax1.plot(task_ids, pooled_bal_acc, marker="o", label="pooled balanced accuracy")
     ax1.plot(task_ids, mean_per_task_bal_acc, marker="s", label="mean per-task balanced accuracy")
     ax1.set_ylabel("Balanced accuracy")
-    ax1.set_title("MADAR+Unlearning: classifier accuracy per task boundary")
+    ax1.set_title("MADAR+Unlearning: classifier accuracy per task boundary (PRE-unlearning snapshot)")
     ax1.legend()
     ax1.grid(alpha=0.3)
 
@@ -1229,6 +1245,9 @@ def main():
 
         unlearning_metrics = None
 
+        # ============================================================
+        # 1. TRAIN on this task's train split.
+        # ============================================================
         if t == 0:
             print(f"  Samples: {len(Xtr)} | pure supervised pretraining, {TASK0_EPOCHS} epochs")
             drop_last = (len(Xtr) % BATCH_SIZE == 1)
@@ -1252,8 +1271,6 @@ def main():
             for n, p in model.named_parameters():
                 if p.requires_grad:
                     p_old_task[n.replace('.', '__')] = p.detach().clone()
-            teacher_model = copy.deepcopy(model); teacher_model.eval()
-            update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
 
         else:
             print(f"  Samples: {len(Xtr)} (+{len(replay_buffer)} replay) | "
@@ -1280,7 +1297,42 @@ def main():
                     omega[n_key] += W[n_key] / ((p_post_cl - p_old_task[n_key]) ** 2 + SI_EPS)
                     W[n_key].zero_()
 
-            # --- Steps 3 + 4: detect poison (ORACLE, this branch), skip if empty ---
+        # ============================================================
+        # 2. TEST on the (poisoned) test split -- REORDERED here, right after
+        # training and BEFORE this task's forget-set population/unlearning,
+        # per explicit request. These per_task_eval/pooled_eval numbers are
+        # now the OFFICIAL logged per-task numbers, reflecting the model
+        # PRE-unlearning. Nothing is lost by moving them earlier: unlearning's
+        # effect on THIS task's own numbers is still captured separately below
+        # (unlearning_metrics.post_unlearn_this_task_eval), and its effect on
+        # every OLDER task is still captured by prior_tasks_recovery, unchanged.
+        # ============================================================
+        per_task_eval = {j: evaluate_classifier(classifier_wrapper, *task_test_splits[j]) for j in range(t + 1)}
+        pooled_X = np.concatenate([task_test_splits[j][0] for j in range(t + 1)])
+        pooled_y = np.concatenate([task_test_splits[j][1] for j in range(t + 1)])
+        pooled_eval = evaluate_classifier(classifier_wrapper, pooled_X, pooled_y)
+        mean_per_task_bal_acc = float(np.mean([per_task_eval[j]["balanced_accuracy"] for j in range(t + 1)]))
+
+        print(f"[Task {t} classifier, PRE-unlearning] this-task bal_acc={per_task_eval[t]['balanced_accuracy']:.4f} "
+              f"pooled bal_acc={pooled_eval['balanced_accuracy']:.4f} "
+              f"mean-per-task bal_acc={mean_per_task_bal_acc:.4f}")
+
+        # ============================================================
+        # 3. FORGET SET POPULATION -- detect_poison_oracle draws Df_t =
+        # poison_idx exactly, from Xtr/ytr (THIS task's own training data
+        # only) -- already maximally targeted at this task's own perturbed
+        # samples, never anything broader (no prior-task or buffer data is
+        # ever a forget-set candidate). Unlearning then runs against Df_t.
+        # 4. ISOLATION FOREST / REPLAY BUFFER POPULATION -- update_buffer_madar,
+        # from the post-unlearning retain set. Whatever this leaves in
+        # replay_buffer is exactly what task t+1's training (step 1, next
+        # iteration) reads via train_cl_er.
+        # ============================================================
+        if t == 0:
+            teacher_model = copy.deepcopy(model); teacher_model.eval()
+            update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
+
+        else:
             forget_idx, retain_idx = detect_poison_oracle(poison_idx, len(Xtr))
             print(f"    [Detect] Df_t (oracle ground truth) = {len(forget_idx)} samples, "
                   f"retain = {len(retain_idx)}")
@@ -1348,6 +1400,17 @@ def main():
                     j: evaluate_classifier(classifier_wrapper, *task_test_splits[j]) for j in range(t)
                 }
 
+                # NEW (this reorder): per_task_eval[t]/pooled_eval above are now
+                # frozen at the PRE-unlearning snapshot (step 2), so this task's
+                # own post-unlearning number needs its own explicit checkpoint --
+                # otherwise it would only ever be visible once task t+1 evaluates
+                # it as a "prior task". Same evaluate_classifier call as
+                # everything else, just scoped to THIS task's test split.
+                post_unlearn_this_task_eval = evaluate_classifier(classifier_wrapper, *task_test_splits[t])
+                print(f"    [This task] bal_acc after its own unlearning: "
+                      f"{per_task_eval[t]['balanced_accuracy']:.4f} -> "
+                      f"{post_unlearn_this_task_eval['balanced_accuracy']:.4f}")
+
                 for tag, m in (("Forget set", f_m), ("Retain set", r_m)):
                     print(f"    [{tag}] acc {m['acc_before']:.4f} -> {m['acc_after']:.4f}, "
                           f"entropy_norm={m['entropy_norm']:.3f}, latent shift "
@@ -1363,6 +1426,7 @@ def main():
                     "detector_eval": detector_eval,
                     "unlearn_diagnostics": unlearn_diag,
                     "forget_set": f_m, "retain_set": r_m,
+                    "post_unlearn_this_task_eval": post_unlearn_this_task_eval,
                     "prior_tasks_recovery": {
                         "pre_unlearn": pre_unlearn_prior_eval,
                         "post_unlearn": post_unlearn_prior_eval,
@@ -1389,16 +1453,6 @@ def main():
 
         buffer_summary = buffer_composition_summary()
         print(f"    [Buffer] composition: {buffer_summary}")
-
-        per_task_eval = {j: evaluate_classifier(classifier_wrapper, *task_test_splits[j]) for j in range(t + 1)}
-        pooled_X = np.concatenate([task_test_splits[j][0] for j in range(t + 1)])
-        pooled_y = np.concatenate([task_test_splits[j][1] for j in range(t + 1)])
-        pooled_eval = evaluate_classifier(classifier_wrapper, pooled_X, pooled_y)
-        mean_per_task_bal_acc = float(np.mean([per_task_eval[j]["balanced_accuracy"] for j in range(t + 1)]))
-
-        print(f"[Task {t} classifier] this-task bal_acc={per_task_eval[t]['balanced_accuracy']:.4f} "
-              f"pooled bal_acc={pooled_eval['balanced_accuracy']:.4f} "
-              f"mean-per-task bal_acc={mean_per_task_bal_acc:.4f}")
 
         results.append({
             "task_id": t,
