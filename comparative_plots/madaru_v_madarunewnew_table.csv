@@ -1,0 +1,3 @@
+run,strategy,final_pooled_balanced_accuracy,final_mean_per_task_balanced_accuracy,final_test_evasion_rate,avg_poison_rate_achieved
+madar_u6_oracle,madar_er_kd_si_plus_unlearning,0.8793208311303022,0.8498410381651382,1.0,0.12961353453550079
+madar6,madar_er_kd_si,0.8780675536034308,0.8657288010344676,1.0,0.2701497377924557
