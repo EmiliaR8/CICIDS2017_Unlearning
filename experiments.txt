@@ -10,32 +10,42 @@ python joint_cl_pipeline.py --seed 42 --log_name joint2                      Joi
 
 
 python madar_cl_pipeline.py --seed 42 --log_name madar1                       MADAR   the rnt schedule increasingly prevents it from learning new ones as the task count grows, Claude provided three options (rnt = max(1/(tid+1), floor), Drop the schedule, use a flat constant(Loses the idea that later tasks should trust accumulated memory more), Base it on actual data volume instead of task index(but this might cause some forgetting)) and chose option A, will look through the json before making any other changes
-python madar_cl_pipeline.py --seed 42 --log_name madar2*                       MADAR   Better than madar 1, checking to see if we can make it better for task 8 and 9 by increasing rnt to 0.5// runs/madar/madar2/madar2.json
+python madar_cl_pipeline.py --seed 42 --log_name madar2                       MADAR   Better than madar 1, checking to see if we can make it better for task 8 and 9 by increasing rnt to 0.5// runs/madar/madar2/madar2.json
 python madar_cl_pipeline.py --seed 42 --log_name madar3                       MADAR   It was not better at learning newer tasks by increasing rnt, Keep at 0.3
 python madar_cl_pipeline.py --seed 42 --log_name madar4                       MADAR   Checking to see if increasing the poison cap to 1000 will change any results: **Have claude compare the logs for MADAR2 and MADAR4, because the perforamnce is better with more poisoned samples
+python madar_cl_pipeline.py --seed 42 --log_name madar5*                       MADAR   Changing logic to ensure that perturbed samples are included in the testing batch, and logging the pertrubed samples like MADAR_UnlEARNING// did change the results to what we need, might want to optimize with other hyper parameters
+
+
 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u1         MADAR+U  First iteration of the MADAR+Unlearning pipeline, donut hole implementation (like EMBER): Many issues logged in chat with piplai, need to modify donut, SI, and isolation forest logic
-python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u2         MADAR+U  First iteration v2, but with softened SI and logs that ensure that this was the right move: SI did nothing, 
-python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u3         MADAR+U   
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u2         MADAR+U  First iteration v2, but with softened SI and logs that ensure that this was the right move: SI did nothing, not better or worse, 
+
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u3_oracle  MADAR+U  Uses the oracle to tell what samples to unlearn: 
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u4_oracle  MADAR+U  Incliude pertrubed samples in the test set, lower:  
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u5_oracle  MADAR+U  Swap the order of the pipeline: This did not make the results much better, maybe by 1% 
+
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u6_oracle  MADAR+U  and forgetting only a fraction of the malcious samples (0.1): performed well, though some samples did make it to the replay buffer
 
 
 
 
 
 
-python compare_cl_runs.py  runs/madar_unlearning/madar_u1/madar_u1.json  runs/madar_unlearning/madar_u2/madar_u2.json  --out madaru1_v_madaru2.png --include_table
+
+
+python compare_cl_runs.py  runs/madar/madar5/madar5.json runs/madar_unlearning/madar_u6_oracle/madar_u6_oracle.json --out madaru_v_madaru6.png --include_table
 
 
 
 Tasks:
-2. IF you know which poisoned samples we have, and we manually unlearn them (using the oracle to tell the unlearner which samples it should unlearn)
-2. Generate new iteration 1 code with logic to log iindeces that are pertrubed to track them down in case we want to generate tsne representations of the samples that were pushed into the buffer, or compare pertrubed samples across tasks
+1. Check if there are pertrubed samples in the test batches for naive and joint
+2. Augment the performace for MADAR+Unlearning with suggestions by piplai
+3. Check if the oracle forgetter is alright or need to get rid of this guy
 
 then try iteration 2 of madar_u BUT include the logic for donut home, toggle on/off
 
 
 Push baseline pipelines to main, then start a new branch where we create more dramatic scenarios
-**IF you know which poisoned samples we have, and we manually unlearn them (using the oracle to tell the unlearner which samples it should unlearn)
 **Make MLP more simple, hand in hand with scenario X
 **Do scenario where the majority of the pertrubed samples are used in the test batch not train batch
 
