@@ -36,7 +36,21 @@ matters. This branch also adds global sample-id tracking (see
 update_buffer_madar/buffer_composition_summary and `gid_train` in main())
 so buffer contents and poisoned samples can be traced across tasks for
 later tSNE-style analysis -- independent of the oracle-vs-phi1 question,
-worth porting back to main either way.
+worth porting back to main either way. UPDATE: this branch also flips
+POISON_TEST_DATA on -- naive/joint/madar_cl_pipeline.py's shared
+convention (and this file's own original design) was to NEVER poison test
+data, since evasion rate already measures test-time generalization and
+poisoning eval labels was judged likely to conflate "evaded" with "ground
+truth malicious." That reasoning holds for the OTHER three pipelines
+(no unlearning to test), but for THIS question it left a gap: with test
+always clean, there was no way to check whether detection/unlearning
+generalizes to evasive samples the classifier never trained on, only
+whether it handles memorized training-time poison. POISON_TEST_DATA
+applies the same evaded-mask-restricted POISON_FRACTION substitution to
+each task's test split too (see its definition below for exactly what).
+Unlearning stays scoped to training data only -- Df_t is never drawn from
+test, since there's nothing to "forget" from data never trained on; this
+only changes what per_task_eval/pooled_eval/prior_tasks_recovery measure.
 
 Outline this implements (task loop, for each task t with a red agent):
   1. Train on Tt via MADAR's existing ER+KD+SI step (train_cl_er, unchanged).
@@ -167,6 +181,17 @@ TASK_TEST_FRAC = 0.20
 
 POISON_FRACTION = 0.3
 REQUIRE_EVASION_SUCCESS = True  # only successfully-evasive perturbations poison training data
+POISON_TEST_DATA = True  # BRANCH-SPECIFIC divergence from naive/joint/madar_cl_pipeline.py's
+                          # shared convention (test is normally NEVER poisoned -- see this
+                          # file's module docstring, BRANCH NOTE). When True, the SAME
+                          # evaded-mask-restricted, POISON_FRACTION-sized substitution applied
+                          # to train is also applied to each task's test split, so per_task_eval
+                          # /pooled_eval/prior_tasks_recovery measure accuracy on data that
+                          # includes evasive perturbations the classifier never trained on --
+                          # i.e. does detection/unlearning generalize to unseen poison, not just
+                          # memorized training-time poison. Unlearning itself stays scoped to
+                          # TRAINING data only (Df_t is never drawn from test) -- there is
+                          # nothing to "forget" from data that was never trained on.
 
 RED_EPSILON = 0.25
 RED_MAX_STEPS = 25
@@ -1098,6 +1123,8 @@ def main():
         red_report = None
         n_poisoned = 0
         poison_idx = np.array([], dtype=int)
+        n_poisoned_test = 0
+        poisoned_test_sample_ids = []
 
         if t == 0:
             print(f"\n===== Task 0 (warm start, no red agent): "
@@ -1121,10 +1148,11 @@ def main():
                         env, agent, X_train, y_train, benign_label,
                         only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
                     )
-                _, test_evasion_rate, test_rewards, test_avg_norm, test_attacked, _ = evaluate_agent_on_batch(
-                    env, agent, X_test, y_test, benign_label,
-                    only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
-                )
+                X_test_pert, test_evasion_rate, test_rewards, test_avg_norm, test_attacked, evaded_mask_test = \
+                    evaluate_agent_on_batch(
+                        env, agent, X_test, y_test, benign_label,
+                        only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                    )
 
                 red_report = {
                     "train_evasion_rate": train_evasion_rate, "train_attacked": train_attacked,
@@ -1148,6 +1176,33 @@ def main():
                 X_train_for_classifier[poison_idx] = X_train_pert[poison_idx]
                 print(f"[Task {t}] poisoned {n_poisoned}/{len(mal_idx_train)} malicious train samples "
                       f"(poison_fraction={POISON_FRACTION})")
+
+                # TEST-SIDE poisoning (POISON_TEST_DATA, this branch only -- see module
+                # docstring BRANCH NOTE and POISON_TEST_DATA's definition for why). Same
+                # evaded-mask restriction + POISON_FRACTION sizing as train, applied to
+                # this task's own test split. Overwrites task_test_splits[t] so every
+                # downstream eval (per_task_eval, pooled_eval, prior_tasks_recovery) for
+                # this task sees the poisoned test set from here on. detect_poison_oracle
+                # / unlearning never sees this -- it stays scoped to Xtr/ytr (training
+                # data) only, unchanged below.
+                if POISON_TEST_DATA:
+                    mal_idx_test = np.where(y_test == mal_label)[0]
+                    poison_pool_test = np.where(evaded_mask_test)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_test
+                    n_to_poison_test = min(int(round(POISON_FRACTION * len(mal_idx_test))), len(poison_pool_test))
+                    rng_test = np.random.RandomState(args.seed + t + 10_000)  # distinct stream from train's rng
+                    poison_idx_test = rng_test.choice(poison_pool_test, size=n_to_poison_test, replace=False) \
+                        if n_to_poison_test > 0 else np.array([], dtype=int)
+                    n_poisoned_test = len(poison_idx_test)
+
+                    X_test = X_test.copy()
+                    X_test[poison_idx_test] = X_test_pert[poison_idx_test]
+                    task_test_splits[t] = (X_test, y_test)
+                    poisoned_test_sample_ids = gid_test[poison_idx_test].tolist() if n_poisoned_test > 0 else []
+                    print(f"[Task {t}] poisoned {n_poisoned_test}/{len(mal_idx_test)} malicious TEST samples "
+                          f"(poison_fraction={POISON_FRACTION}) -- test_evasion_rate was {test_evasion_rate:.3f}")
+                else:
+                    n_poisoned_test = 0
+                    poisoned_test_sample_ids = []
 
         # Category tracking (identical to madar_cl_pipeline.py) -- feeds the
         # buffer composition diagnostic only in this file; detect_poison_oracle()
@@ -1351,6 +1406,8 @@ def main():
             "n_malicious_train": int(len(mal_idx_train)),
             "n_poisoned": n_poisoned,
             "poisoned_sample_ids": poisoned_sample_ids,
+            "n_poisoned_test": n_poisoned_test,
+            "poisoned_test_sample_ids": poisoned_test_sample_ids,
             "red_agent": red_report,
             "per_task_eval": per_task_eval,
             "pooled_eval": pooled_eval,
@@ -1366,6 +1423,7 @@ def main():
         "h5_path": args.h5_path, "seed": args.seed, "num_tasks": NUM_TASKS,
         "task_fractions": TASK_FRACTIONS, "task_test_frac": TASK_TEST_FRAC,
         "poison_fraction": POISON_FRACTION, "require_evasion_success": REQUIRE_EVASION_SUCCESS,
+        "poison_test_data": POISON_TEST_DATA,
         "red_epsilon": RED_EPSILON, "red_max_steps": RED_MAX_STEPS,
         "red_timesteps_per_task": RED_TIMESTEPS_PER_TASK, "alpha_contrast": ALPHA_CONTRAST,
         "contrastive_ema": CONTRASTIVE_EMA, "contrastive_recency_decay": CONTRASTIVE_RECENCY_DECAY,
