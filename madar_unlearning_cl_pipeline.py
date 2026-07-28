@@ -81,6 +81,53 @@ were on main. detector_eval (precision/recall) is no longer trivially
 directly, useful for sweeping "how much of the poison does the unlearner
 actually need to see to keep collateral damage low."
 
+UPDATE 5 (REWORK -- SUPERSEDES detect_poison_oracle/ORACLE_FORGET_FRACTION
+and the "BUFFER ORDERING" decision below entirely; both are kept in this
+docstring for history, not because they're still accurate). Forget-set
+construction no longer draws directly from oracle ground truth. Instead:
+
+  1. Oracle ground truth (poison_idx) is used ONLY to seed training labels
+     for a small per-task 3-class RandomForestClassifier,
+     "perturbation_classifier" (benign / malicious_clean / malicious_perturbed),
+     trained on PERTURBATION_CLASSIFIER_N (default 50, shrinking uniformly
+     across all three classes if any pool is short this task) samples per
+     class, on raw/scaled Xtr features. See
+     build_perturbation_classifier_forget_set()'s docstring for the full
+     mechanics, including why raw features over the blue model's latent
+     embedding (decouples this classifier from the blue model's
+     still-evolving, task-to-task-shifting latent space).
+  2. It then predicts on every OTHER Xtr row this task (never its own
+     150-ish training rows, to avoid trivially-correct leakage in the
+     logged eval metrics). potentially_perturbed_pool = predicted
+     malicious_perturbed AND true (binary) label malicious -- a benign
+     sample mispredicted "perturbed" is excluded, since it isn't malicious
+     at all. forget_idx = potentially_perturbed_pool exactly; this is what
+     unlearn_teacher_guided forgets (same mechanism as before, just a
+     different-provenance forget set).
+  3. BUFFER POPULATION IS NO LONGER RETAIN-ONLY. update_buffer_madar now
+     always fills from the FULL task batch, unfiltered by forget/retain --
+     identical call pattern to task 0 and to plain MADAR. The forget/retain
+     split above is used ONLY to build unlearning's retain_loader (the
+     CE+KD anchor signal), not to gate buffer eligibility anymore. This is
+     a deliberate reversal of the old "poison never enters the buffer even
+     transiently" design (see BUFFER ORDERING below, now stale) -- IsolationForest
+     may legitimately select a potentially_perturbed_pool member into the
+     buffer.
+  4. CLEAN_REPLAY_BUFFER_OF_PERTURBED (toggle, default True): immediately
+     after buffer fill, scan the just-refreshed buffer for entries whose
+     sample_id matches potentially_perturbed_pool's global ids and remove
+     them. No backfill -- a removed slot stays empty until the NEXT task's
+     refresh naturally re-ranks and fills it. When the toggle is off, the
+     buffer is left exactly as IsolationForest selected it (may contain
+     potentially_perturbed_pool members).
+  5. Both the 3-class confusion matrix (against full oracle ground truth on
+     the eval rows) and the 2-class collapsed accuracy/balanced_accuracy
+     are logged per task under unlearning.perturbation_classifier, so
+     precision/recall of the classifier itself -- e.g. how many true
+     malicious_perturbed rows it actually caught, how many
+     malicious_clean rows it mislabeled as perturbed -- is directly visible
+     without cross-referencing anything else.
+
 Outline this implements (task loop, for each task t with a red agent):
   1. Train on Tt via MADAR's existing ER+KD+SI step (train_cl_er, unchanged).
   2/6. Update replay buffer P -- see "buffer ordering" below for the one change
@@ -110,11 +157,12 @@ Four decisions made, not silently assumed (flag anything you want changed):
     measuring "did training just memorize this," not "does this look
     evasive"). phi6/phi7 (malware-family based) don't transfer to CICIDS.
 
-    THIS BRANCH overrides all of that: detect_poison_oracle() below sets
-    Df_t = poison_idx directly, no detection logic at all -- see the BRANCH
-    NOTE above for why. detector_eval (precision/recall vs. poison_idx) is
-    kept as a sanity check that this wiring is correct (trivially 1.0/1.0),
-    not a real evaluation.
+    THIS BRANCH originally overrode all of that with detect_poison_oracle()
+    (Df_t = poison_idx directly, no detection logic at all -- see the BRANCH
+    NOTE above for why). STALE as of UPDATE 5 above: forget-set construction
+    is now build_perturbation_classifier_forget_set(), which uses poison_idx
+    only to seed a small classifier's training labels, not to build Df_t
+    directly.
 
   - WEIGHT PROTECTION during unlearning uses the existing SI (omega/p_old_task)
     machinery already implemented and validated in madar_cl_pipeline.py, not
@@ -144,7 +192,10 @@ Four decisions made, not silently assumed (flag anything you want changed):
     Both reference scripts instead compute the forget/retain split FIRST,
     unlearn, and update the buffer ONCE from the retain set only -- poison
     never enters the buffer even transiently, and it's one buffer touch per
-    task instead of two. Adopted as-is here.
+    task instead of two. Adopted as-is here. STALE as of UPDATE 5 above: the
+    buffer now fills from the FULL task batch (unfiltered), closer to the
+    outline's literal steps 2/6 after all, with CLEAN_REPLAY_BUFFER_OF_PERTURBED
+    doing the "filter back out" part post-hoc instead of pre-filtering.
 
   - VERIFY RECOVERY (step 7) was under-logged in both references: they report
     forget/retain-set accuracy before/after (measure_unlearning_efficacy,
@@ -181,7 +232,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data as data
 
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix
@@ -221,16 +272,6 @@ POISON_TEST_DATA = True  # BRANCH-SPECIFIC divergence from naive/joint/madar_cl_
                           # memorized training-time poison. Unlearning itself stays scoped to
                           # TRAINING data only (Df_t is never drawn from test) -- there is
                           # nothing to "forget" from data that was never trained on.
-ORACLE_FORGET_FRACTION = 1.0  # fraction of THIS TASK's true poison_idx actually handed to
-                               # the unlearner as Df_t, drawn as a random subsample (see
-                               # detect_poison_oracle). 1.0 = every poisoned sample (original
-                               # oracle behavior). Below 1.0 simulates a detector with perfect
-                               # PRECISION (every sample it flags really is poison -- still
-                               # drawn only from poison_idx, no false positives) but imperfect
-                               # RECALL (misses the rest) -- i.e. "what if the unlearner only
-                               # gets told about some of the poison, not all of it." A fixed
-                               # global fraction, not per-task-tuned -- change it here to sweep.
-
 RED_EPSILON = 0.25
 RED_MAX_STEPS = 25
 RED_TIMESTEPS_PER_TASK = 2500
@@ -239,7 +280,7 @@ CONTRASTIVE_EMA = 0.95
 CONTRASTIVE_RECENCY_DECAY = 0.5  # weight of task (k-1) vs (k-2) vs ... in the diversity reward
 
 # Caps evaluate_agent_on_batch's per-task episode count for runtime; None = every malicious sample.
-MAX_EVAL_SAMPLES_PER_TASK = 500
+MAX_EVAL_SAMPLES_PER_TASK = 5000
 
 SAC_POLICY_KWARGS = dict(net_arch=[512, 256, 128], optimizer_kwargs={"weight_decay": 1e-4})
 SAC_KWARGS = dict(
@@ -284,9 +325,25 @@ UNLEARN_SI_C = 0.1  # SI penalty weight during UNLEARNING ONLY -- deliberately
                      # is a first-pass guess at a softer value, NOT yet tuned; see the
                      # loss-component diagnostics logged in unlearn_teacher_guided's
                      # return value for the data to tune it against.
-POISON_DETECTOR = "oracle_ground_truth"  # logged into config/results for
-                                          # provenance -- ORACLE EXPERIMENT
-                                          # BRANCH, see module docstring
+POISON_DETECTOR = "perturbation_classifier"  # logged into config/results for provenance --
+                                              # REWORK, see module docstring: replaces the old
+                                              # oracle-fraction forget set entirely.
+
+# --- Perturbation-classifier forget-set construction (REWORK, replaces
+# detect_poison_oracle/ORACLE_FORGET_FRACTION entirely -- see module
+# docstring). Oracle ground truth is now used only to SEED a small 3-class
+# classifier's training labels, not to build the forget set directly. ---
+PERTURBATION_CLASSIFIER_N = 50  # target sample count PER CLASS (benign / clean_malicious /
+                                 # perturbed) used to train perturbation_classifier each task.
+                                 # Shrinks uniformly across all three classes (same N for all)
+                                 # if any one pool has fewer than this many available this task
+                                 # -- see build_perturbation_classifier_forget_set().
+CLEAN_REPLAY_BUFFER_OF_PERTURBED = True  # toggle: after IsolationForest/buffer fill (which now
+                                          # draws from the FULL task batch, unfiltered -- see
+                                          # module docstring), remove any buffer entries that
+                                          # match potentially_perturbed_pool's global sample ids.
+                                          # No backfill -- removed slots stay empty until the
+                                          # NEXT task's refresh naturally tops them back up.
 
 
 # ---------------------------------------------------------------------------
@@ -750,42 +807,119 @@ def evaluate_classifier(classifier, X, y):
 
 
 # ---------------------------------------------------------------------------
-# Step 3 -- poison detection, ORACLE EXPERIMENT BRANCH (see module docstring).
-# Not phi1 -- this branch deliberately swaps back to ground truth to test
-# whether the unlearning MECHANISM behaves once detection is taken out of the
-# picture entirely, before spending more effort on phi1/phi3-5 statistical
-# features. main branch keeps phi1 (detect_poison_if_latent); that function is
-# untouched there -- this is a separate branch, not a replacement for it.
+# Step 3 -- forget-set construction, PERTURBATION-CLASSIFIER REWORK (see
+# module docstring). Replaces the old detect_poison_oracle/ORACLE_FORGET_FRACTION
+# entirely -- oracle ground truth (poison_idx) is now used only to SEED a
+# small 3-class classifier's training labels, never to build the forget set
+# directly. main branch keeps phi1 (detect_poison_if_latent); untouched, this
+# is a separate branch, not a replacement for it.
 # ---------------------------------------------------------------------------
-def detect_poison_oracle(poison_idx, n_samples, forget_fraction=ORACLE_FORGET_FRACTION, rng=None):
-    """
-    Df_t = a random forget_fraction-sized subsample of poison_idx -- the
-    ground-truth set of samples the red-agent poisoning step substituted with
-    evaded perturbations this task (main() already computes this for the
-    category-tracking/buffer diagnostic; no new computation here). At
-    forget_fraction=1.0 (default), Df_t = poison_idx exactly, unchanged from
-    this branch's original behavior. Below 1.0, still zero false positives
-    (every element of Df_t really is poison -- precision stays 1.0) but
-    recall drops to forget_fraction, simulating an imperfect-recall detector
-    without touching detection logic itself. retain_idx = everything else,
-    including whatever poison this call didn't select -- unforgotten poison
-    is retained (and thus buffer-eligible) exactly like phi1's false
-    negatives were.
+LABEL_BENIGN = "benign"
+LABEL_CLEAN_MALICIOUS = "malicious_clean"
+LABEL_PERTURBED = "malicious_perturbed"
+PERTURBATION_CLASSIFIER_CLASSES = [LABEL_BENIGN, LABEL_CLEAN_MALICIOUS, LABEL_PERTURBED]
 
-    Returns (forget_idx, retain_idx) as sorted int64 index arrays into this
-    task's own Xtr/ytr -- the same contract detect_poison_if_latent uses on
-    main, so swapping back to a real detector later is a one-function change.
+
+def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, benign_label, mal_label,
+                                              rng, n_target=PERTURBATION_CLASSIFIER_N):
+    """
+    Trains a small per-task RandomForestClassifier ("perturbation_classifier")
+    to distinguish benign / malicious_clean / malicious_perturbed on RAW
+    (already-scaled) Xtr features, then uses its predictions -- not oracle
+    ground truth -- to build the forget set.
+
+    1. Oracle draws N per class (benign, malicious_clean = malicious minus
+       poison_idx, malicious_perturbed = poison_idx), N shrinking uniformly
+       across all three classes if any pool has fewer than n_target
+       available this task, so the training set stays class-balanced. This
+       is the ONLY place poison_idx's ground truth "perturbed" label is
+       ever handed to a model as a training target -- nothing downstream of
+       this classifier sees it.
+    2. Classifier trains on those 3*N samples only, then predicts on every
+       OTHER Xtr sample this task (never its own training rows -- avoids
+       leaking their trivially-known labels into the eval metrics below).
+    3. potentially_perturbed_pool = predicted malicious_perturbed AND whose
+       actual ytr label is mal_label (the ordinary binary label the rest of
+       the pipeline sees -- a benign sample the classifier mislabels
+       "perturbed" is excluded, since it isn't malicious at all).
+
+    forget_idx = potentially_perturbed_pool exactly. retain_idx = everything
+    else -- used ONLY to build unlearning's retain_loader (the CE+KD anchor
+    signal), NOT for buffer eligibility anymore (see module docstring/
+    UPDATE 5 -- buffer now fills from the full task batch, unfiltered, and
+    gets cleaned of potentially_perturbed_pool matches afterward instead).
+
+    Returns None if n_target shrinks to 0 for any class this task (no poison,
+    or one of the three pools is empty) -- caller should skip the classifier/
+    forget-set step entirely for this task, same as the old empty-Df_t path.
+    Otherwise returns a dict: forget_idx, retain_idx (sorted int64 arrays
+    into Xtr), n_used (the actual per-class N after shrinking),
+    confusion_matrix (3x3, row/col order == PERTURBATION_CLASSIFIER_CLASSES,
+    computed against oracle ground truth on the held-out eval rows only),
+    two_class_metric (predicted benign -> compare to true benign; predicted
+    malicious_clean OR malicious_perturbed -> compare to true malicious;
+    accuracy + balanced_accuracy over the SAME held-out eval rows), and
+    n_eval (how many rows the classifier was scored against).
     """
     poison_idx = np.asarray(poison_idx, dtype=np.int64)
-    if forget_fraction < 1.0 and len(poison_idx) > 0:
-        rng = rng if rng is not None else np.random.RandomState(SEED)
-        n_forget = int(round(forget_fraction * len(poison_idx)))
-        poison_idx = rng.choice(poison_idx, size=n_forget, replace=False) if n_forget > 0 else \
-            np.array([], dtype=np.int64)
+    y_np = ytr.numpy()
+    n_samples = len(y_np)
 
-    forget_idx = np.asarray(sorted(int(i) for i in poison_idx), dtype=np.int64)
+    mal_idx = np.where(y_np == mal_label)[0]
+    benign_idx = np.where(y_np == benign_label)[0]
+    clean_mal_idx = np.setdiff1d(mal_idx, poison_idx)
+
+    n_used = min(n_target, len(poison_idx), len(clean_mal_idx), len(benign_idx))
+    if n_used == 0:
+        return None
+
+    train_perturbed = rng.choice(poison_idx, size=n_used, replace=False)
+    train_clean_mal = rng.choice(clean_mal_idx, size=n_used, replace=False)
+    train_benign = rng.choice(benign_idx, size=n_used, replace=False)
+    train_idx = np.concatenate([train_benign, train_clean_mal, train_perturbed])
+    train_labels = np.array(
+        [LABEL_BENIGN] * n_used + [LABEL_CLEAN_MALICIOUS] * n_used + [LABEL_PERTURBED] * n_used
+    )
+
+    X_np = Xtr.numpy()
+    clf = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=SEED, n_jobs=-1)
+    clf.fit(X_np[train_idx], train_labels)
+
+    eval_idx = np.setdiff1d(np.arange(n_samples, dtype=np.int64), train_idx)
+    eval_pred = clf.predict(X_np[eval_idx])
+
+    # Oracle 3-way ground truth for the eval rows, for scoring only -- never
+    # fed to the classifier itself.
+    eval_true_3way = np.full(len(eval_idx), LABEL_CLEAN_MALICIOUS, dtype=object)
+    eval_true_3way[y_np[eval_idx] == benign_label] = LABEL_BENIGN
+    poison_set = set(int(i) for i in poison_idx)
+    eval_true_3way[np.array([i in poison_set for i in eval_idx])] = LABEL_PERTURBED
+
+    cm = confusion_matrix(eval_true_3way, eval_pred, labels=PERTURBATION_CLASSIFIER_CLASSES)
+
+    pred_binary = np.where(eval_pred == LABEL_BENIGN, benign_label, mal_label)
+    true_binary = y_np[eval_idx]
+    two_class_metric = {
+        "accuracy": float(accuracy_score(true_binary, pred_binary)),
+        "balanced_accuracy": float(balanced_accuracy_score(true_binary, pred_binary)),
+    }
+
+    potentially_perturbed_pool = eval_idx[(eval_pred == LABEL_PERTURBED) & (true_binary == mal_label)]
+
+    forget_idx = np.asarray(sorted(int(i) for i in potentially_perturbed_pool), dtype=np.int64)
     retain_idx = np.setdiff1d(np.arange(n_samples, dtype=np.int64), forget_idx)
-    return forget_idx, retain_idx
+
+    return {
+        "forget_idx": forget_idx,
+        "retain_idx": retain_idx,
+        "n_used": int(n_used),
+        "confusion_matrix": {
+            "classes": PERTURBATION_CLASSIFIER_CLASSES,
+            "matrix": cm.tolist(),
+        },
+        "two_class_metric": two_class_metric,
+        "n_eval": int(len(eval_idx)),
+    }
 
 
 def unlearn_teacher_guided(model, teacher_model, forget_loader, retain_loader, omega, p_old_task,
@@ -987,9 +1121,11 @@ def plot_unlearning_metrics(results, out_path):
     unlearning, and step 7's prior-task recovery check (mean held-out balanced
     accuracy across every earlier task, before vs. after THIS task's unlearning
     phase specifically -- isolating unlearning's own effect from CL training's).
-    Tasks with no unlearning this run (task 0, or an empty Df_t -- the latter
-    now still logs a "detector_eval"-only entry, so filter on "forget_set"
-    specifically, not just truthiness) simply don't appear on the x-axis.
+    Tasks with no unlearning this run (task 0, too few samples for the
+    perturbation classifier, or an empty potentially_perturbed_pool -- these
+    still log a "perturbation_classifier"-only entry, so filter on
+    "forget_set" specifically, not just truthiness) simply don't appear on
+    the x-axis.
     """
     unl_tasks = [r for r in results if r.get("unlearning") and "forget_set" in r["unlearning"]]
     if not unl_tasks:
@@ -1235,9 +1371,9 @@ def main():
                 # evaded-mask restriction + POISON_FRACTION sizing as train, applied to
                 # this task's own test split. Overwrites task_test_splits[t] so every
                 # downstream eval (per_task_eval, pooled_eval, prior_tasks_recovery) for
-                # this task sees the poisoned test set from here on. detect_poison_oracle
-                # / unlearning never sees this -- it stays scoped to Xtr/ytr (training
-                # data) only, unchanged below.
+                # this task sees the poisoned test set from here on. The perturbation
+                # classifier / unlearning never sees this -- it stays scoped to Xtr/ytr
+                # (training data) only, unchanged below.
                 if POISON_TEST_DATA:
                     mal_idx_test = np.where(y_test == mal_label)[0]
                     poison_pool_test = np.where(evaded_mask_test)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_test
@@ -1258,9 +1394,8 @@ def main():
                     poisoned_test_sample_ids = []
 
         # Category tracking (identical to madar_cl_pipeline.py) -- feeds the
-        # buffer composition diagnostic only in this file; detect_poison_oracle()
-        # below reads poison_idx directly (see module docstring -- oracle branch),
-        # not this array.
+        # buffer composition diagnostic; build_perturbation_classifier_forget_set()
+        # below reads poison_idx directly (see its docstring), not this array.
         category = np.full(len(y_train), "malicious_clean", dtype=object)
         category[y_train == benign_label] = "benign"
         if len(poison_idx) > 0:
@@ -1355,136 +1490,150 @@ def main():
               f"mean-per-task bal_acc={mean_per_task_bal_acc:.4f}")
 
         # ============================================================
-        # 3. FORGET SET POPULATION -- detect_poison_oracle draws Df_t =
-        # poison_idx exactly, from Xtr/ytr (THIS task's own training data
-        # only) -- already maximally targeted at this task's own perturbed
-        # samples, never anything broader (no prior-task or buffer data is
-        # ever a forget-set candidate). Unlearning then runs against Df_t.
-        # 4. ISOLATION FOREST / REPLAY BUFFER POPULATION -- update_buffer_madar,
-        # from the post-unlearning retain set. Whatever this leaves in
-        # replay_buffer is exactly what task t+1's training (step 1, next
-        # iteration) reads via train_cl_er.
+        # 3. FORGET SET POPULATION -- build_perturbation_classifier_forget_set
+        # trains a small 3-class RandomForest per task on PERTURBATION_
+        # CLASSIFIER_N oracle-seeded samples per class, then uses ITS
+        # predictions (not oracle ground truth) to build the forget set --
+        # see that function's docstring and the module docstring's REWORK
+        # note for the full design.
+        # 4. ISOLATION FOREST / REPLAY BUFFER POPULATION -- update_buffer_madar
+        # now always fills from the FULL task batch, unfiltered (REWORK --
+        # forget/retain above shapes ONLY unlearning's retain_loader anchor
+        # now, not buffer eligibility). Whatever this leaves in replay_buffer
+        # feeds task t+1's training (step 1, next iteration) via train_cl_er.
+        # 5. REPLAY BUFFER CLEANING (CLEAN_REPLAY_BUFFER_OF_PERTURBED toggle)
+        # -- after buffer fill, remove any entries matching
+        # potentially_perturbed_pool's global sample ids. No backfill.
         # ============================================================
         if t == 0:
             teacher_model = copy.deepcopy(model); teacher_model.eval()
             update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
 
         else:
-            oracle_rng = np.random.RandomState(args.seed + t + 30_000)  # distinct stream from train/test poison rngs
-            forget_idx, retain_idx = detect_poison_oracle(poison_idx, len(Xtr), rng=oracle_rng)
-            print(f"    [Detect] Df_t (oracle, forget_fraction={ORACLE_FORGET_FRACTION}) = {len(forget_idx)} samples, "
-                  f"retain = {len(retain_idx)}")
+            pc_rng = np.random.RandomState(args.seed + t + 30_000)  # distinct stream from train/test poison rngs
+            pc_result = build_perturbation_classifier_forget_set(
+                Xtr, ytr, poison_idx, benign_label, mal_label, rng=pc_rng
+            )
 
-            # Precision is trivially 1.0 whenever forget_idx is non-empty --
-            # every element of Df_t is drawn from poison_idx, so there are
-            # never false positives on this branch. Recall is trivially 1.0
-            # only at ORACLE_FORGET_FRACTION=1.0 (default); below that it
-            # measures exactly forget_fraction, by construction -- this block
-            # is still a sanity check the wiring is correct, not a real
-            # evaluation (there's no detection LOGIC to evaluate here, just
-            # the subsample rate).
-            poison_set = set(int(i) for i in poison_idx)
-            forget_set_idx = set(int(i) for i in forget_idx)
-            overlap = poison_set & forget_set_idx
-            detector_eval = {
-                "n_poison_true": len(poison_set),
-                "n_forget_poison_overlap": len(overlap),
-                "precision": (len(overlap) / len(forget_set_idx)) if forget_set_idx else None,
-                "recall": (len(overlap) / len(poison_set)) if poison_set else None,
-            }
-            if detector_eval["precision"] is not None and detector_eval["recall"] is not None:
-                print(f"    [Detect eval, oracle-scored] precision={detector_eval['precision']:.3f} "
-                      f"recall={detector_eval['recall']:.3f} "
-                      f"({len(overlap)}/{len(forget_set_idx)} forgotten samples were true poison, "
-                      f"{len(overlap)}/{len(poison_set)} true poison samples were caught)")
-
-            if len(forget_idx) == 0:
-                print("    [Unlearning] Df_t empty -- skipping unlearning phase for this task.")
-                Xtr_for_buffer, ytr_for_buffer, category_for_buffer, gid_for_buffer = Xtr, ytr, category, gid_train
-                unlearning_metrics = {"detector": POISON_DETECTOR, "n_forget": 0, "detector_eval": detector_eval}
+            if pc_result is None:
+                print(f"    [Perturbation classifier] fewer than {PERTURBATION_CLASSIFIER_N} samples available "
+                      f"in one of benign/malicious_clean/malicious_perturbed this task -- skipping "
+                      f"classifier/unlearning phase for this task.")
+                unlearning_metrics = {"detector": POISON_DETECTOR, "n_forget": 0}
             else:
-                forget_idx_t = torch.tensor(forget_idx, dtype=torch.long)
-                retain_idx_t = torch.tensor(retain_idx, dtype=torch.long)
-                forget_loader = data.DataLoader(
-                    data.TensorDataset(Xtr[forget_idx_t], ytr[forget_idx_t]), batch_size=BATCH_SIZE, shuffle=True
-                )
-                retain_loader = data.DataLoader(
-                    data.TensorDataset(Xtr[retain_idx_t], ytr[retain_idx_t]), batch_size=BATCH_SIZE, shuffle=True
-                )
+                forget_idx, retain_idx = pc_result["forget_idx"], pc_result["retain_idx"]
+                cm, tcm = pc_result["confusion_matrix"], pc_result["two_class_metric"]
+                print(f"    [Perturbation classifier] n_used={pc_result['n_used']}/class, "
+                      f"n_eval={pc_result['n_eval']}, 2-class acc={tcm['accuracy']:.3f} "
+                      f"bal_acc={tcm['balanced_accuracy']:.3f}")
+                print(f"    [Perturbation classifier confusion] classes={cm['classes']}, matrix={cm['matrix']}")
+                print(f"    [Forget set] potentially_perturbed_pool = {len(forget_idx)} samples "
+                      f"(retain = {len(retain_idx)})")
 
-                # --- Step 5 setup: snapshot prior-task held-out accuracy BEFORE
-                # unlearning touches the weights (step 7, part 1) ---
-                pre_unlearn_prior_eval = {
-                    j: evaluate_classifier(classifier_wrapper, *task_test_splits[j]) for j in range(t)
-                }
+                if len(forget_idx) == 0:
+                    print("    [Unlearning] potentially_perturbed_pool empty -- "
+                          "skipping unlearning phase for this task.")
+                    unlearning_metrics = {
+                        "detector": POISON_DETECTOR, "n_forget": 0,
+                        "perturbation_classifier": {
+                            "n_used": pc_result["n_used"], "n_eval": pc_result["n_eval"],
+                            "confusion_matrix": cm, "two_class_metric": tcm,
+                        },
+                    }
+                else:
+                    forget_idx_t = torch.tensor(forget_idx, dtype=torch.long)
+                    retain_idx_t = torch.tensor(retain_idx, dtype=torch.long)
+                    forget_loader = data.DataLoader(
+                        data.TensorDataset(Xtr[forget_idx_t], ytr[forget_idx_t]), batch_size=BATCH_SIZE, shuffle=True
+                    )
+                    retain_loader = data.DataLoader(
+                        data.TensorDataset(Xtr[retain_idx_t], ytr[retain_idx_t]), batch_size=BATCH_SIZE, shuffle=True
+                    )
 
-                model_pre_unlearn = copy.deepcopy(model)
-                print(f"    [Unlearn] task {t} (alpha={UNLEARN_ALPHA}, si_c={UNLEARN_SI_C}, "
-                      f"n_forget={len(forget_idx)}, n_retain={len(retain_idx)})...")
-                unlearn_diag = unlearn_teacher_guided(
-                    model=model, teacher_model=model_pre_unlearn,
-                    forget_loader=forget_loader, retain_loader=retain_loader,
-                    omega=omega, p_old_task=p_old_task, si_c=UNLEARN_SI_C,
-                    epochs=UNLEARN_EPOCHS, lr=UNLEARN_LR, alpha=UNLEARN_ALPHA, device=DEVICE,
-                )
-                grad_steps += UNLEARN_EPOCHS * len(forget_loader)
-                print(f"    [Unlearn diag] omega_l2={unlearn_diag['omega_l2_norm']:.3f}, raw losses "
-                      f"forget={unlearn_diag['raw_forget_loss_mean']:.4f} "
-                      f"retain={unlearn_diag['raw_retain_loss_mean']:.4f} "
-                      f"si={unlearn_diag['raw_si_loss_mean']:.4f} (unweighted, before alpha/si_c)")
+                    # --- Step 5 setup: snapshot prior-task held-out accuracy BEFORE
+                    # unlearning touches the weights (step 7, part 1) ---
+                    pre_unlearn_prior_eval = {
+                        j: evaluate_classifier(classifier_wrapper, *task_test_splits[j]) for j in range(t)
+                    }
 
-                f_m = measure_unlearning_efficacy(model_pre_unlearn, model, forget_loader, DEVICE)
-                r_m = measure_unlearning_efficacy(model_pre_unlearn, model, retain_loader, DEVICE)
+                    model_pre_unlearn = copy.deepcopy(model)
+                    print(f"    [Unlearn] task {t} (alpha={UNLEARN_ALPHA}, si_c={UNLEARN_SI_C}, "
+                          f"n_forget={len(forget_idx)}, n_retain={len(retain_idx)})...")
+                    unlearn_diag = unlearn_teacher_guided(
+                        model=model, teacher_model=model_pre_unlearn,
+                        forget_loader=forget_loader, retain_loader=retain_loader,
+                        omega=omega, p_old_task=p_old_task, si_c=UNLEARN_SI_C,
+                        epochs=UNLEARN_EPOCHS, lr=UNLEARN_LR, alpha=UNLEARN_ALPHA, device=DEVICE,
+                    )
+                    grad_steps += UNLEARN_EPOCHS * len(forget_loader)
+                    print(f"    [Unlearn diag] omega_l2={unlearn_diag['omega_l2_norm']:.3f}, raw losses "
+                          f"forget={unlearn_diag['raw_forget_loss_mean']:.4f} "
+                          f"retain={unlearn_diag['raw_retain_loss_mean']:.4f} "
+                          f"si={unlearn_diag['raw_si_loss_mean']:.4f} (unweighted, before alpha/si_c)")
 
-                # --- Step 7, part 2: same prior-task snapshot AFTER unlearning ---
-                post_unlearn_prior_eval = {
-                    j: evaluate_classifier(classifier_wrapper, *task_test_splits[j]) for j in range(t)
-                }
+                    f_m = measure_unlearning_efficacy(model_pre_unlearn, model, forget_loader, DEVICE)
+                    r_m = measure_unlearning_efficacy(model_pre_unlearn, model, retain_loader, DEVICE)
 
-                # NEW (this reorder): per_task_eval[t]/pooled_eval above are now
-                # frozen at the PRE-unlearning snapshot (step 2), so this task's
-                # own post-unlearning number needs its own explicit checkpoint --
-                # otherwise it would only ever be visible once task t+1 evaluates
-                # it as a "prior task". Same evaluate_classifier call as
-                # everything else, just scoped to THIS task's test split.
-                post_unlearn_this_task_eval = evaluate_classifier(classifier_wrapper, *task_test_splits[t])
-                print(f"    [This task] bal_acc after its own unlearning: "
-                      f"{per_task_eval[t]['balanced_accuracy']:.4f} -> "
-                      f"{post_unlearn_this_task_eval['balanced_accuracy']:.4f}")
+                    # --- Step 7, part 2: same prior-task snapshot AFTER unlearning ---
+                    post_unlearn_prior_eval = {
+                        j: evaluate_classifier(classifier_wrapper, *task_test_splits[j]) for j in range(t)
+                    }
 
-                for tag, m in (("Forget set", f_m), ("Retain set", r_m)):
-                    print(f"    [{tag}] acc {m['acc_before']:.4f} -> {m['acc_after']:.4f}, "
-                          f"entropy_norm={m['entropy_norm']:.3f}, latent shift "
-                          f"mean/med/max={m['shift_mean']:.3f}/{m['shift_median']:.3f}/{m['shift_max']:.1f}")
-                if pre_unlearn_prior_eval:
-                    pre_mean = float(np.mean([v["balanced_accuracy"] for v in pre_unlearn_prior_eval.values()]))
-                    post_mean = float(np.mean([v["balanced_accuracy"] for v in post_unlearn_prior_eval.values()]))
-                    print(f"    [Recovery] prior-task mean balanced_accuracy: {pre_mean:.4f} -> {post_mean:.4f}")
+                    # per_task_eval[t]/pooled_eval above are the PRE-unlearning
+                    # snapshot, so this task's own post-unlearning number needs
+                    # its own explicit checkpoint -- otherwise it would only
+                    # ever be visible once task t+1 evaluates it as a "prior task".
+                    post_unlearn_this_task_eval = evaluate_classifier(classifier_wrapper, *task_test_splits[t])
+                    print(f"    [This task] bal_acc after its own unlearning: "
+                          f"{per_task_eval[t]['balanced_accuracy']:.4f} -> "
+                          f"{post_unlearn_this_task_eval['balanced_accuracy']:.4f}")
 
-                unlearning_metrics = {
-                    "detector": POISON_DETECTOR,
-                    "n_forget": int(len(forget_idx)), "n_retain": int(len(retain_idx)),
-                    "detector_eval": detector_eval,
-                    "unlearn_diagnostics": unlearn_diag,
-                    "forget_set": f_m, "retain_set": r_m,
-                    "post_unlearn_this_task_eval": post_unlearn_this_task_eval,
-                    "prior_tasks_recovery": {
-                        "pre_unlearn": pre_unlearn_prior_eval,
-                        "post_unlearn": post_unlearn_prior_eval,
-                    },
-                }
+                    for tag, m in (("Forget set", f_m), ("Retain set", r_m)):
+                        print(f"    [{tag}] acc {m['acc_before']:.4f} -> {m['acc_after']:.4f}, "
+                              f"entropy_norm={m['entropy_norm']:.3f}, latent shift "
+                              f"mean/med/max={m['shift_mean']:.3f}/{m['shift_median']:.3f}/{m['shift_max']:.1f}")
+                    if pre_unlearn_prior_eval:
+                        pre_mean = float(np.mean([v["balanced_accuracy"] for v in pre_unlearn_prior_eval.values()]))
+                        post_mean = float(np.mean([v["balanced_accuracy"] for v in post_unlearn_prior_eval.values()]))
+                        print(f"    [Recovery] prior-task mean balanced_accuracy: {pre_mean:.4f} -> {post_mean:.4f}")
 
-                # Buffer refreshed from the RETAIN set only (see module
-                # docstring's "buffer ordering" note) -- forgotten samples
-                # never enter memory, not even transiently.
-                Xtr_for_buffer = Xtr[retain_idx_t]
-                ytr_for_buffer = ytr[retain_idx_t]
-                category_for_buffer = category[retain_idx]
-                gid_for_buffer = gid_train[retain_idx]
+                    unlearning_metrics = {
+                        "detector": POISON_DETECTOR,
+                        "n_forget": int(len(forget_idx)), "n_retain": int(len(retain_idx)),
+                        "perturbation_classifier": {
+                            "n_used": pc_result["n_used"], "n_eval": pc_result["n_eval"],
+                            "confusion_matrix": cm, "two_class_metric": tcm,
+                        },
+                        "unlearn_diagnostics": unlearn_diag,
+                        "forget_set": f_m, "retain_set": r_m,
+                        "post_unlearn_this_task_eval": post_unlearn_this_task_eval,
+                        "prior_tasks_recovery": {
+                            "pre_unlearn": pre_unlearn_prior_eval,
+                            "post_unlearn": post_unlearn_prior_eval,
+                        },
+                    }
 
             teacher_model = copy.deepcopy(model); teacher_model.eval()
-            update_buffer_madar(Xtr_for_buffer, ytr_for_buffer, category_for_buffer, gid_for_buffer,
-                                benign_label, mal_label, model, DEVICE)
+
+            # Buffer fills from the FULL task batch now, unfiltered (REWORK,
+            # see module docstring) -- matches plain MADAR's/task-0's call
+            # pattern exactly.
+            update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
+
+            # Step 5: post-hoc buffer cleaning (toggleable). Only meaningful
+            # when the classifier actually ran and found something.
+            if CLEAN_REPLAY_BUFFER_OF_PERTURBED and pc_result is not None and len(pc_result["forget_idx"]) > 0:
+                perturbed_gids = set(int(g) for g in gid_train[pc_result["forget_idx"]])
+                before = len(label_buffers.get(mal_label, []))
+                label_buffers[mal_label] = [
+                    e for e in label_buffers.get(mal_label, []) if e[3] not in perturbed_gids
+                ]
+                n_removed = before - len(label_buffers[mal_label])
+                replay_buffer.clear()
+                for buf in label_buffers.values():
+                    replay_buffer.extend(buf)
+                print(f"    [Buffer clean] removed {n_removed} potentially_perturbed_pool matches "
+                      f"from the malicious-label buffer slot (no backfill).")
 
         # p_old_task updated to the FINAL (post-unlearning, if it ran this task)
         # weights, for ALL tasks -- ready as next task's start-of-task SI anchor.
@@ -1518,7 +1667,9 @@ def main():
         "h5_path": args.h5_path, "seed": args.seed, "num_tasks": NUM_TASKS,
         "task_fractions": TASK_FRACTIONS, "task_test_frac": TASK_TEST_FRAC,
         "poison_fraction": POISON_FRACTION, "require_evasion_success": REQUIRE_EVASION_SUCCESS,
-        "poison_test_data": POISON_TEST_DATA, "oracle_forget_fraction": ORACLE_FORGET_FRACTION,
+        "poison_test_data": POISON_TEST_DATA,
+        "perturbation_classifier_n": PERTURBATION_CLASSIFIER_N,
+        "clean_replay_buffer_of_perturbed": CLEAN_REPLAY_BUFFER_OF_PERTURBED,
         "red_epsilon": RED_EPSILON, "red_max_steps": RED_MAX_STEPS,
         "red_timesteps_per_task": RED_TIMESTEPS_PER_TASK, "alpha_contrast": ALPHA_CONTRAST,
         "contrastive_ema": CONTRASTIVE_EMA, "contrastive_recency_decay": CONTRASTIVE_RECENCY_DECAY,
