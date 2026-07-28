@@ -51,16 +51,24 @@ active_count/prev_active_count output-masking machinery in both reference script
 is dead code here (num_classes is always 2, so the mask never actually masks
 anything) and has been dropped rather than ported.
 
-Test data is NEVER poisoned (matching naive/joint's convention, not the old CICIDS
-MADAR script's, which poisoned a slice of test data too) -- red-agent evasion rate
-already measures generalization against the attack directly; poisoning eval labels
-would conflate "evaded" with "ground truth malicious" and corrupt accuracy. This
-means there's no category-sliced *test* evaluation (a "malicious_perturbed" test
-slice would be vacuous by construction). The one MADAR-specific diagnostic kept is
+UPDATE (REWORK): test data IS now poisoned (POISON_TEST_DATA=True), reversing
+the "test is never poisoned" convention this file originally shared with
+naive/joint. Made specifically so this file's structure matches
+madar_unlearning_cl_pipeline.py -- with test poisoning absent here but present
+there, per_task_eval/pooled_eval/mean_per_task_balanced_accuracy were being
+computed on genuinely different (easier vs. harder) test distributions between
+the two pipelines, confounding any comparison between them. Also added to
+match that file: global sample_id tracking (gid_train/gid_test,
+poisoned_sample_ids/poisoned_test_sample_ids in results, sample_id carried in
+the replay buffer) -- see update_buffer_madar's and buffer_composition_summary's
+docstrings. The original reasoning below (evasion rate already measures
+generalization; poisoning eval labels would conflate "evaded" with "ground
+truth malicious") still holds for naive/joint, which this update does not
+touch. The one MADAR-specific diagnostic kept from the original design is
 the replay buffer's category composition (benign / malicious_clean /
-malicious_perturbed per label slot) -- purely observational, computed from ground
-truth already on hand, never fed back into selection or training -- added as an
-extra key on top of naive/joint's existing results schema so
+malicious_perturbed per label slot) -- purely observational, computed from
+ground truth already on hand, never fed back into selection or training --
+added as an extra key on top of naive/joint's existing results schema so
 compare_cl_runs.py keeps working unmodified.
 
 Classifier runs on CPU (TRAIN_DEVICE below), matching the caution already on
@@ -113,6 +121,14 @@ TASK_TEST_FRAC = 0.20
 
 POISON_FRACTION = 0.3
 REQUIRE_EVASION_SUCCESS = True  # only successfully-evasive perturbations poison training data
+POISON_TEST_DATA = True  # REWORK: matches madar_unlearning_cl_pipeline.py's POISON_TEST_DATA
+                          # (previously False/absent here -- test was never poisoned). Needed
+                          # so per_task_eval/pooled_eval are computed on the SAME kind of data
+                          # in both pipelines; see that file's module docstring BRANCH NOTE for
+                          # the original rationale (evasion rate alone doesn't check whether
+                          # detection/unlearning generalizes to evasive samples never trained
+                          # on). Same evaded-mask-restricted, POISON_FRACTION-sized substitution
+                          # as train, applied to each task's test split.
 
 RED_EPSILON = 0.25
 RED_MAX_STEPS = 25
@@ -407,7 +423,7 @@ class TorchIDSWrapper:
 # MADAR replay buffer (keyed by binary label, UNIFORM budget across the two
 # groups -- see module docstring for why ratio-based budgeting was rejected).
 # ---------------------------------------------------------------------------
-label_buffers = {}   # {0: [(X_scaled, y, category), ...], 1: [...]}
+label_buffers = {}   # {0: [(X_scaled, y, category, sample_id), ...], 1: [...]}
 replay_buffer = []   # flattened label_buffers.values()
 
 
@@ -434,8 +450,8 @@ def _embed(model, Xt: torch.Tensor, device):
     return torch.cat(parts).numpy()
 
 
-def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, benign_label, mal_label,
-                         model, device):
+def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, sample_id: np.ndarray,
+                         benign_label, mal_label, model, device):
     """
     Selects, per label (benign/malicious), an interleaved anomalies+inliers sample
     (by IsolationForest decision_function over the model's LATENT space, budget
@@ -446,6 +462,13 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
     exemplars from earlier tasks can survive across updates. `category` is
     attached to each stored sample purely for the buffer_composition_summary()
     diagnostic -- it plays no role in selection, which sees only latent vectors.
+    `sample_id` is the GLOBAL pool row index each sample was assigned in main()
+    (stable across the whole run, survives train/test splitting and poisoning
+    substitution) -- carried alongside category purely for traceability (tSNE
+    plots, cross-task comparison of which physical samples persist in the
+    buffer), also not used by selection. Structure matches
+    madar_unlearning_cl_pipeline.py's update_buffer_madar exactly, so buffer
+    contents are directly comparable between the two pipelines.
     """
     global label_buffers, replay_buffer
     model.eval()
@@ -453,6 +476,7 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
     X_np = X.numpy()
     Y_np = y.numpy()
     cat_np = np.asarray(category)
+    id_np = np.asarray(sample_id)
     L_np = _embed(model, X, device)
     latent_dim = L_np.shape[1]
 
@@ -464,11 +488,13 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
             old_X = np.stack([e[0].numpy() for e in old_entries])
             old_Y = np.array([e[1].item() for e in old_entries], dtype=Y_np.dtype)
             old_cat = np.array([e[2] for e in old_entries], dtype=object)
+            old_id = np.array([e[3] for e in old_entries], dtype=id_np.dtype)
             old_L = _embed(model, torch.tensor(old_X), device)
         else:
             old_X = np.empty((0, X_np.shape[1]), dtype=X_np.dtype)
             old_Y = np.empty((0,), dtype=Y_np.dtype)
             old_cat = np.empty((0,), dtype=object)
+            old_id = np.empty((0,), dtype=id_np.dtype)
             old_L = np.empty((0, latent_dim), dtype=np.float32)
 
         mask = (Y_np == lbl)
@@ -476,6 +502,7 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
         pool_Y = np.concatenate([old_Y, Y_np[mask]], axis=0)
         pool_L = np.concatenate([old_L, L_np[mask]], axis=0)
         pool_cat = np.concatenate([old_cat, cat_np[mask]], axis=0)
+        pool_id = np.concatenate([old_id, id_np[mask]], axis=0)
 
         n_select = min(budget_per_label, len(pool_X))
         if n_select == 0:
@@ -494,7 +521,8 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
             interleaved_idx.append(inliers_idx[-1])
 
         label_buffers[lbl] = [
-            (torch.tensor(pool_X[i]), torch.tensor(pool_Y[i]), pool_cat[i]) for i in interleaved_idx
+            (torch.tensor(pool_X[i]), torch.tensor(pool_Y[i]), pool_cat[i], int(pool_id[i]))
+            for i in interleaved_idx
         ]
 
     replay_buffer.clear()
@@ -504,15 +532,22 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
 
 def buffer_composition_summary():
     """Diagnostic only: what fraction of each label's buffer slot is benign /
-    malicious_clean / malicious_perturbed right now. Never used by training or
-    selection -- additive on top of naive/joint's results schema."""
+    malicious_clean / malicious_perturbed right now, plus the GLOBAL sample_id
+    of every entry so buffer membership can be cross-referenced against
+    poisoned_sample_ids (per-task, in results) or reloaded from the pooled
+    dataset for tSNE later -- see update_buffer_madar's docstring for what
+    sample_id means. Never used by training or selection."""
     summary = {}
     for lbl, entries in label_buffers.items():
         cats = [e[2] for e in entries]
         counts = {}
         for c in cats:
             counts[c] = counts.get(c, 0) + 1
-        summary[str(lbl)] = {"total": len(entries), "category_counts": counts}
+        summary[str(lbl)] = {
+            "total": len(entries),
+            "category_counts": counts,
+            "sample_ids": [e[3] for e in entries],
+        }
     return summary
 
 
@@ -732,6 +767,20 @@ def main():
     print(f"day_mapping={day_mapping}, feature_dim={feature_dim}, "
           f"task sizes={[len(t['labels']) for t in tasks]}")
 
+    # GLOBAL sample ids: task t's rows are a contiguous slice of the pooled,
+    # timestamp-sorted array load_pooled_chronological_tasks builds internally
+    # (see that function -- tasks[t] = pool[starts[t]:starts[t]+len]). task_offsets[t]
+    # reconstructs starts[t] purely from each task's row count, so
+    # task_offsets[t] + (a row's position within task t's pool, BEFORE the
+    # train/test split below) is a stable identifier for that exact physical
+    # row -- same value every run given the same h5 file/task_fractions,
+    # independent of which task's buffer or forget/retain set it ends up in.
+    # Logged per-task (poisoned_sample_ids) and per-buffer-entry
+    # (buffer_composition_summary) purely for traceability -- e.g. reloading
+    # the pooled dataset by id later for tSNE -- never used by training or
+    # selection. Matches madar_unlearning_cl_pipeline.py's tracking exactly.
+    task_offsets = np.concatenate([[0], np.cumsum([len(t["labels"]) for t in tasks])[:-1]])
+
     bank = RecencyWeightedContrastiveBank(
         dim=feature_dim, ema=CONTRASTIVE_EMA, recency_decay=CONTRASTIVE_RECENCY_DECAY
     )
@@ -761,9 +810,10 @@ def main():
     for t, task in enumerate(tasks):
         X = np.clip(task["features"].astype(np.float32), 0.0, 1.0)  # data is documented [0,1]-scaled already
         y = task["labels"].astype(np.int64)
+        gid = task_offsets[t] + np.arange(len(y), dtype=np.int64)  # this task's pool-local id -> global id
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=TASK_TEST_FRAC, random_state=args.seed, stratify=y
+        X_train, X_test, y_train, y_test, gid_train, gid_test = train_test_split(
+            X, y, gid, test_size=TASK_TEST_FRAC, random_state=args.seed, stratify=y
         )
         task_test_splits[t] = (X_test, y_test)
 
@@ -771,6 +821,8 @@ def main():
         red_report = None
         n_poisoned = 0
         poison_idx = np.array([], dtype=int)
+        n_poisoned_test = 0
+        poisoned_test_sample_ids = []
 
         if t == 0:
             print(f"\n===== Task 0 (warm start, no red agent): "
@@ -794,10 +846,11 @@ def main():
                         env, agent, X_train, y_train, benign_label,
                         only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
                     )
-                _, test_evasion_rate, test_rewards, test_avg_norm, test_attacked, _ = evaluate_agent_on_batch(
-                    env, agent, X_test, y_test, benign_label,
-                    only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
-                )
+                X_test_pert, test_evasion_rate, test_rewards, test_avg_norm, test_attacked, evaded_mask_test = \
+                    evaluate_agent_on_batch(
+                        env, agent, X_test, y_test, benign_label,
+                        only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                    )
 
                 red_report = {
                     "train_evasion_rate": train_evasion_rate, "train_attacked": train_attacked,
@@ -822,14 +875,42 @@ def main():
                 print(f"[Task {t}] poisoned {n_poisoned}/{len(mal_idx_train)} malicious train samples "
                       f"(poison_fraction={POISON_FRACTION})")
 
+                # TEST-SIDE poisoning (POISON_TEST_DATA -- REWORK, see module
+                # docstring; matches madar_unlearning_cl_pipeline.py's structure
+                # exactly, so per_task_eval/pooled_eval are computed on the SAME
+                # kind of data in both pipelines). Same evaded-mask restriction +
+                # POISON_FRACTION sizing as train, applied to this task's own test
+                # split. Overwrites task_test_splits[t] so every downstream eval
+                # (per_task_eval, pooled_eval) for this task sees the poisoned
+                # test set from here on.
+                if POISON_TEST_DATA:
+                    mal_idx_test = np.where(y_test == mal_label)[0]
+                    poison_pool_test = np.where(evaded_mask_test)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_test
+                    n_to_poison_test = min(int(round(POISON_FRACTION * len(mal_idx_test))), len(poison_pool_test))
+                    rng_test = np.random.RandomState(args.seed + t + 10_000)  # distinct stream from train's rng
+                    poison_idx_test = rng_test.choice(poison_pool_test, size=n_to_poison_test, replace=False) \
+                        if n_to_poison_test > 0 else np.array([], dtype=int)
+                    n_poisoned_test = len(poison_idx_test)
+
+                    X_test = X_test.copy()
+                    X_test[poison_idx_test] = X_test_pert[poison_idx_test]
+                    task_test_splits[t] = (X_test, y_test)
+                    poisoned_test_sample_ids = gid_test[poison_idx_test].tolist() if n_poisoned_test > 0 else []
+                    print(f"[Task {t}] poisoned {n_poisoned_test}/{len(mal_idx_test)} malicious TEST samples "
+                          f"(poison_fraction={POISON_FRACTION}) -- test_evasion_rate was {test_evasion_rate:.3f}")
+                else:
+                    n_poisoned_test = 0
+                    poisoned_test_sample_ids = []
+
         # Category tracking for the buffer-composition diagnostic ONLY (never fed
         # back into training/selection) -- benign / malicious_clean /
-        # malicious_perturbed, built from data already on hand above. Test data is
-        # never poisoned (see module docstring), so no category slicing there.
+        # malicious_perturbed, built from TRAIN data only; test poisoning above
+        # never touches training/selection.
         category = np.full(len(y_train), "malicious_clean", dtype=object)
         category[y_train == benign_label] = "benign"
         if len(poison_idx) > 0:
             category[poison_idx] = "malicious_perturbed"
+        poisoned_sample_ids = gid_train[poison_idx].tolist() if len(poison_idx) > 0 else []
 
         if t == 0:
             # Scaler fit on TASK 0 (pre-poisoning, but task 0 has no red agent
@@ -873,7 +954,7 @@ def main():
                 if p.requires_grad:
                     p_old_task[n.replace('.', '__')] = p.detach().clone()
             teacher_model = copy.deepcopy(model); teacher_model.eval()
-            update_buffer_madar(Xtr, ytr, category, benign_label, mal_label, model, DEVICE)
+            update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
 
         else:
             print(f"  Samples: {len(Xtr)} (+{len(replay_buffer)} replay) | "
@@ -895,7 +976,7 @@ def main():
                     p_old_task[n_key] = p_current
 
             teacher_model = copy.deepcopy(model); teacher_model.eval()
-            update_buffer_madar(Xtr, ytr, category, benign_label, mal_label, model, DEVICE)
+            update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
 
         buffer_summary = buffer_composition_summary()
         print(f"    [Buffer] composition: {buffer_summary}")
@@ -915,6 +996,9 @@ def main():
             "n_train": int(len(y_train)), "n_test": int(len(y_test)),
             "n_malicious_train": int(len(mal_idx_train)),
             "n_poisoned": n_poisoned,
+            "poisoned_sample_ids": poisoned_sample_ids,
+            "n_poisoned_test": n_poisoned_test,
+            "poisoned_test_sample_ids": poisoned_test_sample_ids,
             "red_agent": red_report,
             "per_task_eval": per_task_eval,
             "pooled_eval": pooled_eval,
@@ -927,7 +1011,8 @@ def main():
         "strategy": "madar_er_kd_si",
         "h5_path": args.h5_path, "seed": args.seed, "num_tasks": NUM_TASKS,
         "task_fractions": TASK_FRACTIONS, "task_test_frac": TASK_TEST_FRAC,
-        "poison_fraction": POISON_FRACTION, "require_evasion_success": REQUIRE_EVASION_SUCCESS,
+        "poison_fraction": POISON_FRACTION, "poison_test_data": POISON_TEST_DATA,
+        "require_evasion_success": REQUIRE_EVASION_SUCCESS,
         "red_epsilon": RED_EPSILON, "red_max_steps": RED_MAX_STEPS,
         "red_timesteps_per_task": RED_TIMESTEPS_PER_TASK, "alpha_contrast": ALPHA_CONTRAST,
         "contrastive_ema": CONTRASTIVE_EMA, "contrastive_recency_decay": CONTRASTIVE_RECENCY_DECAY,
