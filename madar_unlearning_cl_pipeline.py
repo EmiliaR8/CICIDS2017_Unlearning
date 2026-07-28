@@ -68,6 +68,19 @@ analysis done on madar_u1-u4), unlearning_metrics now separately logs
 post_unlearn_this_task_eval alongside the existing prior_tasks_recovery
 bracket (which still covers OLDER tasks and is untouched by this reorder).
 
+UPDATE 3: detect_poison_oracle can now forget a partial random subsample of
+poison_idx instead of always all of it -- ORACLE_FORGET_FRACTION (default
+1.0 = unchanged prior behavior). Still zero false positives (Df_t is always
+a subset of true poison; precision stays 1.0), but recall drops to
+forget_fraction, so this simulates "the unlearner only gets told about SOME
+of the poison" without touching detection logic or inventing a fake
+detector. Whatever poison isn't selected stays in the retain set --
+unforgotten poison is buffer-eligible exactly like phi1's false negatives
+were on main. detector_eval (precision/recall) is no longer trivially
+1.0/1.0 below forget_fraction=1.0 -- it now measures the subsample rate
+directly, useful for sweeping "how much of the poison does the unlearner
+actually need to see to keep collateral damage low."
+
 Outline this implements (task loop, for each task t with a red agent):
   1. Train on Tt via MADAR's existing ER+KD+SI step (train_cl_er, unchanged).
   2/6. Update replay buffer P -- see "buffer ordering" below for the one change
@@ -208,6 +221,15 @@ POISON_TEST_DATA = True  # BRANCH-SPECIFIC divergence from naive/joint/madar_cl_
                           # memorized training-time poison. Unlearning itself stays scoped to
                           # TRAINING data only (Df_t is never drawn from test) -- there is
                           # nothing to "forget" from data that was never trained on.
+ORACLE_FORGET_FRACTION = 1.0  # fraction of THIS TASK's true poison_idx actually handed to
+                               # the unlearner as Df_t, drawn as a random subsample (see
+                               # detect_poison_oracle). 1.0 = every poisoned sample (original
+                               # oracle behavior). Below 1.0 simulates a detector with perfect
+                               # PRECISION (every sample it flags really is poison -- still
+                               # drawn only from poison_idx, no false positives) but imperfect
+                               # RECALL (misses the rest) -- i.e. "what if the unlearner only
+                               # gets told about some of the poison, not all of it." A fixed
+                               # global fraction, not per-task-tuned -- change it here to sweep.
 
 RED_EPSILON = 0.25
 RED_MAX_STEPS = 25
@@ -735,17 +757,32 @@ def evaluate_classifier(classifier, X, y):
 # features. main branch keeps phi1 (detect_poison_if_latent); that function is
 # untouched there -- this is a separate branch, not a replacement for it.
 # ---------------------------------------------------------------------------
-def detect_poison_oracle(poison_idx, n_samples):
+def detect_poison_oracle(poison_idx, n_samples, forget_fraction=ORACLE_FORGET_FRACTION, rng=None):
     """
-    Df_t = poison_idx exactly -- the ground-truth set of samples the red-agent
-    poisoning step substituted with evaded perturbations this task (main()
-    already computes this for the category-tracking/buffer diagnostic; no new
-    computation here). retain_idx = everything else.
+    Df_t = a random forget_fraction-sized subsample of poison_idx -- the
+    ground-truth set of samples the red-agent poisoning step substituted with
+    evaded perturbations this task (main() already computes this for the
+    category-tracking/buffer diagnostic; no new computation here). At
+    forget_fraction=1.0 (default), Df_t = poison_idx exactly, unchanged from
+    this branch's original behavior. Below 1.0, still zero false positives
+    (every element of Df_t really is poison -- precision stays 1.0) but
+    recall drops to forget_fraction, simulating an imperfect-recall detector
+    without touching detection logic itself. retain_idx = everything else,
+    including whatever poison this call didn't select -- unforgotten poison
+    is retained (and thus buffer-eligible) exactly like phi1's false
+    negatives were.
 
     Returns (forget_idx, retain_idx) as sorted int64 index arrays into this
     task's own Xtr/ytr -- the same contract detect_poison_if_latent uses on
     main, so swapping back to a real detector later is a one-function change.
     """
+    poison_idx = np.asarray(poison_idx, dtype=np.int64)
+    if forget_fraction < 1.0 and len(poison_idx) > 0:
+        rng = rng if rng is not None else np.random.RandomState(SEED)
+        n_forget = int(round(forget_fraction * len(poison_idx)))
+        poison_idx = rng.choice(poison_idx, size=n_forget, replace=False) if n_forget > 0 else \
+            np.array([], dtype=np.int64)
+
     forget_idx = np.asarray(sorted(int(i) for i in poison_idx), dtype=np.int64)
     retain_idx = np.setdiff1d(np.arange(n_samples, dtype=np.int64), forget_idx)
     return forget_idx, retain_idx
@@ -1333,15 +1370,19 @@ def main():
             update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
 
         else:
-            forget_idx, retain_idx = detect_poison_oracle(poison_idx, len(Xtr))
-            print(f"    [Detect] Df_t (oracle ground truth) = {len(forget_idx)} samples, "
+            oracle_rng = np.random.RandomState(args.seed + t + 30_000)  # distinct stream from train/test poison rngs
+            forget_idx, retain_idx = detect_poison_oracle(poison_idx, len(Xtr), rng=oracle_rng)
+            print(f"    [Detect] Df_t (oracle, forget_fraction={ORACLE_FORGET_FRACTION}) = {len(forget_idx)} samples, "
                   f"retain = {len(retain_idx)}")
 
-            # Trivially precision=1.0/recall=1.0 whenever poison_idx is
-            # non-empty, since Df_t IS poison_idx on this branch -- kept as a
-            # sanity check that the oracle wiring is actually correct, not a
-            # real evaluation (there's nothing to evaluate: detector==ground
-            # truth by construction).
+            # Precision is trivially 1.0 whenever forget_idx is non-empty --
+            # every element of Df_t is drawn from poison_idx, so there are
+            # never false positives on this branch. Recall is trivially 1.0
+            # only at ORACLE_FORGET_FRACTION=1.0 (default); below that it
+            # measures exactly forget_fraction, by construction -- this block
+            # is still a sanity check the wiring is correct, not a real
+            # evaluation (there's no detection LOGIC to evaluate here, just
+            # the subsample rate).
             poison_set = set(int(i) for i in poison_idx)
             forget_set_idx = set(int(i) for i in forget_idx)
             overlap = poison_set & forget_set_idx
@@ -1477,7 +1518,7 @@ def main():
         "h5_path": args.h5_path, "seed": args.seed, "num_tasks": NUM_TASKS,
         "task_fractions": TASK_FRACTIONS, "task_test_frac": TASK_TEST_FRAC,
         "poison_fraction": POISON_FRACTION, "require_evasion_success": REQUIRE_EVASION_SUCCESS,
-        "poison_test_data": POISON_TEST_DATA,
+        "poison_test_data": POISON_TEST_DATA, "oracle_forget_fraction": ORACLE_FORGET_FRACTION,
         "red_epsilon": RED_EPSILON, "red_max_steps": RED_MAX_STEPS,
         "red_timesteps_per_task": RED_TIMESTEPS_PER_TASK, "alpha_contrast": ALPHA_CONTRAST,
         "contrastive_ema": CONTRASTIVE_EMA, "contrastive_recency_decay": CONTRASTIVE_RECENCY_DECAY,
