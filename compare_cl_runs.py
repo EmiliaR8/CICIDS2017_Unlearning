@@ -21,6 +21,8 @@ Usage:
     python compare_cl_runs.py naive1.json naive2.json joint1.json \\
         --out comparison1.png [--include_table]
 
+    python compare_cl_runs.py runs/joint/joint1/joint1.json runs/naive/naive3/naive3.json runs/madar/madar2/madar2.json --out naive_vs_joint_vs_MADAR.png --include_table
+
 Output: Unlearning_experiments/comparative_plots/<--out> (created if it
 doesn't exist yet). With --include_table, also writes a same-named .csv
 summary table (final-task accuracy/evasion/poison-rate per run) next to the

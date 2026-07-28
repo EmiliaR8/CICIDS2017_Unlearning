@@ -499,6 +499,8 @@ def main():
         print(f"[Task {t} classifier] this-task acc={per_task_eval[t]['balanced_accuracy']:.4f} "
               f"pooled acc={pooled_eval['balanced_accuracy']:.4f} "
               f"mean-per-task acc={mean_per_task_bal_acc:.4f}")
+              
+        print(f"Elapsed time: %.2f seconds" % (time.perf_counter() - start_time))
 
         results.append({
             "task_id": t,

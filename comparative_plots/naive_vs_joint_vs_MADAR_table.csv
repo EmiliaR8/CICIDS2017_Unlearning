@@ -1,0 +1,4 @@
+run,strategy,final_pooled_balanced_accuracy,final_mean_per_task_balanced_accuracy,final_test_evasion_rate,avg_poison_rate_achieved
+joint1,joint_full_retrain,0.99848997514971,0.9900812243436412,1.0,0.12961353453550079
+naive3,naive,0.4626916821742645,0.4652427288983379,0.932,0.12928612110162835
+madar2,madar_er_kd_si,0.8826109103486797,0.8641455762467993,1.0,0.12961353453550079

@@ -299,10 +299,10 @@ class NetworkAttackEnv(gym.Env):
         # your logging (optional)
         avg = np.mean(self.rewards_list) if self.rewards_list else 0.0
         std_dev = np.std(self.rewards_list) if self.rewards_list else 0.0
-        with open("cumulative_r_training_red.txt", "a") as f:
-            f.write(f"{avg}\n")
-        with open("stand_dev_r_training_red.txt", "a") as g:
-            g.write(f"{std_dev}\n")
+        # with open("cumulative_r_training_red.txt", "a") as f:
+        #     f.write(f"{avg}\n")
+        # with open("stand_dev_r_training_red.txt", "a") as g:
+        #     g.write(f"{std_dev}\n")
         self.rewards_list = []
 
         info = {"index": int(self.current_index), "true_label": int(self.true_label)}
