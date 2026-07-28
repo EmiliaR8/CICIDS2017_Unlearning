@@ -138,7 +138,7 @@ CONTRASTIVE_EMA = 0.95
 CONTRASTIVE_RECENCY_DECAY = 0.5  # weight of task (k-1) vs (k-2) vs ... in the diversity reward
 
 # Caps evaluate_agent_on_batch's per-task episode count for runtime; None = every malicious sample.
-MAX_EVAL_SAMPLES_PER_TASK = 1000
+MAX_EVAL_SAMPLES_PER_TASK = 5000
 
 SAC_POLICY_KWARGS = dict(net_arch=[512, 256, 128], optimizer_kwargs={"weight_decay": 1e-4})
 SAC_KWARGS = dict(
