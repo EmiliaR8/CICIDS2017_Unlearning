@@ -20,6 +20,24 @@ madar_cl_pipeline.py's foundation rather than a fix-up of either -- several
 decisions below deliberately diverge from both, spelled out here so they're easy
 to correct rather than silently baked in.
 
+BRANCH NOTE (claude/oracle-unlearn-sample-tracking): main's version of this
+file uses detect_poison_if_latent (phi1, iteration 1). This branch swaps
+detection back to detect_poison_oracle (Df_t = poison_idx exactly) to
+isolate a still-open question -- does the unlearning MECHANISM (steps
+5/7: unlearn_teacher_guided, SI, retain+KD anchoring) behave sensibly at
+all -- from detector quality, before sinking more effort into phi1/phi3-5.
+If oracle-driven unlearning is well-behaved, the swings seen with phi1
+(madar_u1.json/madar_u2.json: forget-set accuracy sometimes frozen,
+sometimes moving the wrong direction, task 7's -0.17 collateral damage on
+task 0) are downstream of what phi1 selects, not the mechanism itself --
+narrowing where to look next. If oracle-driven unlearning is ALSO
+unstable, the mechanism itself needs fixing before any detector iteration
+matters. This branch also adds global sample-id tracking (see
+update_buffer_madar/buffer_composition_summary and `gid_train` in main())
+so buffer contents and poisoned samples can be traced across tasks for
+later tSNE-style analysis -- independent of the oracle-vs-phi1 question,
+worth porting back to main either way.
+
 Outline this implements (task loop, for each task t with a red agent):
   1. Train on Tt via MADAR's existing ER+KD+SI step (train_cl_er, unchanged).
   2/6. Update replay buffer P -- see "buffer ordering" below for the one change
@@ -33,48 +51,27 @@ Outline this implements (task loop, for each task t with a red agent):
 
 Four decisions made, not silently assumed (flag anything you want changed):
 
-  - POISON DETECTION (step 3) is being built iteratively, on purpose, rather
-    than landing fully-formed. This is ITERATION 1: phi1 only -- an
-    IsolationForest decision_function score over the CURRENT model's latent
-    embedding of this task's malicious-labeled training samples, forgetting
-    the MIDDLE band (DONUT_FORGET_RATIO of the population) rather than the
-    extremes. Ported from split_option_b_donut_hole in the EMBER unlearning
-    reference (clmdu_ember18_mk6B_cd.py), with its per-malware-family
-    joint-fit machinery dropped: that reference fits IF jointly across
-    several concurrent "families"; CICIDS poisoning only ever touches the
-    malicious-labeled population (benign is never poisoned -- see
-    madar_cl_pipeline.py), so there is exactly one population to search and
-    no family-level joint fit is meaningful. detect_poison_if_latent() below
-    never reads poison_idx or any ground truth -- Df_t is chosen purely from
-    the classifier's own latent geometry, unlike the oracle stand-in this
-    file used before phi1 was implemented (see git history for that version).
-    ITERATION 2 (not yet built) adds phi3 (per-sample CE loss), phi4
-    (normalized predictive entropy), and phi5 (top-two probability margin) --
-    model-behavior features, from the same paper's feature list, expected to
-    matter more than phi1/phi2's raw/latent geometry alone against this
-    pipeline's evasion-crafted poisoning specifically (minimal, decision-
-    boundary-targeted perturbations are optimized to NOT look geometrically
-    anomalous -- see discussion in commit history / conversation). Critically,
-    phi3-5 need to be computed against the PRE-task-t snapshot of the model
-    (teacher_model, as captured before this task's train_cl_er call), not the
-    post-CL-training model detect_poison_if_latent() reads today -- by the
-    time detection runs post-training, the model has already been fit to
-    Tt's labels (poison included), so forget_set's acc_before=1.0 in most
-    tasks of the first smoke test just reflects "training memorized this,"
-    not "this looks confident/typical." Computing loss/entropy/margin against
-    teacher_model instead directly asks "did this fool the classifier as it
-    stood when the red agent attacked it" -- the actual definition of poison
-    here (REQUIRE_EVASION_SUCCESS=True) -- without reading poison_idx itself.
-    phi6 (distance to family centroid) and phi7 (log family size) from that
-    same paper are EMBER-specific (malware-family concept) and don't transfer
-    to CICIDS's flat binary labeling -- not planned for any iteration here.
+  - POISON DETECTION (step 3): on main, being built iteratively (iteration 1
+    shipped phi1 -- an IsolationForest decision_function score over the
+    latent embedding of this task's malicious-labeled samples, forgetting the
+    MIDDLE band; ported from split_option_b_donut_hole in the EMBER unlearning
+    reference, clmdu_ember18_mk6B_cd.py, with its per-malware-family joint-fit
+    machinery dropped since CICIDS poisoning only ever touches the
+    malicious-labeled population). Planned iteration 2 there: phi3 (per-sample
+    CE loss), phi4 (normalized entropy), phi5 (top-two margin) -- model-
+    behavior features expected to matter more than phi1/phi2's raw geometry
+    against evasion-crafted poisoning specifically, computed against the
+    PRE-task-t teacher_model snapshot rather than the post-CL-training model
+    (by the time detection runs post-training, the model has already fit Tt's
+    labels, poison included, so post-training confidence features are
+    measuring "did training just memorize this," not "does this look
+    evasive"). phi6/phi7 (malware-family based) don't transfer to CICIDS.
 
-    Every detect_poison_if_latent() call is now also scored (evaluation only,
-    never fed back into the detector) against poison_idx ground truth --
-    detector_eval in each checkpoint's "unlearning" block logs precision
-    (fraction of Df_t that's true poison) and recall (fraction of true poison
-    caught), so detector quality is measurable directly instead of inferred
-    from downstream accuracy deltas.
+    THIS BRANCH overrides all of that: detect_poison_oracle() below sets
+    Df_t = poison_idx directly, no detection logic at all -- see the BRANCH
+    NOTE above for why. detector_eval (precision/recall vs. poison_idx) is
+    kept as a sanity check that this wiring is correct (trivially 1.0/1.0),
+    not a real evaluation.
 
   - WEIGHT PROTECTION during unlearning uses the existing SI (omega/p_old_task)
     machinery already implemented and validated in madar_cl_pipeline.py, not
@@ -224,13 +221,9 @@ UNLEARN_SI_C = 0.1  # SI penalty weight during UNLEARNING ONLY -- deliberately
                      # is a first-pass guess at a softer value, NOT yet tuned; see the
                      # loss-component diagnostics logged in unlearn_teacher_guided's
                      # return value for the data to tune it against.
-POISON_DETECTOR = "if_latent_phi1_donut_hole"  # logged into config/results for
-                                                # provenance; see module docstring's
-                                                # "poison detection" note
-DONUT_FORGET_RATIO = 0.1  # fraction of this task's malicious-labeled samples
-                           # forgotten (the middle band of the phi1 IF-score
-                           # distribution) -- value carried over unchanged from
-                           # split_option_b_donut_hole's forget_ratio default
+POISON_DETECTOR = "oracle_ground_truth"  # logged into config/results for
+                                          # provenance -- ORACLE EXPERIMENT
+                                          # BRANCH, see module docstring
 
 
 # ---------------------------------------------------------------------------
@@ -503,8 +496,8 @@ def _embed(model, Xt: torch.Tensor, device):
     return torch.cat(parts).numpy()
 
 
-def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, benign_label, mal_label,
-                         model, device):
+def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, sample_id: np.ndarray,
+                         benign_label, mal_label, model, device):
     """
     Selects, per label (benign/malicious), an interleaved anomalies+inliers sample
     (by IsolationForest decision_function over the model's LATENT space, budget
@@ -515,6 +508,11 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
     so exemplars from earlier tasks can survive across updates. `category` is
     attached to each stored sample purely for the buffer_composition_summary()
     diagnostic -- it plays no role in selection, which sees only latent vectors.
+    `sample_id` is the GLOBAL pool row index each sample was assigned in main()
+    (stable across the whole run, survives train/test splitting and poisoning
+    substitution) -- carried alongside category purely for traceability (tSNE
+    plots, cross-task comparison of which physical samples persist in the
+    buffer), also not used by selection.
     """
     global label_buffers, replay_buffer
     model.eval()
@@ -522,6 +520,7 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
     X_np = X.numpy()
     Y_np = y.numpy()
     cat_np = np.asarray(category)
+    id_np = np.asarray(sample_id)
     L_np = _embed(model, X, device)
     latent_dim = L_np.shape[1]
 
@@ -533,11 +532,13 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
             old_X = np.stack([e[0].numpy() for e in old_entries])
             old_Y = np.array([e[1].item() for e in old_entries], dtype=Y_np.dtype)
             old_cat = np.array([e[2] for e in old_entries], dtype=object)
+            old_id = np.array([e[3] for e in old_entries], dtype=id_np.dtype)
             old_L = _embed(model, torch.tensor(old_X), device)
         else:
             old_X = np.empty((0, X_np.shape[1]), dtype=X_np.dtype)
             old_Y = np.empty((0,), dtype=Y_np.dtype)
             old_cat = np.empty((0,), dtype=object)
+            old_id = np.empty((0,), dtype=id_np.dtype)
             old_L = np.empty((0, latent_dim), dtype=np.float32)
 
         mask = (Y_np == lbl)
@@ -545,6 +546,7 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
         pool_Y = np.concatenate([old_Y, Y_np[mask]], axis=0)
         pool_L = np.concatenate([old_L, L_np[mask]], axis=0)
         pool_cat = np.concatenate([old_cat, cat_np[mask]], axis=0)
+        pool_id = np.concatenate([old_id, id_np[mask]], axis=0)
 
         n_select = min(budget_per_label, len(pool_X))
         if n_select == 0:
@@ -563,7 +565,8 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
             interleaved_idx.append(inliers_idx[-1])
 
         label_buffers[lbl] = [
-            (torch.tensor(pool_X[i]), torch.tensor(pool_Y[i]), pool_cat[i]) for i in interleaved_idx
+            (torch.tensor(pool_X[i]), torch.tensor(pool_Y[i]), pool_cat[i], int(pool_id[i]))
+            for i in interleaved_idx
         ]
 
     replay_buffer.clear()
@@ -573,15 +576,22 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
 
 def buffer_composition_summary():
     """Diagnostic only: what fraction of each label's buffer slot is benign /
-    malicious_clean / malicious_perturbed right now. Never used by training or
-    selection."""
+    malicious_clean / malicious_perturbed right now, plus the GLOBAL sample_id
+    of every entry so buffer membership can be cross-referenced against
+    poisoned_sample_ids (per-task, in results) or reloaded from the pooled
+    dataset for tSNE later -- see update_buffer_madar's docstring for what
+    sample_id means. Never used by training or selection."""
     summary = {}
     for lbl, entries in label_buffers.items():
         cats = [e[2] for e in entries]
         counts = {}
         for c in cats:
             counts[c] = counts.get(c, 0) + 1
-        summary[str(lbl)] = {"total": len(entries), "category_counts": counts}
+        summary[str(lbl)] = {
+            "total": len(entries),
+            "category_counts": counts,
+            "sample_ids": [e[3] for e in entries],
+        }
     return summary
 
 
@@ -677,50 +687,25 @@ def evaluate_classifier(classifier, X, y):
 
 
 # ---------------------------------------------------------------------------
-# Step 3 -- poison detection, iteration 1 (phi1 only; see module docstring) +
-# unlearning phase itself.
+# Step 3 -- poison detection, ORACLE EXPERIMENT BRANCH (see module docstring).
+# Not phi1 -- this branch deliberately swaps back to ground truth to test
+# whether the unlearning MECHANISM behaves once detection is taken out of the
+# picture entirely, before spending more effort on phi1/phi3-5 statistical
+# features. main branch keeps phi1 (detect_poison_if_latent); that function is
+# untouched there -- this is a separate branch, not a replacement for it.
 # ---------------------------------------------------------------------------
-def detect_poison_if_latent(Xtr, ytr, mal_label, model, device, forget_ratio=DONUT_FORGET_RATIO):
+def detect_poison_oracle(poison_idx, n_samples):
     """
-    Step 3, iteration 1: phi1 -- IsolationForest decision_function score over
-    the CURRENT model's latent embedding of this task's malicious-labeled
-    training samples, forgetting the MIDDLE band of that score distribution
-    (neither the strongest anomalies nor the strongest inliers). Ported from
-    split_option_b_donut_hole in the EMBER unlearning reference
-    (clmdu_ember18_mk6B_cd.py); the reference's per-malware-family joint IF
-    fit is dropped -- CICIDS poisoning only ever touches the malicious-labeled
-    population (benign is never poisoned), so there's exactly one population
-    to search, not several families to fit jointly over.
-
-    Reads NO ground truth -- Df_t is chosen purely from the classifier's own
-    latent geometry (unlike this file's earlier oracle stand-in, kept in git
-    history). Benign samples are never candidates and are always retained.
+    Df_t = poison_idx exactly -- the ground-truth set of samples the red-agent
+    poisoning step substituted with evaded perturbations this task (main()
+    already computes this for the category-tracking/buffer diagnostic; no new
+    computation here). retain_idx = everything else.
 
     Returns (forget_idx, retain_idx) as sorted int64 index arrays into this
-    task's own Xtr/ytr -- the contract the rest of the pipeline depends on,
-    so iteration 2 (phi3/phi4/phi5 folded in) is a same-shape swap here.
+    task's own Xtr/ytr -- the same contract detect_poison_if_latent uses on
+    main, so swapping back to a real detector later is a one-function change.
     """
-    mal_idx = np.where(ytr.numpy() == mal_label)[0]
-    n_samples = len(ytr)
-    if len(mal_idx) == 0:
-        return np.array([], dtype=np.int64), np.arange(n_samples, dtype=np.int64)
-
-    L_np = _embed(model, Xtr[mal_idx], device)
-    iso = IsolationForest(contamination=MADAR_CONTAMINATION, n_jobs=-1, random_state=SEED)
-    iso.fit(L_np)
-    scores = iso.decision_function(L_np)
-    sorted_local = np.argsort(scores)
-
-    n_total = len(sorted_local)
-    n_forget = int(n_total * forget_ratio)
-    if n_forget == 0:
-        return np.array([], dtype=np.int64), np.arange(n_samples, dtype=np.int64)
-
-    mid_start = (n_total // 2) - (n_forget // 2)
-    mid_end = mid_start + n_forget
-    forget_local = sorted_local[mid_start:mid_end]
-
-    forget_idx = np.sort(mal_idx[forget_local])
+    forget_idx = np.asarray(sorted(int(i) for i in poison_idx), dtype=np.int64)
     retain_idx = np.setdiff1d(np.arange(n_samples, dtype=np.int64), forget_idx)
     return forget_idx, retain_idx
 
@@ -1063,6 +1048,20 @@ def main():
     print(f"day_mapping={day_mapping}, feature_dim={feature_dim}, "
           f"task sizes={[len(t['labels']) for t in tasks]}")
 
+    # GLOBAL sample ids: task t's rows are a contiguous slice of the pooled,
+    # timestamp-sorted array load_pooled_chronological_tasks builds internally
+    # (see that function -- tasks[t] = pool[starts[t]:starts[t]+len]). task_offsets[t]
+    # reconstructs starts[t] purely from each task's row count, so
+    # task_offsets[t] + (a row's position within task t's pool, BEFORE the
+    # train/test split below) is a stable identifier for that exact physical
+    # row -- same value every run given the same h5 file/task_fractions,
+    # independent of which task's buffer or forget/retain set it ends up in.
+    # Logged per-task (poisoned_sample_ids) and per-buffer-entry
+    # (buffer_composition_summary) purely for traceability -- e.g. reloading
+    # the pooled dataset by id later for tSNE -- never used by training,
+    # detection, or selection.
+    task_offsets = np.concatenate([[0], np.cumsum([len(t["labels"]) for t in tasks])[:-1]])
+
     bank = RecencyWeightedContrastiveBank(
         dim=feature_dim, ema=CONTRASTIVE_EMA, recency_decay=CONTRASTIVE_RECENCY_DECAY
     )
@@ -1088,9 +1087,10 @@ def main():
     for t, task in enumerate(tasks):
         X = np.clip(task["features"].astype(np.float32), 0.0, 1.0)  # data is documented [0,1]-scaled already
         y = task["labels"].astype(np.int64)
+        gid = task_offsets[t] + np.arange(len(y), dtype=np.int64)  # this task's pool-local id -> global id
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=TASK_TEST_FRAC, random_state=args.seed, stratify=y
+        X_train, X_test, y_train, y_test, gid_train, gid_test = train_test_split(
+            X, y, gid, test_size=TASK_TEST_FRAC, random_state=args.seed, stratify=y
         )
         task_test_splits[t] = (X_test, y_test)
 
@@ -1150,12 +1150,14 @@ def main():
                       f"(poison_fraction={POISON_FRACTION})")
 
         # Category tracking (identical to madar_cl_pipeline.py) -- feeds the
-        # buffer composition diagnostic only in this file; detect_poison_if_latent()
-        # below reads no ground truth from this array (see its docstring).
+        # buffer composition diagnostic only in this file; detect_poison_oracle()
+        # below reads poison_idx directly (see module docstring -- oracle branch),
+        # not this array.
         category = np.full(len(y_train), "malicious_clean", dtype=object)
         category[y_train == benign_label] = "benign"
         if len(poison_idx) > 0:
             category[poison_idx] = "malicious_perturbed"
+        poisoned_sample_ids = gid_train[poison_idx].tolist() if len(poison_idx) > 0 else []
 
         if t == 0:
             scaler = StandardScaler()
@@ -1196,7 +1198,7 @@ def main():
                 if p.requires_grad:
                     p_old_task[n.replace('.', '__')] = p.detach().clone()
             teacher_model = copy.deepcopy(model); teacher_model.eval()
-            update_buffer_madar(Xtr, ytr, category, benign_label, mal_label, model, DEVICE)
+            update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
 
         else:
             print(f"  Samples: {len(Xtr)} (+{len(replay_buffer)} replay) | "
@@ -1223,14 +1225,16 @@ def main():
                     omega[n_key] += W[n_key] / ((p_post_cl - p_old_task[n_key]) ** 2 + SI_EPS)
                     W[n_key].zero_()
 
-            # --- Steps 3 + 4: detect poison (phi1, iteration 1), skip if empty ---
-            forget_idx, retain_idx = detect_poison_if_latent(Xtr, ytr, mal_label, model, DEVICE)
-            print(f"    [Detect] Df_t (phi1 latent-IF donut-hole) = {len(forget_idx)} samples, "
+            # --- Steps 3 + 4: detect poison (ORACLE, this branch), skip if empty ---
+            forget_idx, retain_idx = detect_poison_oracle(poison_idx, len(Xtr))
+            print(f"    [Detect] Df_t (oracle ground truth) = {len(forget_idx)} samples, "
                   f"retain = {len(retain_idx)}")
 
-            # Evaluation-only: how much of Df_t is ACTUALLY poison, per ground
-            # truth. Never fed back into the detector's own decision (that would
-            # be the oracle again) -- purely for scoring detector quality this run.
+            # Trivially precision=1.0/recall=1.0 whenever poison_idx is
+            # non-empty, since Df_t IS poison_idx on this branch -- kept as a
+            # sanity check that the oracle wiring is actually correct, not a
+            # real evaluation (there's nothing to evaluate: detector==ground
+            # truth by construction).
             poison_set = set(int(i) for i in poison_idx)
             forget_set_idx = set(int(i) for i in forget_idx)
             overlap = poison_set & forget_set_idx
@@ -1248,7 +1252,7 @@ def main():
 
             if len(forget_idx) == 0:
                 print("    [Unlearning] Df_t empty -- skipping unlearning phase for this task.")
-                Xtr_for_buffer, ytr_for_buffer, category_for_buffer = Xtr, ytr, category
+                Xtr_for_buffer, ytr_for_buffer, category_for_buffer, gid_for_buffer = Xtr, ytr, category, gid_train
                 unlearning_metrics = {"detector": POISON_DETECTOR, "n_forget": 0, "detector_eval": detector_eval}
             else:
                 forget_idx_t = torch.tensor(forget_idx, dtype=torch.long)
@@ -1316,9 +1320,10 @@ def main():
                 Xtr_for_buffer = Xtr[retain_idx_t]
                 ytr_for_buffer = ytr[retain_idx_t]
                 category_for_buffer = category[retain_idx]
+                gid_for_buffer = gid_train[retain_idx]
 
             teacher_model = copy.deepcopy(model); teacher_model.eval()
-            update_buffer_madar(Xtr_for_buffer, ytr_for_buffer, category_for_buffer,
+            update_buffer_madar(Xtr_for_buffer, ytr_for_buffer, category_for_buffer, gid_for_buffer,
                                 benign_label, mal_label, model, DEVICE)
 
         # p_old_task updated to the FINAL (post-unlearning, if it ran this task)
@@ -1345,6 +1350,7 @@ def main():
             "n_train": int(len(y_train)), "n_test": int(len(y_test)),
             "n_malicious_train": int(len(mal_idx_train)),
             "n_poisoned": n_poisoned,
+            "poisoned_sample_ids": poisoned_sample_ids,
             "red_agent": red_report,
             "per_task_eval": per_task_eval,
             "pooled_eval": pooled_eval,
@@ -1370,7 +1376,7 @@ def main():
         "si_c": SI_C, "si_eps": SI_EPS, "rnt_floor": RNT_FLOOR, "task0_epochs": TASK0_EPOCHS,
         "cl_iters": CL_ITERS, "batch_size": BATCH_SIZE, "feature_clip": FEATURE_CLIP,
         "unlearn_epochs": UNLEARN_EPOCHS, "unlearn_lr": UNLEARN_LR, "unlearn_alpha": UNLEARN_ALPHA,
-        "unlearn_si_c": UNLEARN_SI_C, "donut_forget_ratio": DONUT_FORGET_RATIO,
+        "unlearn_si_c": UNLEARN_SI_C,
     }
     with open(os.path.join(out_dir, f"{args.log_name}.json"), "w") as f:
         json.dump({"config": config, "warnings": warnings_log, "results": results}, f, indent=2)
