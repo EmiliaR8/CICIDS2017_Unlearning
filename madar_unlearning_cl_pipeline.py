@@ -259,19 +259,45 @@ NUM_TASKS = 10
 TASK_FRACTIONS = [0.3000, 0.0918, 0.0883, 0.0848, 0.0813, 0.0778, 0.0743, 0.0708, 0.0673, 0.0638]
 TASK_TEST_FRAC = 0.20
 
-POISON_FRACTION = 0.3
 REQUIRE_EVASION_SUCCESS = True  # only successfully-evasive perturbations poison training data
 POISON_TEST_DATA = True  # BRANCH-SPECIFIC divergence from naive/joint/madar_cl_pipeline.py's
                           # shared convention (test is normally NEVER poisoned -- see this
                           # file's module docstring, BRANCH NOTE). When True, the SAME
-                          # evaded-mask-restricted, POISON_FRACTION-sized substitution applied
-                          # to train is also applied to each task's test split, so per_task_eval
+                          # evaded-mask-restricted substitution (schedule below) applied to
+                          # train is also applied to each task's test split, so per_task_eval
                           # /pooled_eval/prior_tasks_recovery measure accuracy on data that
                           # includes evasive perturbations the classifier never trained on --
                           # i.e. does detection/unlearning generalize to unseen poison, not just
                           # memorized training-time poison. Unlearning itself stays scoped to
                           # TRAINING data only (Df_t is never drawn from test) -- there is
                           # nothing to "forget" from data that was never trained on.
+
+# Per-task poison injection schedule (REWORK, replaces the old flat
+# POISON_FRACTION=0.3). Linear interpolation from task 1 to task NUM_TASKS-1
+# (task 0 has no red agent, so no poisoning either way). TRAIN and TEST are
+# deliberate mirror images of each other -- train front-loads poison (heavy
+# early, tapering later), test back-loads it (light early, heavy later) --
+# crossing at ~0.30 around the midpoint task, matching the flat fraction
+# this replaces. Plain global variables (not derived/computed) specifically
+# so they're easy to change later -- see poison_fraction_for_task() below.
+# Identical to madar_cl_pipeline.py's, so both pipelines see the SAME
+# poisoned data each task -- any difference in outcomes is attributable to
+# the STRATEGY, not to one pipeline facing easier/harder data.
+POISON_FRACTION_TRAIN_START = 0.50  # task 1
+POISON_FRACTION_TRAIN_END = 0.10    # task NUM_TASKS-1
+POISON_FRACTION_TEST_START = 0.10   # task 1
+POISON_FRACTION_TEST_END = 0.50     # task NUM_TASKS-1
+
+
+def poison_fraction_for_task(t, start, end, num_tasks=NUM_TASKS):
+    """Linear interpolation from `start` (task 1) to `end` (task num_tasks-1).
+    t=0 is never called (task 0 has no red agent / no poisoning)."""
+    if num_tasks <= 2:
+        return start
+    frac = (t - 1) / (num_tasks - 2)
+    return start + frac * (end - start)
+
+
 RED_EPSILON = 0.25
 RED_MAX_STEPS = 25
 RED_TIMESTEPS_PER_TASK = 2500
@@ -1354,8 +1380,11 @@ def main():
                 print(f"[Task {t} red agent] train_evasion={train_evasion_rate:.3f} "
                       f"test_evasion={test_evasion_rate:.3f} avg_pert_L2={train_avg_norm:.3f}")
 
+                poison_fraction_train = poison_fraction_for_task(
+                    t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
+                )
                 poison_pool = np.where(evaded_mask)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_train
-                n_to_poison = min(int(round(POISON_FRACTION * len(mal_idx_train))), len(poison_pool))
+                n_to_poison = min(int(round(poison_fraction_train * len(mal_idx_train))), len(poison_pool))
                 rng = np.random.RandomState(args.seed + t)
                 poison_idx = rng.choice(poison_pool, size=n_to_poison, replace=False) if n_to_poison > 0 else \
                     np.array([], dtype=int)
@@ -1364,20 +1393,24 @@ def main():
                 X_train_for_classifier = X_train.copy()
                 X_train_for_classifier[poison_idx] = X_train_pert[poison_idx]
                 print(f"[Task {t}] poisoned {n_poisoned}/{len(mal_idx_train)} malicious train samples "
-                      f"(poison_fraction={POISON_FRACTION})")
+                      f"(poison_fraction_train={poison_fraction_train:.3f})")
 
                 # TEST-SIDE poisoning (POISON_TEST_DATA, this branch only -- see module
                 # docstring BRANCH NOTE and POISON_TEST_DATA's definition for why). Same
-                # evaded-mask restriction + POISON_FRACTION sizing as train, applied to
-                # this task's own test split. Overwrites task_test_splits[t] so every
-                # downstream eval (per_task_eval, pooled_eval, prior_tasks_recovery) for
-                # this task sees the poisoned test set from here on. The perturbation
+                # evaded-mask restriction, sized per poison_fraction_for_task() (mirror
+                # image of train's schedule -- rises across tasks instead of falling),
+                # applied to this task's own test split. Overwrites task_test_splits[t]
+                # so every downstream eval (per_task_eval, pooled_eval, prior_tasks_recovery)
+                # for this task sees the poisoned test set from here on. The perturbation
                 # classifier / unlearning never sees this -- it stays scoped to Xtr/ytr
                 # (training data) only, unchanged below.
                 if POISON_TEST_DATA:
+                    poison_fraction_test = poison_fraction_for_task(
+                        t, POISON_FRACTION_TEST_START, POISON_FRACTION_TEST_END
+                    )
                     mal_idx_test = np.where(y_test == mal_label)[0]
                     poison_pool_test = np.where(evaded_mask_test)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_test
-                    n_to_poison_test = min(int(round(POISON_FRACTION * len(mal_idx_test))), len(poison_pool_test))
+                    n_to_poison_test = min(int(round(poison_fraction_test * len(mal_idx_test))), len(poison_pool_test))
                     rng_test = np.random.RandomState(args.seed + t + 10_000)  # distinct stream from train's rng
                     poison_idx_test = rng_test.choice(poison_pool_test, size=n_to_poison_test, replace=False) \
                         if n_to_poison_test > 0 else np.array([], dtype=int)
@@ -1388,7 +1421,8 @@ def main():
                     task_test_splits[t] = (X_test, y_test)
                     poisoned_test_sample_ids = gid_test[poison_idx_test].tolist() if n_poisoned_test > 0 else []
                     print(f"[Task {t}] poisoned {n_poisoned_test}/{len(mal_idx_test)} malicious TEST samples "
-                          f"(poison_fraction={POISON_FRACTION}) -- test_evasion_rate was {test_evasion_rate:.3f}")
+                          f"(poison_fraction_test={poison_fraction_test:.3f}) -- "
+                          f"test_evasion_rate was {test_evasion_rate:.3f}")
                 else:
                     n_poisoned_test = 0
                     poisoned_test_sample_ids = []
@@ -1666,7 +1700,11 @@ def main():
         "poison_detector": POISON_DETECTOR,
         "h5_path": args.h5_path, "seed": args.seed, "num_tasks": NUM_TASKS,
         "task_fractions": TASK_FRACTIONS, "task_test_frac": TASK_TEST_FRAC,
-        "poison_fraction": POISON_FRACTION, "require_evasion_success": REQUIRE_EVASION_SUCCESS,
+        "poison_fraction_train_start": POISON_FRACTION_TRAIN_START,
+        "poison_fraction_train_end": POISON_FRACTION_TRAIN_END,
+        "poison_fraction_test_start": POISON_FRACTION_TEST_START,
+        "poison_fraction_test_end": POISON_FRACTION_TEST_END,
+        "require_evasion_success": REQUIRE_EVASION_SUCCESS,
         "poison_test_data": POISON_TEST_DATA,
         "perturbation_classifier_n": PERTURBATION_CLASSIFIER_N,
         "clean_replay_buffer_of_perturbed": CLEAN_REPLAY_BUFFER_OF_PERTURBED,
