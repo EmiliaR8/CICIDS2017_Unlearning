@@ -224,6 +224,25 @@ prev_active_count:active_count "newly introduced class range" to target
 specifically) is carried over from the two references unchanged; see the
 docstrings on unlearn_teacher_guided / measure_unlearning_efficacy below for
 exactly what and why.
+
+UPDATE (REWORK 2, cross-task buffer refill): the malicious-slot refill step
+(CLEAN_REPLAY_BUFFER_OF_PERTURBED, step 5) previously only drew replacement
+candidates from the CURRENT task's own leftover clean-malicious samples,
+which left the slot chronically under-filled whenever a single task didn't
+have enough on its own (observed as low as 657/2000 in early runs -- see
+CLEAN_REPLAY_BUFFER_OF_PERTURBED's definition and main()'s "REFILL" comment
+for the fix in detail). Refill candidates are now the current task's own
+leftovers COMBINED with historical_clean_mal_pool -- every past task's own
+clean-malicious samples (main()'s own judgment via
+build_perturbation_classifier_forget_set, never oracle poison_idx),
+accumulated across the whole run and appended to only after each task's own
+refill has already drawn from it (so a task never becomes a candidate for
+its own refill). Both pools are ranked together as one combined candidate
+set via the existing IsolationForest anomaly+inlier selection, not
+"this-task-first". No eviction from the historical pool -- it grows for the
+whole run, a real memory/compute tradeoff (a model forward pass +
+IsolationForest fit over the whole accumulated pool on every refill)
+accepted because "any past task" was the explicit design goal here.
 """
 import argparse
 import copy
@@ -395,13 +414,16 @@ CLEAN_REPLAY_BUFFER_OF_PERTURBED = True  # toggle: after IsolationForest/buffer 
                                           # draws from the FULL task batch, unfiltered -- see
                                           # module docstring), remove any buffer entries that
                                           # match potentially_perturbed_pool's global sample ids,
-                                          # then refill the malicious slot back up to budget with
-                                          # this task's own clean-malicious (not in
-                                          # potentially_perturbed_pool) samples, ranked via the
-                                          # same IsolationForest anomaly+inlier selection as
-                                          # everywhere else. Stays under-filled only if too few
-                                          # clean-malicious candidates exist this task to cover
-                                          # the deficit.
+                                          # then refill the malicious slot back up to budget.
+                                          # REWORK 2: refill candidates are no longer just this
+                                          # task's own leftovers -- they're combined with
+                                          # historical_clean_mal_pool (every PAST task's own
+                                          # clean-malicious samples, see its definition in main())
+                                          # and ranked together via the same IsolationForest
+                                          # anomaly+inlier selection as everywhere else. Stays
+                                          # under-filled only if the combined this-task +
+                                          # cross-task pool still can't cover the deficit (rare
+                                          # after task 1 or so, once history has accumulated).
 
 
 # ---------------------------------------------------------------------------
@@ -1369,6 +1391,21 @@ def main():
                           # task_test_splits[t] are the poisoned ones (see task_poisoned_test_gids)
     task_poisoned_test_gids = {}  # t -> that task's own poisoned_test_sample_ids, recorded once
                                    # per task (immutable afterward) -- feeds perturbed_test_eval
+    historical_clean_mal_pool = []  # REWORK: list of (X, y, category, gid) 4-tuples --
+                                     # every PAST task's malicious training samples that task's
+                                     # OWN perturbation_classifier did NOT flag as perturbed
+                                     # (never oracle poison_idx -- same "classifier's judgment
+                                     # only" rule the within-task refill already followed).
+                                     # Appended to once per task, AFTER that task's own buffer
+                                     # refill runs (so a task's own samples are never candidates
+                                     # for its own refill -- see the refill site below). Feeds
+                                     # the buffer-refill step so it can draw on any earlier
+                                     # task's clean-malicious samples, not just the current
+                                     # task's leftovers. Grows unbounded across the run (no
+                                     # eviction) -- by task 9 this can hold tens of thousands of
+                                     # feature vectors; a real memory/compute cost (IsolationForest
+                                     # + a model forward pass over the whole pool every refill),
+                                     # accepted here since "any past task" was the explicit ask.
     results = []
     warnings_log = []
 
@@ -1616,6 +1653,16 @@ def main():
             teacher_model = copy.deepcopy(model); teacher_model.eval()
             update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
 
+            # Task 0 has no red agent / no poisoning at all, so every malicious
+            # sample here is trivially "clean" -- seed the cross-task historical
+            # pool with all of them (see historical_clean_mal_pool's definition
+            # above for what this feeds).
+            ytr_np = ytr.numpy()
+            for i in np.where(ytr_np == mal_label)[0]:
+                historical_clean_mal_pool.append(
+                    (Xtr[i].clone(), ytr[i].clone(), category[i], int(gid_train[i]))
+                )
+
         else:
             pc_rng = np.random.RandomState(args.seed + t + 30_000)  # distinct stream from train/test poison rngs
             pc_result = build_perturbation_classifier_forget_set(
@@ -1737,16 +1784,25 @@ def main():
                 ]
                 n_removed = before - len(label_buffers[mal_label])
 
-                # REFILL (REWORK): top the malicious slot back up to budget with
-                # this task's own clean-malicious samples -- i.e. malicious AND
-                # NOT in potentially_perturbed_pool (the classifier's judgment,
-                # not oracle ground truth -- staying consistent with the rest of
-                # this pipeline never peeking at poison_idx beyond seeding the
-                # classifier's training labels). Without this, the slot stays
-                # under-filled until the NEXT task's refresh happens to top it
-                # back up on its own, confounding "effect of forgetting
-                # perturbed samples" with "effect of a chronically smaller
-                # buffer" -- plain MADAR's buffer never shrinks this way, so an
+                # REFILL (REWORK 2 -- now cross-task): top the malicious slot
+                # back up to budget with clean-malicious samples -- i.e.
+                # malicious AND NOT flagged perturbed by the classifier that
+                # judged them (never oracle ground truth -- staying consistent
+                # with the rest of this pipeline never peeking at poison_idx
+                # beyond seeding the classifier's training labels). Candidates
+                # now come from THIS task's own leftovers AND every past task's
+                # clean-malicious samples (historical_clean_mal_pool, see its
+                # definition above) combined into one pool, ranked together via
+                # the same IsolationForest anomaly+inlier selection used
+                # everywhere else -- not "prefer this task's own first". This
+                # replaces the original within-task-only refill, which left the
+                # slot under-filled whenever a single task didn't have enough
+                # clean-malicious samples on its own (observed as low as
+                # 657/2000 in early runs). Without ANY refill, the slot stays
+                # under-filled until a later task's own refresh happens to top
+                # it back up, confounding "effect of forgetting perturbed
+                # samples" with "effect of a chronically smaller buffer" --
+                # plain MADAR's buffer never shrinks this way, so an
                 # uncontrolled size gap would bias any comparison between them.
                 budget_per_label = MEM_SIZE // 2
                 deficit = budget_per_label - len(label_buffers[mal_label])
@@ -1755,15 +1811,20 @@ def main():
                     already_buffered = set(int(e[3]) for e in label_buffers[mal_label])
                     ytr_np = ytr.numpy()
                     forgotten_set = set(int(i) for i in pc_result["forget_idx"])
-                    refill_candidates = np.array([
-                        i for i in range(len(Xtr))
+                    this_task_entries = [
+                        (Xtr[i].clone(), ytr[i].clone(), category[i], int(gid_train[i]))
+                        for i in range(len(Xtr))
                         if ytr_np[i] == mal_label and i not in forgotten_set
                         and int(gid_train[i]) not in already_buffered
-                    ], dtype=np.int64)
+                    ]
+                    historical_entries = [
+                        e for e in historical_clean_mal_pool if e[3] not in already_buffered
+                    ]
+                    combined_entries = this_task_entries + historical_entries
 
-                    if len(refill_candidates) > 0:
-                        n_refill = min(deficit, len(refill_candidates))
-                        cand_X = Xtr[torch.tensor(refill_candidates, dtype=torch.long)]
+                    if combined_entries:
+                        n_refill = min(deficit, len(combined_entries))
+                        cand_X = torch.stack([e[0] for e in combined_entries])
                         cand_L = _embed(model, cand_X, DEVICE)
                         iso = IsolationForest(contamination=MADAR_CONTAMINATION, n_jobs=-1, random_state=SEED)
                         iso.fit(cand_L)
@@ -1771,11 +1832,7 @@ def main():
                         local_idx = _anomaly_inlier_interleave(scores, n_refill)
 
                         for li in local_idx:
-                            orig_i = int(refill_candidates[li])
-                            label_buffers[mal_label].append((
-                                Xtr[orig_i].clone(), ytr[orig_i].clone(),
-                                category[orig_i], int(gid_train[orig_i]),
-                            ))
+                            label_buffers[mal_label].append(combined_entries[li])
                         n_refilled = len(local_idx)
 
                 replay_buffer.clear()
@@ -1783,7 +1840,24 @@ def main():
                     replay_buffer.extend(buf)
                 print(f"    [Buffer clean] removed {n_removed} potentially_perturbed_pool matches, "
                       f"refilled {n_refilled}/{deficit} with clean-malicious samples "
+                      f"(this task + {len(historical_clean_mal_pool)} historical candidates) "
                       f"in the malicious-label buffer slot.")
+
+            # Grow the cross-task historical pool with THIS task's own
+            # clean-malicious samples, AFTER this task's own refill above (so
+            # a task's own samples are never candidates for its own refill --
+            # only genuinely PAST tasks' samples are). Independent of the
+            # CLEAN_REPLAY_BUFFER_OF_PERTURBED toggle -- the pool is always
+            # maintained when a classifier judgment exists, regardless of
+            # whether cleaning/refill happened to run this task.
+            if pc_result is not None:
+                ytr_np = ytr.numpy()
+                forgotten_set = set(int(i) for i in pc_result["forget_idx"])
+                for i in range(len(Xtr)):
+                    if ytr_np[i] == mal_label and i not in forgotten_set:
+                        historical_clean_mal_pool.append(
+                            (Xtr[i].clone(), ytr[i].clone(), category[i], int(gid_train[i]))
+                        )
 
         # p_old_task updated to the FINAL (post-unlearning, if it ran this task)
         # weights, for ALL tasks -- ready as next task's start-of-task SI anchor.
