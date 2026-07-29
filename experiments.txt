@@ -21,6 +21,9 @@ python madar_cl_pipeline.py --seed 42 --log_name madar7                       MA
 python madar_cl_pipeline.py --seed 42 --log_name madar_dual_agent1            MADAR   1 train agent, 1 test agent
 
 
+
+
+
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u1         MADAR+U  First iteration of the MADAR+Unlearning pipeline, donut hole implementation (like EMBER): Many issues logged in chat with piplai, need to modify donut, SI, and isolation forest logic
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u2         MADAR+U  First iteration v2, but with softened SI and logs that ensure that this was the right move: SI did nothing, not better or worse, 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u3_oracle  MADAR+U  Uses the oracle to tell what samples to unlearn: 
@@ -36,6 +39,9 @@ python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active2   MADA
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u_dual_agent
 
 
+python madar_cl_pipeline.py --seed 42 --log_name madar_10task_run 
+
+
 Next: 
 python naive_cl_pipeline.py --seed 42 --log_name naive4                       Naive   Change XGBoost to NN and include poisoning schedule
 python joint_cl_pipeline.py --seed 42 --log_name joint2                       Joint   Change XGBoost to NN and include poisoning schedule
@@ -45,7 +51,7 @@ python joint_cl_pipeline.py --seed 42 --log_name joint2                       Jo
 fill replay buffer with not pertrubed samples for MADR+U
 
 
- python compare_cl_runs.py  runs/madar_unlearning/madar_u_dual_agent/madar_u_dual_agent.json  runs/madar/madar_dual_agent1/madar_dual_agent1.json --out madar_dual_v_madaru_dual.png  --include_table
+ python compare_cl_runs.py runs/madar/madar_dualAgent_uncertain/madar_10task_run.json  runs/madar_unlearning/madar_u_uncertainty_refill/madar_u_uncertainty_refill.json --out madar_dual_v_madaru_uncertain.png  --include_table
 
 conda
 
