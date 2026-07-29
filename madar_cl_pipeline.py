@@ -102,6 +102,32 @@ SAC agent for nothing. Also: POISON_SCHEDULE_ENABLED flipped to False (flat
 POISON_FRACTION_FLAT=0.30 for both train and test, every task) -- moving
 away from the per-task schedule per explicit request; the schedule code
 itself is untouched and can be re-enabled by flipping the toggle back.
+
+UPDATE (REWORK, quad red agents): two MORE agents added per task --
+red_train_benign_pert_agent and red_test_benign_pert_agent -- mirroring the
+malicious pair but attacking BENIGN rows toward mal_label instead of
+malicious rows toward benign_label. Reuses NetworkAttackEnv/
+train_red_agent_for_task/evaluate_agent_on_batch entirely unmodified: the
+"benign_label" argument threaded through that whole call chain is really
+just "the target class this agent optimizes toward", so passing mal_label
+in for the two new agents is sufficient. All four agents (train, test,
+train_benign, test_benign) register in the SAME contrastive bank under
+"{task_id}_{agent_type}", trained in that order, so each is pushed away
+from every agent registered before it (this task and all earlier ones) via
+the existing recency-weighted mechanism -- no new diversity logic needed.
+Poisoning of benign data mirrors the malicious mechanic exactly (same flat
+0.30 rate via poison_fraction_for_task, same REQUIRE_EVASION_SUCCESS gate,
+same evaded-mask-restricted substitution) and is applied on TOP of the
+existing malicious substitution in X_train_for_classifier/X_test (disjoint
+index sets, so no collision). Ground truth y is left unchanged (still
+benign) on substitution, matching how malicious_perturbed keeps its true
+malicious label -- only X changes. New category value "benign_perturbed"
+added alongside the existing benign/malicious_clean/malicious_perturbed
+three, purely for the same buffer-composition/plotting diagnostics (never
+fed back into selection or training). New per-task diagnostic plot,
+plot_clean_vs_perturbed: task-local 2D PCA of that task's scaled training
+features, colored by category, so perturbed populations' position relative
+to the clean clouds is visible per task.
 """
 import argparse
 import copy
@@ -402,29 +428,41 @@ def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
     return X_pert, evasion_rate, rewards, avg_pert_norm, attacked, evaded_mask
 
 
+RED_AGENT_SEED_OFFSETS = {"train": 0, "test": 100_000, "train_benign": 200_000, "test_benign": 300_000}
+
+
 def train_red_agent_for_task(task_id, agent_type, classifier, X_data, y_data, benign_label, bank, seed, out_dir):
     """
     REWORK: one call per (task, agent_type) pair now, not one call per task.
-    agent_type in {"train", "test"} -- the caller passes X_data/y_data as
-    whichever split this agent is dedicated to (X_train for the train-side
-    perturbation agent, X_test for the test-side one), and this builds a
-    NetworkAttackEnv directly over THAT data. Fixes a latent bug: previously
-    a single agent's env was built once from X_train, then reused unmodified
-    for the "test" evaluate_agent_on_batch call -- NetworkAttackEnv.reset()
-    always samples from self.X_data (fixed at construction, update_data()
-    existed but was never called), so that second call was actually
-    attacking train rows at test-derived indices, not test data at all.
+    agent_type in {"train", "test", "train_benign", "test_benign"} -- the
+    caller passes X_data/y_data as whichever split this agent is dedicated to
+    (X_train for the train-side perturbation agent, X_test for the test-side
+    one), and this builds a NetworkAttackEnv directly over THAT data. Fixes a
+    latent bug: previously a single agent's env was built once from X_train,
+    then reused unmodified for the "test" evaluate_agent_on_batch call --
+    NetworkAttackEnv.reset() always samples from self.X_data (fixed at
+    construction, update_data() existed but was never called), so that
+    second call was actually attacking train rows at test-derived indices,
+    not test data at all.
+
+    "train"/"test" attack malicious rows toward benign_label (the original
+    mechanism); "train_benign"/"test_benign" attack benign rows toward
+    whatever label the CALLER passes in as `benign_label` (in practice
+    mal_label) -- this argument is really just "the target class this agent
+    optimizes toward", and NetworkAttackEnv's non_benign_indices = where
+    (y_data != that target) already generalizes to "the pool being
+    attacked" for any target class, so no changes to NetworkAttackEnv/
+    evaluate_agent_on_batch were needed to add the benign-side agents.
 
     agent_id is now a compound "{task_id}_{agent_type}" string (was task_id
-    alone) so the contrastive bank tracks train/test agents as fully
-    distinct entries -- train_t's reward pushes it away from every agent
-    registered before it (..., test_{t-1}, train_{t-1}, ...), and test_t's
-    reward (trained second, see main()) additionally sees train_t's
-    now-registered prototype, giving same-task train/test dissimilarity.
-    Distinct seed offset per agent_type so the two agents' SAC init/training
-    RNG streams don't collide within the same task.
+    alone) so the contrastive bank tracks all four agent types as fully
+    distinct entries -- each agent's reward pushes it away from every agent
+    registered before it, this task and all earlier tasks, via the existing
+    recency-weighted mechanism. Distinct seed offset per agent_type (see
+    RED_AGENT_SEED_OFFSETS) so the four agents' SAC init/training RNG
+    streams don't collide within the same task.
     """
-    seed_offset = 0 if agent_type == "train" else 100_000
+    seed_offset = RED_AGENT_SEED_OFFSETS.get(agent_type, 0)
     agent_id = f"{task_id}_{agent_type}"
 
     def _thunk():
@@ -777,11 +815,26 @@ def plot_task_metrics(results, out_path):
     plt.close(fig)
 
 
+# agent_ids are "{task_id}_{agent_type}" compound strings, agent_type in
+# {"train", "test", "train_benign", "test_benign"} -- split on the FIRST
+# underscore only (agent_type itself contains one for the benign types), and
+# sort/mark deterministically rather than relying on alphabetical order.
+AGENT_TYPE_ORDER = {"train": 0, "test": 1, "train_benign": 2, "test_benign": 3}
+AGENT_TYPE_MARKERS = {"train": "o", "test": "^", "train_benign": "s", "test_benign": "D"}
+
+
+def _parse_agent_id(agent_id):
+    task_num, agent_type = agent_id.split("_", 1)
+    return int(task_num), agent_type
+
+
+def _agent_id_sort_key(agent_id):
+    task_num, agent_type = _parse_agent_id(agent_id)
+    return (task_num, AGENT_TYPE_ORDER.get(agent_type, 99))
+
+
 def plot_prototype_heatmap(bank, out_path):
-    # REWORK: agent_ids are "{task_id}_train"/"{task_id}_test" compound strings
-    # now -- plain sorted() would put "10_x" before "2_x" and "0_test" before
-    # "0_train" (alphabetical), so sort by (task number, train-before-test).
-    ordered_ids = sorted(bank.protos.keys(), key=lambda pid: (int(pid.split("_")[0]), pid.split("_")[1] != "train"))
+    ordered_ids = sorted(bank.protos.keys(), key=_agent_id_sort_key)
     agent_ids, S = bank.cosine_matrix(agent_ids=ordered_ids)
     if S is None or len(agent_ids) < 2:
         print("[Plot] Not enough task prototypes to plot a heatmap yet.")
@@ -801,12 +854,7 @@ def plot_prototype_heatmap(bank, out_path):
 
 
 def plot_episode_clouds(bank, out_path):
-    # REWORK: agent_ids are "{task_id}_train"/"{task_id}_test" compound
-    # strings now, not bare ints -- sort chronologically (task number, then
-    # train-before-test) rather than alphabetically, and derive the color
-    # index/marker from the parsed task number/type instead of `tid % 10`
-    # (which would TypeError on a string).
-    task_ids = sorted(bank.episode_embs.keys(), key=lambda pid: (int(pid.split("_")[0]), pid.split("_")[1] != "train"))
+    task_ids = sorted(bank.episode_embs.keys(), key=_agent_id_sort_key)
     X, y = [], []
     for tid in task_ids:
         for e in bank.episode_embs.get(tid, []):
@@ -830,12 +878,64 @@ def plot_episode_clouds(bank, out_path):
         mask = y == tid
         if mask.sum() == 0:
             continue
-        task_num, agent_type = tid.split("_")
-        marker = "o" if agent_type == "train" else "^"
-        plt.scatter(Z[mask, 0], Z[mask, 1], s=12, alpha=0.6, color=cmap(int(task_num) % 10),
+        task_num, agent_type = _parse_agent_id(tid)
+        marker = AGENT_TYPE_MARKERS.get(agent_type, "x")
+        plt.scatter(Z[mask, 0], Z[mask, 1], s=12, alpha=0.6, color=cmap(task_num % 10),
                     marker=marker, label=f"task {tid}")
 
     plt.title("Episode embedding clouds (PCA-2D of cumulative perturbations)")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.legend(markerscale=1.5, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+
+CATEGORY_COLORS = {
+    "benign": "tab:blue",
+    "malicious_clean": "tab:orange",
+    "malicious_perturbed": "tab:red",
+    "benign_perturbed": "tab:purple",
+}
+
+
+def plot_clean_vs_perturbed(Xtr, category, task_id, out_path):
+    """
+    Task-local 2D PCA (SVD, same style as plot_episode_clouds) of this task's
+    SCALED training features (Xtr, post to_tensor -- same space the classifier
+    actually trains on), colored by category (benign / malicious_clean /
+    malicious_perturbed / benign_perturbed) so the perturbed populations'
+    position relative to the clean clouds is directly visible, per task. Fresh
+    PCA basis every call (task-local, not shared across tasks) -- the goal is
+    within-task comparison, not cross-task trajectory tracking. Clean
+    categories are drawn first/smaller/fainter so the perturbed points (drawn
+    on top, larger, more opaque) aren't buried under the denser clean cloud.
+    """
+    X_np = Xtr.numpy() if hasattr(Xtr, "numpy") else np.asarray(Xtr)
+    cat_np = np.asarray(category)
+
+    if len(X_np) < 5:
+        print(f"[Plot] Task {task_id}: not enough samples to plot clean-vs-perturbed.")
+        return
+
+    X0 = X_np - X_np.mean(axis=0, keepdims=True)
+    _, _, Vt = np.linalg.svd(X0, full_matrices=False)
+    Z = X0 @ Vt[:2].T
+
+    plt.figure(figsize=(7, 6))
+    for cat in ("benign", "malicious_clean", "malicious_perturbed", "benign_perturbed"):
+        mask = cat_np == cat
+        if mask.sum() == 0:
+            continue
+        is_perturbed = cat.endswith("_perturbed")
+        plt.scatter(
+            Z[mask, 0], Z[mask, 1],
+            s=18 if is_perturbed else 8, alpha=0.8 if is_perturbed else 0.3,
+            color=CATEGORY_COLORS[cat], label=f"{cat} (n={int(mask.sum())})",
+        )
+
+    plt.title(f"Task {task_id}: clean vs. perturbed samples (PCA-2D of scaled features)")
     plt.xlabel("PC1")
     plt.ylabel("PC2")
     plt.legend(markerscale=1.5, fontsize=8)
@@ -897,7 +997,8 @@ def main():
     # misorder the log/plots relative to when each agent actually trained.
     bank.init_distance_logger(
         path=os.path.join(out_dir, "logs", "prototype_cosine_over_time.txt"),
-        agent_ids=[f"{t}_{typ}" for t in range(NUM_TASKS) for typ in ("train", "test")],
+        agent_ids=[f"{t}_{typ}" for t in range(NUM_TASKS)
+                   for typ in ("train", "test", "train_benign", "test_benign")],
     )
 
     # Classifier, scaler, SI bookkeeping: all lazily created at task 0, once
@@ -934,11 +1035,16 @@ def main():
         task_test_gids[t] = gid_test
 
         mal_idx_train = np.where(y_train == mal_label)[0]
+        benign_idx_train = np.where(y_train == benign_label)[0]
         red_report = None
         n_poisoned = 0
         poison_idx = np.array([], dtype=int)
         n_poisoned_test = 0
         poisoned_test_sample_ids = []
+        n_poisoned_benign = 0
+        poison_idx_benign = np.array([], dtype=int)
+        n_poisoned_test_benign = 0
+        poisoned_test_sample_ids_benign = []
 
         if t == 0:
             print(f"\n===== Task 0 (warm start, no red agent): "
@@ -950,6 +1056,7 @@ def main():
                   f"({len(y_train)} train / {len(y_test)} test, {len(mal_idx_train)} malicious train) =====")
 
             mal_idx_test = np.where(y_test == mal_label)[0]
+            benign_idx_test = np.where(y_test == benign_label)[0]
 
             if len(mal_idx_train) == 0:
                 warnings_log.append(f"Task {t}: no malicious training samples, skipping red agents.")
@@ -1039,15 +1146,109 @@ def main():
                     n_poisoned_test = 0
                     poisoned_test_sample_ids = []
 
+                # BENIGN-SIDE perturbation agents (added alongside the malicious
+                # train/test agents above). Mirror-image objective: attack
+                # BENIGN rows, reward/terminate on being misclassified as
+                # mal_label instead of benign_label. Reuses NetworkAttackEnv/
+                # train_red_agent_for_task/evaluate_agent_on_batch completely
+                # unmodified -- passing mal_label in as the "benign_label"
+                # argument is sufficient, since that argument is really just
+                # "the target class this agent optimizes toward" and
+                # non_benign_indices = where(y_data != target) already
+                # generalizes to "the pool being attacked" for any target
+                # class. Registered in the SAME contrastive bank as the
+                # malicious agents, so all four of this task's agents (and
+                # every earlier task's) push each other apart via the
+                # existing recency-weighted mechanism -- no new diversity
+                # logic needed. Ground truth label is left as benign (0) on
+                # substitution, matching how malicious_perturbed keeps its
+                # true malicious label -- only X changes, not y.
+                if len(benign_idx_train) == 0:
+                    warnings_log.append(f"Task {t}: no benign training samples, skipping benign red agents.")
+                else:
+                    env_train_benign, agent_train_benign = train_red_agent_for_task(
+                        t, "train_benign", classifier_wrapper, X_train, y_train, mal_label, bank, args.seed, out_dir
+                    )
+                    (X_train_pert_benign, train_evasion_rate_benign, train_rewards_benign, train_avg_norm_benign,
+                     train_attacked_benign, evaded_mask_benign) = evaluate_agent_on_batch(
+                        env_train_benign, agent_train_benign, X_train, y_train, mal_label,
+                        only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                    )
+
+                    red_report["train_benign_evasion_rate"] = train_evasion_rate_benign
+                    red_report["train_benign_attacked"] = train_attacked_benign
+                    red_report["train_benign_avg_reward"] = float(np.mean(train_rewards_benign)) if train_rewards_benign else 0.0
+                    red_report["train_benign_avg_pert_l2"] = train_avg_norm_benign
+                    print(f"[Task {t} red_train_benign_pert_agent] train_evasion={train_evasion_rate_benign:.3f} "
+                          f"avg_pert_L2={train_avg_norm_benign:.3f}")
+
+                    poison_fraction_train_benign = poison_fraction_for_task(
+                        t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
+                    )
+                    poison_pool_benign = np.where(evaded_mask_benign)[0] if REQUIRE_EVASION_SUCCESS else benign_idx_train
+                    n_to_poison_benign = min(
+                        int(round(poison_fraction_train_benign * len(benign_idx_train))), len(poison_pool_benign)
+                    )
+                    rng_benign = np.random.RandomState(args.seed + t + 20_000)  # distinct stream from mal train/test rngs
+                    poison_idx_benign = rng_benign.choice(poison_pool_benign, size=n_to_poison_benign, replace=False) \
+                        if n_to_poison_benign > 0 else np.array([], dtype=int)
+                    n_poisoned_benign = len(poison_idx_benign)
+
+                    X_train_for_classifier[poison_idx_benign] = X_train_pert_benign[poison_idx_benign]
+                    print(f"[Task {t}] poisoned {n_poisoned_benign}/{len(benign_idx_train)} benign train samples "
+                          f"(poison_fraction_train_benign={poison_fraction_train_benign:.3f})")
+
+                    if POISON_TEST_DATA and len(benign_idx_test) > 0:
+                        env_test_benign, agent_test_benign = train_red_agent_for_task(
+                            t, "test_benign", classifier_wrapper, X_test, y_test, mal_label, bank, args.seed, out_dir
+                        )
+                        (X_test_pert_benign, test_evasion_rate_benign, test_rewards_benign, test_avg_norm_benign,
+                         test_attacked_benign, evaded_mask_test_benign) = evaluate_agent_on_batch(
+                            env_test_benign, agent_test_benign, X_test, y_test, mal_label,
+                            only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                        )
+                        red_report["test_benign_evasion_rate"] = test_evasion_rate_benign
+                        red_report["test_benign_attacked"] = test_attacked_benign
+                        red_report["test_benign_avg_reward"] = float(np.mean(test_rewards_benign)) if test_rewards_benign else 0.0
+                        red_report["test_benign_avg_pert_l2"] = test_avg_norm_benign
+                        print(f"[Task {t} red_test_benign_pert_agent] test_evasion={test_evasion_rate_benign:.3f} "
+                              f"avg_pert_L2={test_avg_norm_benign:.3f}")
+
+                        poison_fraction_test_benign = poison_fraction_for_task(
+                            t, POISON_FRACTION_TEST_START, POISON_FRACTION_TEST_END
+                        )
+                        poison_pool_test_benign = np.where(evaded_mask_test_benign)[0] if REQUIRE_EVASION_SUCCESS \
+                            else benign_idx_test
+                        n_to_poison_test_benign = min(
+                            int(round(poison_fraction_test_benign * len(benign_idx_test))), len(poison_pool_test_benign)
+                        )
+                        rng_test_benign = np.random.RandomState(args.seed + t + 40_000)  # distinct stream
+                        poison_idx_test_benign = rng_test_benign.choice(
+                            poison_pool_test_benign, size=n_to_poison_test_benign, replace=False
+                        ) if n_to_poison_test_benign > 0 else np.array([], dtype=int)
+                        n_poisoned_test_benign = len(poison_idx_test_benign)
+
+                        X_test = X_test.copy()
+                        X_test[poison_idx_test_benign] = X_test_pert_benign[poison_idx_test_benign]
+                        task_test_splits[t] = (X_test, y_test)
+                        poisoned_test_sample_ids_benign = gid_test[poison_idx_test_benign].tolist() \
+                            if n_poisoned_test_benign > 0 else []
+                        print(f"[Task {t}] poisoned {n_poisoned_test_benign}/{len(benign_idx_test)} benign TEST samples "
+                              f"(poison_fraction_test_benign={poison_fraction_test_benign:.3f}) -- "
+                              f"test_evasion_rate was {test_evasion_rate_benign:.3f}")
+
         # Category tracking for the buffer-composition diagnostic ONLY (never fed
         # back into training/selection) -- benign / malicious_clean /
-        # malicious_perturbed, built from TRAIN data only; test poisoning above
-        # never touches training/selection.
+        # malicious_perturbed / benign_perturbed, built from TRAIN data only;
+        # test poisoning above never touches training/selection.
         category = np.full(len(y_train), "malicious_clean", dtype=object)
         category[y_train == benign_label] = "benign"
         if len(poison_idx) > 0:
             category[poison_idx] = "malicious_perturbed"
+        if len(poison_idx_benign) > 0:
+            category[poison_idx_benign] = "benign_perturbed"
         poisoned_sample_ids = gid_train[poison_idx].tolist() if len(poison_idx) > 0 else []
+        poisoned_sample_ids_benign = gid_train[poison_idx_benign].tolist() if len(poison_idx_benign) > 0 else []
 
         if t == 0:
             # Scaler fit on TASK 0 (pre-poisoning, but task 0 has no red agent
@@ -1066,6 +1267,10 @@ def main():
 
         Xtr = to_tensor(X_train_for_classifier)
         ytr = torch.tensor(y_train, dtype=torch.long)
+
+        plot_clean_vs_perturbed(
+            Xtr, category, t, os.path.join(out_dir, "plots", f"clean_vs_perturbed_task{t}.png")
+        )
 
         if t == 0:
             print(f"  Samples: {len(Xtr)} | pure supervised pretraining, {TASK0_EPOCHS} epochs")
@@ -1150,10 +1355,15 @@ def main():
             "task_id": t,
             "n_train": int(len(y_train)), "n_test": int(len(y_test)),
             "n_malicious_train": int(len(mal_idx_train)),
+            "n_benign_train": int(len(benign_idx_train)),
             "n_poisoned": n_poisoned,
             "poisoned_sample_ids": poisoned_sample_ids,
             "n_poisoned_test": n_poisoned_test,
             "poisoned_test_sample_ids": poisoned_test_sample_ids,
+            "n_poisoned_benign": n_poisoned_benign,
+            "poisoned_sample_ids_benign": poisoned_sample_ids_benign,
+            "n_poisoned_test_benign": n_poisoned_test_benign,
+            "poisoned_test_sample_ids_benign": poisoned_test_sample_ids_benign,
             "red_agent": red_report,
             "per_task_eval": per_task_eval,
             "perturbed_test_eval": perturbed_test_eval,

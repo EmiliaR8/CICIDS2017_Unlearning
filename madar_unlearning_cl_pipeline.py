@@ -138,6 +138,24 @@ construction no longer draws directly from oracle ground truth. Instead:
      malicious_clean rows it mislabeled as perturbed -- is directly visible
      without cross-referencing anything else.
 
+UPDATE (REWORK, benign perturbation classifier): perturbation_classifier is
+now 4-class (benign / malicious_clean / malicious_perturbed /
+benign_perturbed), mirroring points 1-5 above exactly on the benign side --
+poison_idx_benign (from the new red_train_benign_pert_agent, see module
+docstring) seeds benign_perturbed's training labels the same way poison_idx
+seeds malicious_perturbed's; potentially_perturbed_benign_pool = predicted
+benign_perturbed AND true (binary) label benign, same construction as
+potentially_perturbed_pool. forget_idx fed to unlearn_teacher_guided is now
+the UNION of both pools (one unlearning pass covers both populations --
+unlearn_teacher_guided doesn't care why a sample is in the forget set).
+CLEAN_REPLAY_BUFFER_OF_PERTURBED's clean+refill (point 4 above) is likewise
+mirrored per label slot: the malicious slot is cleaned/refilled using only
+forget_idx_malicious as before, and the benign slot is now ALSO
+cleaned of forget_idx_benign matches and refilled from this task's own
+clean-benign candidates, via the same shared _anomaly_inlier_interleave
+selection. See build_perturbation_classifier_forget_set()'s docstring for
+the full mechanics.
+
 Outline this implements (task loop, for each task t with a red agent):
   1. Train on Tt via MADAR's existing ER+KD+SI step (train_cl_er, unchanged).
   2/6. Update replay buffer P -- see "buffer ordering" below for the one change
@@ -419,8 +437,9 @@ POISON_DETECTOR = "perturbation_classifier"  # logged into config/results for pr
 # docstring). Oracle ground truth is now used only to SEED a small 3-class
 # classifier's training labels, not to build the forget set directly. ---
 PERTURBATION_CLASSIFIER_N = 50  # target sample count PER CLASS (benign / clean_malicious /
-                                 # perturbed) used to train perturbation_classifier each task.
-                                 # Shrinks uniformly across all three classes (same N for all)
+                                 # perturbed / benign_perturbed) used to train
+                                 # perturbation_classifier each task. Shrinks uniformly across
+                                 # all four classes (same N for all)
                                  # if any one pool has fewer than this many available this task
                                  # -- see build_perturbation_classifier_forget_set().
 CLEAN_REPLAY_BUFFER_OF_PERTURBED = True  # toggle: after IsolationForest/buffer fill (which now
@@ -586,29 +605,41 @@ def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
     return X_pert, evasion_rate, rewards, avg_pert_norm, attacked, evaded_mask
 
 
+RED_AGENT_SEED_OFFSETS = {"train": 0, "test": 100_000, "train_benign": 200_000, "test_benign": 300_000}
+
+
 def train_red_agent_for_task(task_id, agent_type, classifier, X_data, y_data, benign_label, bank, seed, out_dir):
     """
     REWORK: one call per (task, agent_type) pair now, not one call per task.
-    agent_type in {"train", "test"} -- the caller passes X_data/y_data as
-    whichever split this agent is dedicated to (X_train for the train-side
-    perturbation agent, X_test for the test-side one), and this builds a
-    NetworkAttackEnv directly over THAT data. Fixes a latent bug: previously
-    a single agent's env was built once from X_train, then reused unmodified
-    for the "test" evaluate_agent_on_batch call -- NetworkAttackEnv.reset()
-    always samples from self.X_data (fixed at construction, update_data()
-    existed but was never called), so that second call was actually
-    attacking train rows at test-derived indices, not test data at all.
+    agent_type in {"train", "test", "train_benign", "test_benign"} -- the
+    caller passes X_data/y_data as whichever split this agent is dedicated to
+    (X_train for the train-side perturbation agent, X_test for the test-side
+    one), and this builds a NetworkAttackEnv directly over THAT data. Fixes a
+    latent bug: previously a single agent's env was built once from X_train,
+    then reused unmodified for the "test" evaluate_agent_on_batch call --
+    NetworkAttackEnv.reset() always samples from self.X_data (fixed at
+    construction, update_data() existed but was never called), so that
+    second call was actually attacking train rows at test-derived indices,
+    not test data at all.
+
+    "train"/"test" attack malicious rows toward benign_label (the original
+    mechanism); "train_benign"/"test_benign" attack benign rows toward
+    whatever label the CALLER passes in as `benign_label` (in practice
+    mal_label) -- this argument is really just "the target class this agent
+    optimizes toward", and NetworkAttackEnv's non_benign_indices = where
+    (y_data != that target) already generalizes to "the pool being
+    attacked" for any target class, so no changes to NetworkAttackEnv/
+    evaluate_agent_on_batch were needed to add the benign-side agents.
 
     agent_id is now a compound "{task_id}_{agent_type}" string (was task_id
-    alone) so the contrastive bank tracks train/test agents as fully
-    distinct entries -- train_t's reward pushes it away from every agent
-    registered before it (..., test_{t-1}, train_{t-1}, ...), and test_t's
-    reward (trained second, see main()) additionally sees train_t's
-    now-registered prototype, giving same-task train/test dissimilarity.
-    Distinct seed offset per agent_type so the two agents' SAC init/training
-    RNG streams don't collide within the same task.
+    alone) so the contrastive bank tracks all four agent types as fully
+    distinct entries -- each agent's reward pushes it away from every agent
+    registered before it, this task and all earlier tasks, via the existing
+    recency-weighted mechanism. Distinct seed offset per agent_type (see
+    RED_AGENT_SEED_OFFSETS) so the four agents' SAC init/training RNG
+    streams don't collide within the same task.
     """
-    seed_offset = 0 if agent_type == "train" else 100_000
+    seed_offset = RED_AGENT_SEED_OFFSETS.get(agent_type, 0)
     agent_id = f"{task_id}_{agent_type}"
 
     def _thunk():
@@ -936,75 +967,94 @@ def evaluate_classifier(classifier, X, y):
 # Step 3 -- forget-set construction, PERTURBATION-CLASSIFIER REWORK (see
 # module docstring). Replaces the old detect_poison_oracle/ORACLE_FORGET_FRACTION
 # entirely -- oracle ground truth (poison_idx) is now used only to SEED a
-# small 3-class classifier's training labels, never to build the forget set
+# small 4-class classifier's training labels, never to build the forget set
 # directly. main branch keeps phi1 (detect_poison_if_latent); untouched, this
 # is a separate branch, not a replacement for it.
 # ---------------------------------------------------------------------------
 LABEL_BENIGN = "benign"
 LABEL_CLEAN_MALICIOUS = "malicious_clean"
 LABEL_PERTURBED = "malicious_perturbed"
-PERTURBATION_CLASSIFIER_CLASSES = [LABEL_BENIGN, LABEL_CLEAN_MALICIOUS, LABEL_PERTURBED]
+LABEL_BENIGN_PERTURBED = "benign_perturbed"
+PERTURBATION_CLASSIFIER_CLASSES = [LABEL_BENIGN, LABEL_CLEAN_MALICIOUS, LABEL_PERTURBED, LABEL_BENIGN_PERTURBED]
 
 
-def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, benign_label, mal_label,
+def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, poison_idx_benign, benign_label, mal_label,
                                               rng, n_target=PERTURBATION_CLASSIFIER_N):
     """
     Trains a small per-task RandomForestClassifier ("perturbation_classifier")
-    to distinguish benign / malicious_clean / malicious_perturbed on RAW
-    (already-scaled) Xtr features, then uses its predictions -- not oracle
-    ground truth -- to build the forget set.
+    to distinguish benign / malicious_clean / malicious_perturbed /
+    benign_perturbed on RAW (already-scaled) Xtr features, then uses its
+    predictions -- not oracle ground truth -- to build the forget set.
+    benign_perturbed mirrors malicious_perturbed exactly (same construction,
+    same eval, same downstream forget-pool logic), just on the benign side:
+    poison_idx_benign is to benign_idx what poison_idx is to mal_idx.
 
-    1. Oracle draws N per class (benign, malicious_clean = malicious minus
-       poison_idx, malicious_perturbed = poison_idx), N shrinking uniformly
-       across all three classes if any pool has fewer than n_target
-       available this task, so the training set stays class-balanced. This
-       is the ONLY place poison_idx's ground truth "perturbed" label is
+    1. Oracle draws N per class (benign_clean = benign minus
+       poison_idx_benign, malicious_clean = malicious minus poison_idx,
+       malicious_perturbed = poison_idx, benign_perturbed =
+       poison_idx_benign), N shrinking uniformly across all FOUR classes if
+       any pool has fewer than n_target available this task, so the
+       training set stays class-balanced. This is the ONLY place
+       poison_idx/poison_idx_benign's ground truth "perturbed" label is
        ever handed to a model as a training target -- nothing downstream of
        this classifier sees it.
-    2. Classifier trains on those 3*N samples only, then predicts on every
+    2. Classifier trains on those 4*N samples only, then predicts on every
        OTHER Xtr sample this task (never its own training rows -- avoids
        leaking their trivially-known labels into the eval metrics below).
     3. potentially_perturbed_pool = predicted malicious_perturbed AND whose
        actual ytr label is mal_label (the ordinary binary label the rest of
        the pipeline sees -- a benign sample the classifier mislabels
        "perturbed" is excluded, since it isn't malicious at all).
+       potentially_perturbed_benign_pool = the mirror: predicted
+       benign_perturbed AND whose actual ytr label is benign_label.
 
-    forget_idx = potentially_perturbed_pool exactly. retain_idx = everything
-    else -- used ONLY to build unlearning's retain_loader (the CE+KD anchor
-    signal), NOT for buffer eligibility anymore (see module docstring/
+    forget_idx = potentially_perturbed_pool UNION potentially_perturbed_benign_pool
+    -- fed to a single unlearn_teacher_guided call (that function doesn't
+    care WHY something's in the forget set, just pushes it toward uniform).
+    forget_idx_malicious/forget_idx_benign are also returned individually so
+    the buffer-clean/refill step (main()) can clean each label's buffer
+    slot using only the matches relevant to that slot. retain_idx =
+    everything else -- used ONLY to build unlearning's retain_loader (the
+    CE+KD anchor signal), NOT for buffer eligibility (see module docstring/
     UPDATE 5 -- buffer now fills from the full task batch, unfiltered, and
-    gets cleaned of potentially_perturbed_pool matches afterward instead).
+    gets cleaned of forget-pool matches afterward instead).
 
-    Returns None if n_target shrinks to 0 for any class this task (no poison,
-    or one of the three pools is empty) -- caller should skip the classifier/
-    forget-set step entirely for this task, same as the old empty-Df_t path.
-    Otherwise returns a dict: forget_idx, retain_idx (sorted int64 arrays
-    into Xtr), n_used (the actual per-class N after shrinking),
-    confusion_matrix (3x3, row/col order == PERTURBATION_CLASSIFIER_CLASSES,
+    Returns None if n_target shrinks to 0 for any class this task (no
+    poison on either side, or one of the four pools is empty) -- caller
+    should skip the classifier/forget-set step entirely for this task, same
+    as the old empty-Df_t path. Otherwise returns a dict: forget_idx,
+    forget_idx_malicious, forget_idx_benign, retain_idx (sorted int64
+    arrays into Xtr), n_used (the actual per-class N after shrinking),
+    confusion_matrix (4x4, row/col order == PERTURBATION_CLASSIFIER_CLASSES,
     computed against oracle ground truth on the held-out eval rows only),
-    two_class_metric (predicted benign -> compare to true benign; predicted
-    malicious_clean OR malicious_perturbed -> compare to true malicious;
-    accuracy + balanced_accuracy over the SAME held-out eval rows), and
-    n_eval (how many rows the classifier was scored against).
+    two_class_metric (predicted benign OR benign_perturbed -> compare to
+    true benign; predicted malicious_clean OR malicious_perturbed ->
+    compare to true malicious; accuracy + balanced_accuracy over the SAME
+    held-out eval rows), and n_eval (how many rows the classifier was
+    scored against).
     """
     poison_idx = np.asarray(poison_idx, dtype=np.int64)
+    poison_idx_benign = np.asarray(poison_idx_benign, dtype=np.int64)
     y_np = ytr.numpy()
     n_samples = len(y_np)
 
     mal_idx = np.where(y_np == mal_label)[0]
     benign_idx = np.where(y_np == benign_label)[0]
     clean_mal_idx = np.setdiff1d(mal_idx, poison_idx)
+    clean_benign_idx = np.setdiff1d(benign_idx, poison_idx_benign)
 
-    n_used = min(n_target, len(poison_idx), len(clean_mal_idx), len(benign_idx))
+    n_used = min(n_target, len(poison_idx), len(clean_mal_idx), len(clean_benign_idx), len(poison_idx_benign))
     if n_used == 0:
         return None
 
     train_perturbed = rng.choice(poison_idx, size=n_used, replace=False)
     train_clean_mal = rng.choice(clean_mal_idx, size=n_used, replace=False)
-    train_benign = rng.choice(benign_idx, size=n_used, replace=False)
-    train_idx = np.concatenate([train_benign, train_clean_mal, train_perturbed])
+    train_benign = rng.choice(clean_benign_idx, size=n_used, replace=False)
+    train_benign_perturbed = rng.choice(poison_idx_benign, size=n_used, replace=False)
+    train_idx = np.concatenate([train_benign, train_clean_mal, train_perturbed, train_benign_perturbed])
     train_labels = np.array(
-        [LABEL_BENIGN] * n_used + [LABEL_CLEAN_MALICIOUS] * n_used + [LABEL_PERTURBED] * n_used
+        [LABEL_BENIGN] * n_used + [LABEL_CLEAN_MALICIOUS] * n_used
+        + [LABEL_PERTURBED] * n_used + [LABEL_BENIGN_PERTURBED] * n_used
     )
 
     X_np = Xtr.numpy()
@@ -1014,16 +1064,20 @@ def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, benign_label,
     eval_idx = np.setdiff1d(np.arange(n_samples, dtype=np.int64), train_idx)
     eval_pred = clf.predict(X_np[eval_idx])
 
-    # Oracle 3-way ground truth for the eval rows, for scoring only -- never
+    # Oracle 4-way ground truth for the eval rows, for scoring only -- never
     # fed to the classifier itself.
-    eval_true_3way = np.full(len(eval_idx), LABEL_CLEAN_MALICIOUS, dtype=object)
-    eval_true_3way[y_np[eval_idx] == benign_label] = LABEL_BENIGN
+    eval_true_4way = np.full(len(eval_idx), LABEL_CLEAN_MALICIOUS, dtype=object)
+    eval_true_4way[y_np[eval_idx] == benign_label] = LABEL_BENIGN
     poison_set = set(int(i) for i in poison_idx)
-    eval_true_3way[np.array([i in poison_set for i in eval_idx])] = LABEL_PERTURBED
+    poison_set_benign = set(int(i) for i in poison_idx_benign)
+    eval_true_4way[np.array([i in poison_set for i in eval_idx])] = LABEL_PERTURBED
+    eval_true_4way[np.array([i in poison_set_benign for i in eval_idx])] = LABEL_BENIGN_PERTURBED
 
-    cm = confusion_matrix(eval_true_3way, eval_pred, labels=PERTURBATION_CLASSIFIER_CLASSES)
+    cm = confusion_matrix(eval_true_4way, eval_pred, labels=PERTURBATION_CLASSIFIER_CLASSES)
 
-    pred_binary = np.where(eval_pred == LABEL_BENIGN, benign_label, mal_label)
+    pred_binary = np.where(
+        np.isin(eval_pred, [LABEL_BENIGN, LABEL_BENIGN_PERTURBED]), benign_label, mal_label
+    )
     true_binary = y_np[eval_idx]
     two_class_metric = {
         "accuracy": float(accuracy_score(true_binary, pred_binary)),
@@ -1031,12 +1085,17 @@ def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, benign_label,
     }
 
     potentially_perturbed_pool = eval_idx[(eval_pred == LABEL_PERTURBED) & (true_binary == mal_label)]
+    potentially_perturbed_benign_pool = eval_idx[(eval_pred == LABEL_BENIGN_PERTURBED) & (true_binary == benign_label)]
 
-    forget_idx = np.asarray(sorted(int(i) for i in potentially_perturbed_pool), dtype=np.int64)
+    forget_idx_malicious = np.asarray(sorted(int(i) for i in potentially_perturbed_pool), dtype=np.int64)
+    forget_idx_benign = np.asarray(sorted(int(i) for i in potentially_perturbed_benign_pool), dtype=np.int64)
+    forget_idx = np.union1d(forget_idx_malicious, forget_idx_benign)
     retain_idx = np.setdiff1d(np.arange(n_samples, dtype=np.int64), forget_idx)
 
     return {
         "forget_idx": forget_idx,
+        "forget_idx_malicious": forget_idx_malicious,
+        "forget_idx_benign": forget_idx_benign,
         "retain_idx": retain_idx,
         "n_used": int(n_used),
         "confusion_matrix": {
@@ -1305,11 +1364,26 @@ def plot_unlearning_metrics(results, out_path):
     plt.close(fig)
 
 
+# agent_ids are "{task_id}_{agent_type}" compound strings, agent_type in
+# {"train", "test", "train_benign", "test_benign"} -- split on the FIRST
+# underscore only (agent_type itself contains one for the benign types), and
+# sort/mark deterministically rather than relying on alphabetical order.
+AGENT_TYPE_ORDER = {"train": 0, "test": 1, "train_benign": 2, "test_benign": 3}
+AGENT_TYPE_MARKERS = {"train": "o", "test": "^", "train_benign": "s", "test_benign": "D"}
+
+
+def _parse_agent_id(agent_id):
+    task_num, agent_type = agent_id.split("_", 1)
+    return int(task_num), agent_type
+
+
+def _agent_id_sort_key(agent_id):
+    task_num, agent_type = _parse_agent_id(agent_id)
+    return (task_num, AGENT_TYPE_ORDER.get(agent_type, 99))
+
+
 def plot_prototype_heatmap(bank, out_path):
-    # REWORK: agent_ids are "{task_id}_train"/"{task_id}_test" compound strings
-    # now -- plain sorted() would put "10_x" before "2_x" and "0_test" before
-    # "0_train" (alphabetical), so sort by (task number, train-before-test).
-    ordered_ids = sorted(bank.protos.keys(), key=lambda pid: (int(pid.split("_")[0]), pid.split("_")[1] != "train"))
+    ordered_ids = sorted(bank.protos.keys(), key=_agent_id_sort_key)
     agent_ids, S = bank.cosine_matrix(agent_ids=ordered_ids)
     if S is None or len(agent_ids) < 2:
         print("[Plot] Not enough task prototypes to plot a heatmap yet.")
@@ -1329,12 +1403,7 @@ def plot_prototype_heatmap(bank, out_path):
 
 
 def plot_episode_clouds(bank, out_path):
-    # REWORK: agent_ids are "{task_id}_train"/"{task_id}_test" compound
-    # strings now, not bare ints -- sort chronologically (task number, then
-    # train-before-test) rather than alphabetically, and derive the color
-    # index/marker from the parsed task number/type instead of `tid % 10`
-    # (which would TypeError on a string).
-    task_ids = sorted(bank.episode_embs.keys(), key=lambda pid: (int(pid.split("_")[0]), pid.split("_")[1] != "train"))
+    task_ids = sorted(bank.episode_embs.keys(), key=_agent_id_sort_key)
     X, y = [], []
     for tid in task_ids:
         for e in bank.episode_embs.get(tid, []):
@@ -1358,12 +1427,64 @@ def plot_episode_clouds(bank, out_path):
         mask = y == tid
         if mask.sum() == 0:
             continue
-        task_num, agent_type = tid.split("_")
-        marker = "o" if agent_type == "train" else "^"
-        plt.scatter(Z[mask, 0], Z[mask, 1], s=12, alpha=0.6, color=cmap(int(task_num) % 10),
+        task_num, agent_type = _parse_agent_id(tid)
+        marker = AGENT_TYPE_MARKERS.get(agent_type, "x")
+        plt.scatter(Z[mask, 0], Z[mask, 1], s=12, alpha=0.6, color=cmap(task_num % 10),
                     marker=marker, label=f"task {tid}")
 
     plt.title("Episode embedding clouds (PCA-2D of cumulative perturbations)")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.legend(markerscale=1.5, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+
+CATEGORY_COLORS = {
+    "benign": "tab:blue",
+    "malicious_clean": "tab:orange",
+    "malicious_perturbed": "tab:red",
+    "benign_perturbed": "tab:purple",
+}
+
+
+def plot_clean_vs_perturbed(Xtr, category, task_id, out_path):
+    """
+    Task-local 2D PCA (SVD, same style as plot_episode_clouds) of this task's
+    SCALED training features (Xtr, post to_tensor -- same space the classifier
+    actually trains on), colored by category (benign / malicious_clean /
+    malicious_perturbed / benign_perturbed) so the perturbed populations'
+    position relative to the clean clouds is directly visible, per task. Fresh
+    PCA basis every call (task-local, not shared across tasks) -- the goal is
+    within-task comparison, not cross-task trajectory tracking. Clean
+    categories are drawn first/smaller/fainter so the perturbed points (drawn
+    on top, larger, more opaque) aren't buried under the denser clean cloud.
+    """
+    X_np = Xtr.numpy() if hasattr(Xtr, "numpy") else np.asarray(Xtr)
+    cat_np = np.asarray(category)
+
+    if len(X_np) < 5:
+        print(f"[Plot] Task {task_id}: not enough samples to plot clean-vs-perturbed.")
+        return
+
+    X0 = X_np - X_np.mean(axis=0, keepdims=True)
+    _, _, Vt = np.linalg.svd(X0, full_matrices=False)
+    Z = X0 @ Vt[:2].T
+
+    plt.figure(figsize=(7, 6))
+    for cat in ("benign", "malicious_clean", "malicious_perturbed", "benign_perturbed"):
+        mask = cat_np == cat
+        if mask.sum() == 0:
+            continue
+        is_perturbed = cat.endswith("_perturbed")
+        plt.scatter(
+            Z[mask, 0], Z[mask, 1],
+            s=18 if is_perturbed else 8, alpha=0.8 if is_perturbed else 0.3,
+            color=CATEGORY_COLORS[cat], label=f"{cat} (n={int(mask.sum())})",
+        )
+
+    plt.title(f"Task {task_id}: clean vs. perturbed samples (PCA-2D of scaled features)")
     plt.xlabel("PC1")
     plt.ylabel("PC2")
     plt.legend(markerscale=1.5, fontsize=8)
@@ -1425,7 +1546,8 @@ def main():
     # misorder the log/plots relative to when each agent actually trained.
     bank.init_distance_logger(
         path=os.path.join(out_dir, "logs", "prototype_cosine_over_time.txt"),
-        agent_ids=[f"{t}_{typ}" for t in range(NUM_TASKS) for typ in ("train", "test")],
+        agent_ids=[f"{t}_{typ}" for t in range(NUM_TASKS)
+                   for typ in ("train", "test", "train_benign", "test_benign")],
     )
 
     scaler = None
@@ -1458,11 +1580,16 @@ def main():
         task_test_gids[t] = gid_test
 
         mal_idx_train = np.where(y_train == mal_label)[0]
+        benign_idx_train = np.where(y_train == benign_label)[0]
         red_report = None
         n_poisoned = 0
         poison_idx = np.array([], dtype=int)
         n_poisoned_test = 0
         poisoned_test_sample_ids = []
+        n_poisoned_benign = 0
+        poison_idx_benign = np.array([], dtype=int)
+        n_poisoned_test_benign = 0
+        poisoned_test_sample_ids_benign = []
 
         if t == 0:
             print(f"\n===== Task 0 (warm start, no red agent): "
@@ -1474,6 +1601,7 @@ def main():
                   f"({len(y_train)} train / {len(y_test)} test, {len(mal_idx_train)} malicious train) =====")
 
             mal_idx_test = np.where(y_test == mal_label)[0]
+            benign_idx_test = np.where(y_test == benign_label)[0]
 
             if len(mal_idx_train) == 0:
                 warnings_log.append(f"Task {t}: no malicious training samples, skipping red agents.")
@@ -1564,14 +1692,114 @@ def main():
                     n_poisoned_test = 0
                     poisoned_test_sample_ids = []
 
+                # BENIGN-SIDE perturbation agents (added alongside the malicious
+                # train/test agents above). Mirror-image objective: attack
+                # BENIGN rows, reward/terminate on being misclassified as
+                # mal_label instead of benign_label. Reuses NetworkAttackEnv/
+                # train_red_agent_for_task/evaluate_agent_on_batch completely
+                # unmodified -- passing mal_label in as the "benign_label"
+                # argument is sufficient, since that argument is really just
+                # "the target class this agent optimizes toward" and
+                # non_benign_indices = where(y_data != target) already
+                # generalizes to "the pool being attacked" for any target
+                # class. Registered in the SAME contrastive bank as the
+                # malicious agents, so all four of this task's agents (and
+                # every earlier task's) push each other apart via the
+                # existing recency-weighted mechanism -- no new diversity
+                # logic needed. Ground truth label is left as benign (0) on
+                # substitution, matching how malicious_perturbed keeps its
+                # true malicious label -- only X changes, not y. This new
+                # "benign_perturbed" population feeds the reconfigured
+                # (4-class) perturbation_classifier below exactly like
+                # malicious_perturbed does.
+                if len(benign_idx_train) == 0:
+                    warnings_log.append(f"Task {t}: no benign training samples, skipping benign red agents.")
+                else:
+                    env_train_benign, agent_train_benign = train_red_agent_for_task(
+                        t, "train_benign", classifier_wrapper, X_train, y_train, mal_label, bank, args.seed, out_dir
+                    )
+                    (X_train_pert_benign, train_evasion_rate_benign, train_rewards_benign, train_avg_norm_benign,
+                     train_attacked_benign, evaded_mask_benign) = evaluate_agent_on_batch(
+                        env_train_benign, agent_train_benign, X_train, y_train, mal_label,
+                        only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                    )
+
+                    red_report["train_benign_evasion_rate"] = train_evasion_rate_benign
+                    red_report["train_benign_attacked"] = train_attacked_benign
+                    red_report["train_benign_avg_reward"] = float(np.mean(train_rewards_benign)) if train_rewards_benign else 0.0
+                    red_report["train_benign_avg_pert_l2"] = train_avg_norm_benign
+                    print(f"[Task {t} red_train_benign_pert_agent] train_evasion={train_evasion_rate_benign:.3f} "
+                          f"avg_pert_L2={train_avg_norm_benign:.3f}")
+
+                    poison_fraction_train_benign = poison_fraction_for_task(
+                        t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
+                    )
+                    poison_pool_benign = np.where(evaded_mask_benign)[0] if REQUIRE_EVASION_SUCCESS else benign_idx_train
+                    n_to_poison_benign = min(
+                        int(round(poison_fraction_train_benign * len(benign_idx_train))), len(poison_pool_benign)
+                    )
+                    rng_benign = np.random.RandomState(args.seed + t + 20_000)  # distinct stream from mal train/test rngs
+                    poison_idx_benign = rng_benign.choice(poison_pool_benign, size=n_to_poison_benign, replace=False) \
+                        if n_to_poison_benign > 0 else np.array([], dtype=int)
+                    n_poisoned_benign = len(poison_idx_benign)
+
+                    X_train_for_classifier[poison_idx_benign] = X_train_pert_benign[poison_idx_benign]
+                    print(f"[Task {t}] poisoned {n_poisoned_benign}/{len(benign_idx_train)} benign train samples "
+                          f"(poison_fraction_train_benign={poison_fraction_train_benign:.3f})")
+
+                    if POISON_TEST_DATA and len(benign_idx_test) > 0:
+                        env_test_benign, agent_test_benign = train_red_agent_for_task(
+                            t, "test_benign", classifier_wrapper, X_test, y_test, mal_label, bank, args.seed, out_dir
+                        )
+                        (X_test_pert_benign, test_evasion_rate_benign, test_rewards_benign, test_avg_norm_benign,
+                         test_attacked_benign, evaded_mask_test_benign) = evaluate_agent_on_batch(
+                            env_test_benign, agent_test_benign, X_test, y_test, mal_label,
+                            only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                        )
+                        red_report["test_benign_evasion_rate"] = test_evasion_rate_benign
+                        red_report["test_benign_attacked"] = test_attacked_benign
+                        red_report["test_benign_avg_reward"] = float(np.mean(test_rewards_benign)) if test_rewards_benign else 0.0
+                        red_report["test_benign_avg_pert_l2"] = test_avg_norm_benign
+                        print(f"[Task {t} red_test_benign_pert_agent] test_evasion={test_evasion_rate_benign:.3f} "
+                              f"avg_pert_L2={test_avg_norm_benign:.3f}")
+
+                        poison_fraction_test_benign = poison_fraction_for_task(
+                            t, POISON_FRACTION_TEST_START, POISON_FRACTION_TEST_END
+                        )
+                        poison_pool_test_benign = np.where(evaded_mask_test_benign)[0] if REQUIRE_EVASION_SUCCESS \
+                            else benign_idx_test
+                        n_to_poison_test_benign = min(
+                            int(round(poison_fraction_test_benign * len(benign_idx_test))), len(poison_pool_test_benign)
+                        )
+                        rng_test_benign = np.random.RandomState(args.seed + t + 40_000)  # distinct stream, avoids
+                                                                                          # colliding with pc_rng
+                                                                                          # (also +30_000, below)
+                        poison_idx_test_benign = rng_test_benign.choice(
+                            poison_pool_test_benign, size=n_to_poison_test_benign, replace=False
+                        ) if n_to_poison_test_benign > 0 else np.array([], dtype=int)
+                        n_poisoned_test_benign = len(poison_idx_test_benign)
+
+                        X_test = X_test.copy()
+                        X_test[poison_idx_test_benign] = X_test_pert_benign[poison_idx_test_benign]
+                        task_test_splits[t] = (X_test, y_test)
+                        poisoned_test_sample_ids_benign = gid_test[poison_idx_test_benign].tolist() \
+                            if n_poisoned_test_benign > 0 else []
+                        print(f"[Task {t}] poisoned {n_poisoned_test_benign}/{len(benign_idx_test)} benign TEST samples "
+                              f"(poison_fraction_test_benign={poison_fraction_test_benign:.3f}) -- "
+                              f"test_evasion_rate was {test_evasion_rate_benign:.3f}")
+
         # Category tracking (identical to madar_cl_pipeline.py) -- feeds the
         # buffer composition diagnostic; build_perturbation_classifier_forget_set()
-        # below reads poison_idx directly (see its docstring), not this array.
+        # below reads poison_idx/poison_idx_benign directly (see its docstring),
+        # not this array.
         category = np.full(len(y_train), "malicious_clean", dtype=object)
         category[y_train == benign_label] = "benign"
         if len(poison_idx) > 0:
             category[poison_idx] = "malicious_perturbed"
+        if len(poison_idx_benign) > 0:
+            category[poison_idx_benign] = "benign_perturbed"
         poisoned_sample_ids = gid_train[poison_idx].tolist() if len(poison_idx) > 0 else []
+        poisoned_sample_ids_benign = gid_train[poison_idx_benign].tolist() if len(poison_idx_benign) > 0 else []
 
         if t == 0:
             scaler = StandardScaler()
@@ -1585,6 +1813,10 @@ def main():
 
         Xtr = to_tensor(X_train_for_classifier)
         ytr = torch.tensor(y_train, dtype=torch.long)
+
+        plot_clean_vs_perturbed(
+            Xtr, category, t, os.path.join(out_dir, "plots", f"clean_vs_perturbed_task{t}.png")
+        )
 
         unlearning_metrics = None
 
@@ -1685,7 +1917,7 @@ def main():
 
         # ============================================================
         # 3. FORGET SET POPULATION -- build_perturbation_classifier_forget_set
-        # trains a small 3-class RandomForest per task on PERTURBATION_
+        # trains a small 4-class RandomForest per task on PERTURBATION_
         # CLASSIFIER_N oracle-seeded samples per class, then uses ITS
         # predictions (not oracle ground truth) to build the forget set --
         # see that function's docstring and the module docstring's REWORK
@@ -1707,13 +1939,13 @@ def main():
         else:
             pc_rng = np.random.RandomState(args.seed + t + 30_000)  # distinct stream from train/test poison rngs
             pc_result = build_perturbation_classifier_forget_set(
-                Xtr, ytr, poison_idx, benign_label, mal_label, rng=pc_rng
+                Xtr, ytr, poison_idx, poison_idx_benign, benign_label, mal_label, rng=pc_rng
             )
 
             if pc_result is None:
                 print(f"    [Perturbation classifier] fewer than {PERTURBATION_CLASSIFIER_N} samples available "
-                      f"in one of benign/malicious_clean/malicious_perturbed this task -- skipping "
-                      f"classifier/unlearning phase for this task.")
+                      f"in one of benign/malicious_clean/malicious_perturbed/benign_perturbed this task -- "
+                      f"skipping classifier/unlearning phase for this task.")
                 unlearning_metrics = {"detector": POISON_DETECTOR, "n_forget": 0}
             else:
                 forget_idx, retain_idx = pc_result["forget_idx"], pc_result["retain_idx"]
@@ -1722,14 +1954,18 @@ def main():
                       f"n_eval={pc_result['n_eval']}, 2-class acc={tcm['accuracy']:.3f} "
                       f"bal_acc={tcm['balanced_accuracy']:.3f}")
                 print(f"    [Perturbation classifier confusion] classes={cm['classes']}, matrix={cm['matrix']}")
-                print(f"    [Forget set] potentially_perturbed_pool = {len(forget_idx)} samples "
+                print(f"    [Forget set] potentially_perturbed_pool (malicious) = "
+                      f"{len(pc_result['forget_idx_malicious'])}, potentially_perturbed_benign_pool = "
+                      f"{len(pc_result['forget_idx_benign'])}, combined forget_idx = {len(forget_idx)} samples "
                       f"(retain = {len(retain_idx)})")
 
                 if len(forget_idx) == 0:
-                    print("    [Unlearning] potentially_perturbed_pool empty -- "
+                    print("    [Unlearning] forget set empty -- "
                           "skipping unlearning phase for this task.")
                     unlearning_metrics = {
                         "detector": POISON_DETECTOR, "n_forget": 0,
+                        "n_forget_malicious": int(len(pc_result["forget_idx_malicious"])),
+                        "n_forget_benign": int(len(pc_result["forget_idx_benign"])),
                         "perturbation_classifier": {
                             "n_used": pc_result["n_used"], "n_eval": pc_result["n_eval"],
                             "confusion_matrix": cm, "two_class_metric": tcm,
@@ -1795,6 +2031,8 @@ def main():
                     unlearning_metrics = {
                         "detector": POISON_DETECTOR,
                         "n_forget": int(len(forget_idx)), "n_retain": int(len(retain_idx)),
+                        "n_forget_malicious": int(len(pc_result["forget_idx_malicious"])),
+                        "n_forget_benign": int(len(pc_result["forget_idx_benign"])),
                         "perturbation_classifier": {
                             "n_used": pc_result["n_used"], "n_eval": pc_result["n_eval"],
                             "confusion_matrix": cm, "two_class_metric": tcm,
@@ -1816,62 +2054,77 @@ def main():
             update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
 
             # Step 5: post-hoc buffer cleaning (toggleable). Only meaningful
-            # when the classifier actually ran and found something.
-            if CLEAN_REPLAY_BUFFER_OF_PERTURBED and pc_result is not None and len(pc_result["forget_idx"]) > 0:
-                perturbed_gids = set(int(g) for g in gid_train[pc_result["forget_idx"]])
-                before = len(label_buffers.get(mal_label, []))
-                label_buffers[mal_label] = [
-                    e for e in label_buffers.get(mal_label, []) if e[3] not in perturbed_gids
-                ]
-                n_removed = before - len(label_buffers[mal_label])
-
-                # REFILL (REWORK): top the malicious slot back up to budget with
-                # this task's own clean-malicious samples -- i.e. malicious AND
-                # NOT in potentially_perturbed_pool (the classifier's judgment,
-                # not oracle ground truth -- staying consistent with the rest of
-                # this pipeline never peeking at poison_idx beyond seeding the
-                # classifier's training labels). Without this, the slot stays
-                # under-filled until the NEXT task's refresh happens to top it
-                # back up on its own, confounding "effect of forgetting
-                # perturbed samples" with "effect of a chronically smaller
-                # buffer" -- plain MADAR's buffer never shrinks this way, so an
-                # uncontrolled size gap would bias any comparison between them.
+            # when the classifier actually ran and found something. Mirrored
+            # for both label slots: malicious slot cleaned of
+            # forget_idx_malicious matches / refilled from clean-malicious
+            # candidates (unchanged from before benign agents existed);
+            # benign slot cleaned of forget_idx_benign matches / refilled
+            # from clean-benign candidates (new, exact mirror).
+            if CLEAN_REPLAY_BUFFER_OF_PERTURBED and pc_result is not None:
                 budget_per_label = MEM_SIZE // 2
-                deficit = budget_per_label - len(label_buffers[mal_label])
-                n_refilled = 0
-                if deficit > 0:
-                    already_buffered = set(int(e[3]) for e in label_buffers[mal_label])
-                    ytr_np = ytr.numpy()
-                    forgotten_set = set(int(i) for i in pc_result["forget_idx"])
-                    refill_candidates = np.array([
-                        i for i in range(len(Xtr))
-                        if ytr_np[i] == mal_label and i not in forgotten_set
-                        and int(gid_train[i]) not in already_buffered
-                    ], dtype=np.int64)
 
-                    if len(refill_candidates) > 0:
-                        n_refill = min(deficit, len(refill_candidates))
-                        cand_X = Xtr[torch.tensor(refill_candidates, dtype=torch.long)]
-                        cand_L = _embed(model, cand_X, DEVICE)
-                        iso = IsolationForest(contamination=MADAR_CONTAMINATION, n_jobs=-1, random_state=SEED)
-                        iso.fit(cand_L)
-                        scores = iso.decision_function(cand_L)
-                        local_idx = _anomaly_inlier_interleave(scores, n_refill)
+                def _clean_and_refill(label, forget_idx_for_label, category_tag):
+                    forget_gids = set(int(g) for g in gid_train[forget_idx_for_label])
+                    before = len(label_buffers.get(label, []))
+                    label_buffers[label] = [
+                        e for e in label_buffers.get(label, []) if e[3] not in forget_gids
+                    ]
+                    n_removed = before - len(label_buffers[label])
 
-                        for li in local_idx:
-                            orig_i = int(refill_candidates[li])
-                            label_buffers[mal_label].append((
-                                Xtr[orig_i].clone(), ytr[orig_i].clone(),
-                                category[orig_i], int(gid_train[orig_i]),
-                            ))
-                        n_refilled = len(local_idx)
+                    deficit = budget_per_label - len(label_buffers[label])
+                    n_refilled = 0
+                    if deficit > 0:
+                        already_buffered = set(int(e[3]) for e in label_buffers[label])
+                        ytr_np = ytr.numpy()
+                        forgotten_set = set(int(i) for i in forget_idx_for_label)
+                        refill_candidates = np.array([
+                            i for i in range(len(Xtr))
+                            if ytr_np[i] == label and i not in forgotten_set
+                            and int(gid_train[i]) not in already_buffered
+                        ], dtype=np.int64)
+
+                        if len(refill_candidates) > 0:
+                            n_refill = min(deficit, len(refill_candidates))
+                            cand_X = Xtr[torch.tensor(refill_candidates, dtype=torch.long)]
+                            cand_L = _embed(model, cand_X, DEVICE)
+                            iso = IsolationForest(contamination=MADAR_CONTAMINATION, n_jobs=-1, random_state=SEED)
+                            iso.fit(cand_L)
+                            scores = iso.decision_function(cand_L)
+                            local_idx = _anomaly_inlier_interleave(scores, n_refill)
+
+                            for li in local_idx:
+                                orig_i = int(refill_candidates[li])
+                                label_buffers[label].append((
+                                    Xtr[orig_i].clone(), ytr[orig_i].clone(),
+                                    category[orig_i], int(gid_train[orig_i]),
+                                ))
+                            n_refilled = len(local_idx)
+
+                    print(f"    [Buffer clean] label={label} ({category_tag}): removed {n_removed} forget-pool "
+                          f"matches, refilled {n_refilled}/{deficit} with clean {category_tag} samples.")
+
+                if len(pc_result["forget_idx_malicious"]) > 0:
+                    # REFILL (REWORK): top the malicious slot back up to budget
+                    # with this task's own clean-malicious samples -- i.e.
+                    # malicious AND NOT in potentially_perturbed_pool (the
+                    # classifier's judgment, not oracle ground truth -- staying
+                    # consistent with the rest of this pipeline never peeking
+                    # at poison_idx beyond seeding the classifier's training
+                    # labels). Without this, the slot stays under-filled until
+                    # the NEXT task's refresh happens to top it back up on its
+                    # own, confounding "effect of forgetting perturbed
+                    # samples" with "effect of a chronically smaller buffer"
+                    # -- plain MADAR's buffer never shrinks this way, so an
+                    # uncontrolled size gap would bias any comparison between
+                    # them.
+                    _clean_and_refill(mal_label, pc_result["forget_idx_malicious"], "malicious")
+
+                if len(pc_result["forget_idx_benign"]) > 0:
+                    _clean_and_refill(benign_label, pc_result["forget_idx_benign"], "benign")
 
                 replay_buffer.clear()
                 for buf in label_buffers.values():
                     replay_buffer.extend(buf)
-                print(f"    [Buffer clean] removed {n_removed} potentially_perturbed_pool matches, "
-                      f"refilled {n_refilled}/{deficit} with clean-malicious samples "
-                      f"in the malicious-label buffer slot.")
 
         # p_old_task updated to the FINAL (post-unlearning, if it ran this task)
         # weights, for ALL tasks -- ready as next task's start-of-task SI anchor.
@@ -1886,10 +2139,15 @@ def main():
             "task_id": t,
             "n_train": int(len(y_train)), "n_test": int(len(y_test)),
             "n_malicious_train": int(len(mal_idx_train)),
+            "n_benign_train": int(len(benign_idx_train)),
             "n_poisoned": n_poisoned,
             "poisoned_sample_ids": poisoned_sample_ids,
             "n_poisoned_test": n_poisoned_test,
             "poisoned_test_sample_ids": poisoned_test_sample_ids,
+            "n_poisoned_benign": n_poisoned_benign,
+            "poisoned_sample_ids_benign": poisoned_sample_ids_benign,
+            "n_poisoned_test_benign": n_poisoned_test_benign,
+            "poisoned_test_sample_ids_benign": poisoned_test_sample_ids_benign,
             "red_agent": red_report,
             "per_task_eval": per_task_eval,
             "perturbed_test_eval": perturbed_test_eval,
