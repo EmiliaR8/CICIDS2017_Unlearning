@@ -14,7 +14,9 @@ python madar_cl_pipeline.py --seed 42 --log_name madar2                       MA
 python madar_cl_pipeline.py --seed 42 --log_name madar3                       MADAR   It was not better at learning newer tasks by increasing rnt, Keep at 0.3
 python madar_cl_pipeline.py --seed 42 --log_name madar4                       MADAR   Checking to see if increasing the poison cap to 1000 will change any results: **Have claude compare the logs for MADAR2 and MADAR4, because the perforamnce is better with more poisoned samples
 python madar_cl_pipeline.py --seed 42 --log_name madar5*                      MADAR   Changing logic to ensure that perturbed samples are included in the testing batch, and logging the pertrubed samples like MADAR_UnlEARNING// did change the results to what we need, might want to optimize with other hyper parameters
+
 python madar_cl_pipeline.py --seed 42 --log_name madar6*                      MADAR   increased MAX.. variable
+python madar_cl_pipeline.py --seed 42 --log_name madar7                       MADAR   Include logic to make poisoning schedule
 
 
 
@@ -27,21 +29,24 @@ python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u5_oracle  MAD
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u6_oracle  MADAR+U  and forgetting only a fraction of the malcious samples (0.1): performed well, though some samples did make it to the replay buffer
 
 
+
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active1   MADAR+U  Restructured full pipeline, 
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active2   MADAR+U   Include logic for poisoning schedule 
+
 
 
 Next: 
-python madar_cl_pipeline.py --seed 42 --log_name madar7                       MADAR   Include logic to make poisoning schedule
-python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active2   MADAR+U   Include logic for poisoning schedule 
 python naive_cl_pipeline.py --seed 42 --log_name naive4                       Naive   Change XGBoost to NN and include poisoning schedule
 python joint_cl_pipeline.py --seed 42 --log_name joint2                       Joint   Change XGBoost to NN and include poisoning schedule
 
 
 
+fill replay buffer with not pertrubed samples for MADR+U
 
 
-python compare_cl_runs.py  runs/madar_unlearning/madar_u6_oracle/madar_u6_oracle.json runs/madar/madar6/madar6.json  --out madaru_v_madarunewnew.png --include_table
+ python compare_cl_runs.py runs/madar_unlearning/madar_active2/madar_active2.json  runs/madar/madar7/madar7.json --out madar_u_v_madar_no_u.png  --include_table
 
+conda
 
 
 Tasks:
@@ -54,9 +59,5 @@ then try iteration 2 of madar_u BUT include the logic for donut home, toggle on/
 
 Push baseline pipelines to main, then start a new branch where we create more dramatic scenarios
 **Make MLP more simple, hand in hand with scenario X
+
 **Do scenario where the majority of the pertrubed samples are used in the test batch not train batch
-
-
-Backlog:
-Compare MADAR2 and MADAR4 to see how increasing malicious cap affect results
-See what may happen when you turn off REQUIRE_EVASION_SUCCESS **If that makes sense to do
