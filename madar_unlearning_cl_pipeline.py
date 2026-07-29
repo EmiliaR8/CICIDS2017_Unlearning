@@ -116,10 +116,20 @@ construction no longer draws directly from oracle ground truth. Instead:
   4. CLEAN_REPLAY_BUFFER_OF_PERTURBED (toggle, default True): immediately
      after buffer fill, scan the just-refreshed buffer for entries whose
      sample_id matches potentially_perturbed_pool's global ids and remove
-     them. No backfill -- a removed slot stays empty until the NEXT task's
-     refresh naturally re-ranks and fills it. When the toggle is off, the
-     buffer is left exactly as IsolationForest selected it (may contain
-     potentially_perturbed_pool members).
+     them, THEN refill the malicious slot back up to budget with this task's
+     own malicious samples that are NOT in potentially_perturbed_pool (the
+     classifier's judgment, never oracle ground truth), ranked via the same
+     IsolationForest anomaly+inlier selection as everywhere else
+     (_anomaly_inlier_interleave, shared with update_buffer_madar). REWORK:
+     originally no backfill (removed slots stayed empty until the next
+     task's refresh happened to top them up); added because leaving the
+     slot chronically under-filled confounds "effect of forgetting perturbed
+     samples" with "effect of a smaller buffer" -- plain MADAR's buffer
+     never shrinks this way, so the size gap alone could bias any comparison
+     between the two pipelines. If fewer clean-malicious candidates exist
+     than the deficit, the slot stays under-filled by whatever's left over.
+     When the toggle is off, the buffer is left exactly as IsolationForest
+     selected it (may contain potentially_perturbed_pool members).
   5. Both the 3-class confusion matrix (against full oracle ground truth on
      the eval rows) and the 2-class collapsed accuracy/balanced_accuracy
      are logged per task under unlearning.perturbation_classifier, so
@@ -283,17 +293,23 @@ POISON_TEST_DATA = True  # BRANCH-SPECIFIC divergence from naive/joint/madar_cl_
 # Identical to madar_cl_pipeline.py's, so both pipelines see the SAME
 # poisoned data each task -- any difference in outcomes is attributable to
 # the STRATEGY, not to one pipeline facing easier/harder data.
+# REWORK 2: endpoints pushed to a much more drastic 0.99/0.01 split (was
+# 0.50/0.10) -- crossing point is now ~0.50 around the midpoint task, no
+# longer ~0.30. POISON_FRACTION_FLAT (below) was NOT changed to match --
+# it's an independently-set fallback for the schedule-off case, not derived
+# from the schedule's endpoints, so it no longer coincides with the
+# schedule's midpoint the way it used to.
 POISON_SCHEDULE_ENABLED = True  # toggle: True = the linear train/test schedule below.
                                  # False = flat POISON_FRACTION_FLAT for BOTH train and
                                  # test, every task -- restores pre-schedule behavior.
 POISON_FRACTION_FLAT = 0.30  # fallback fraction (both train and test) when
-                              # POISON_SCHEDULE_ENABLED is False. Matches the old flat
-                              # POISON_FRACTION this schedule replaced, and the
-                              # schedule's own midpoint/crossing value.
-POISON_FRACTION_TRAIN_START = 0.50  # task 1
-POISON_FRACTION_TRAIN_END = 0.10    # task NUM_TASKS-1
-POISON_FRACTION_TEST_START = 0.10   # task 1
-POISON_FRACTION_TEST_END = 0.50     # task NUM_TASKS-1
+                              # POISON_SCHEDULE_ENABLED is False. Originally matched the
+                              # schedule's own midpoint/crossing value; no longer does
+                              # since REWORK 2 moved the schedule's endpoints (see above).
+POISON_FRACTION_TRAIN_START = 0.99  # task 1
+POISON_FRACTION_TRAIN_END = 0.01    # task NUM_TASKS-1
+POISON_FRACTION_TEST_START = 0.01   # task 1
+POISON_FRACTION_TEST_END = 0.99     # task NUM_TASKS-1
 
 
 def poison_fraction_for_task(t, start, end, num_tasks=NUM_TASKS):
@@ -378,9 +394,14 @@ PERTURBATION_CLASSIFIER_N = 50  # target sample count PER CLASS (benign / clean_
 CLEAN_REPLAY_BUFFER_OF_PERTURBED = True  # toggle: after IsolationForest/buffer fill (which now
                                           # draws from the FULL task batch, unfiltered -- see
                                           # module docstring), remove any buffer entries that
-                                          # match potentially_perturbed_pool's global sample ids.
-                                          # No backfill -- removed slots stay empty until the
-                                          # NEXT task's refresh naturally tops them back up.
+                                          # match potentially_perturbed_pool's global sample ids,
+                                          # then refill the malicious slot back up to budget with
+                                          # this task's own clean-malicious (not in
+                                          # potentially_perturbed_pool) samples, ranked via the
+                                          # same IsolationForest anomaly+inlier selection as
+                                          # everywhere else. Stays under-filled only if too few
+                                          # clean-malicious candidates exist this task to cover
+                                          # the deficit.
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +674,25 @@ def _embed(model, Xt: torch.Tensor, device):
     return torch.cat(parts).numpy()
 
 
+def _anomaly_inlier_interleave(scores, n_select):
+    """Given IsolationForest decision_function scores (lower = more anomalous)
+    over a candidate pool, returns n_select LOCAL indices into that pool:
+    half most-anomalous-first, half most-inlier-first, interleaved. Factored
+    out of update_buffer_madar so the buffer-cleaning refill step in main()
+    (REWORK) can draw new entries using identical selection logic instead of
+    a separately-invented method."""
+    sorted_idx = np.argsort(scores)
+    n_total = len(sorted_idx)
+    half = n_select // 2
+    n_inlier = n_select - half
+    anomalies_idx = sorted_idx[:half]
+    inliers_idx = sorted_idx[n_total - n_inlier:] if n_inlier > 0 else np.array([], dtype=int)
+    interleaved = [idx for pair in zip(anomalies_idx, inliers_idx) for idx in pair]
+    if n_select % 2 != 0 and len(inliers_idx) > 0:
+        interleaved.append(inliers_idx[-1])
+    return interleaved
+
+
 def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, sample_id: np.ndarray,
                          benign_label, mal_label, model, device):
     """
@@ -712,14 +752,7 @@ def update_buffer_madar(X: torch.Tensor, y: torch.Tensor, category: np.ndarray, 
         iso = IsolationForest(contamination=MADAR_CONTAMINATION, n_jobs=-1, random_state=SEED)
         iso.fit(pool_L)
         scores = iso.decision_function(pool_L)
-        sorted_idx = np.argsort(scores)
-
-        half = n_select // 2
-        anomalies_idx = sorted_idx[:half]
-        inliers_idx = sorted_idx[-(n_select - half):]
-        interleaved_idx = [idx for pair in zip(anomalies_idx, inliers_idx) for idx in pair]
-        if n_select % 2 != 0:
-            interleaved_idx.append(inliers_idx[-1])
+        interleaved_idx = _anomaly_inlier_interleave(scores, n_select)
 
         label_buffers[lbl] = [
             (torch.tensor(pool_X[i]), torch.tensor(pool_Y[i]), pool_cat[i], int(pool_id[i]))
@@ -1548,7 +1581,8 @@ def main():
         # feeds task t+1's training (step 1, next iteration) via train_cl_er.
         # 5. REPLAY BUFFER CLEANING (CLEAN_REPLAY_BUFFER_OF_PERTURBED toggle)
         # -- after buffer fill, remove any entries matching
-        # potentially_perturbed_pool's global sample ids. No backfill.
+        # potentially_perturbed_pool's global sample ids, then refill with
+        # this task's own clean-malicious samples up to budget.
         # ============================================================
         if t == 0:
             teacher_model = copy.deepcopy(model); teacher_model.eval()
@@ -1674,11 +1708,54 @@ def main():
                     e for e in label_buffers.get(mal_label, []) if e[3] not in perturbed_gids
                 ]
                 n_removed = before - len(label_buffers[mal_label])
+
+                # REFILL (REWORK): top the malicious slot back up to budget with
+                # this task's own clean-malicious samples -- i.e. malicious AND
+                # NOT in potentially_perturbed_pool (the classifier's judgment,
+                # not oracle ground truth -- staying consistent with the rest of
+                # this pipeline never peeking at poison_idx beyond seeding the
+                # classifier's training labels). Without this, the slot stays
+                # under-filled until the NEXT task's refresh happens to top it
+                # back up on its own, confounding "effect of forgetting
+                # perturbed samples" with "effect of a chronically smaller
+                # buffer" -- plain MADAR's buffer never shrinks this way, so an
+                # uncontrolled size gap would bias any comparison between them.
+                budget_per_label = MEM_SIZE // 2
+                deficit = budget_per_label - len(label_buffers[mal_label])
+                n_refilled = 0
+                if deficit > 0:
+                    already_buffered = set(int(e[3]) for e in label_buffers[mal_label])
+                    ytr_np = ytr.numpy()
+                    forgotten_set = set(int(i) for i in pc_result["forget_idx"])
+                    refill_candidates = np.array([
+                        i for i in range(len(Xtr))
+                        if ytr_np[i] == mal_label and i not in forgotten_set
+                        and int(gid_train[i]) not in already_buffered
+                    ], dtype=np.int64)
+
+                    if len(refill_candidates) > 0:
+                        n_refill = min(deficit, len(refill_candidates))
+                        cand_X = Xtr[torch.tensor(refill_candidates, dtype=torch.long)]
+                        cand_L = _embed(model, cand_X, DEVICE)
+                        iso = IsolationForest(contamination=MADAR_CONTAMINATION, n_jobs=-1, random_state=SEED)
+                        iso.fit(cand_L)
+                        scores = iso.decision_function(cand_L)
+                        local_idx = _anomaly_inlier_interleave(scores, n_refill)
+
+                        for li in local_idx:
+                            orig_i = int(refill_candidates[li])
+                            label_buffers[mal_label].append((
+                                Xtr[orig_i].clone(), ytr[orig_i].clone(),
+                                category[orig_i], int(gid_train[orig_i]),
+                            ))
+                        n_refilled = len(local_idx)
+
                 replay_buffer.clear()
                 for buf in label_buffers.values():
                     replay_buffer.extend(buf)
-                print(f"    [Buffer clean] removed {n_removed} potentially_perturbed_pool matches "
-                      f"from the malicious-label buffer slot (no backfill).")
+                print(f"    [Buffer clean] removed {n_removed} potentially_perturbed_pool matches, "
+                      f"refilled {n_refilled}/{deficit} with clean-malicious samples "
+                      f"in the malicious-label buffer slot.")
 
         # p_old_task updated to the FINAL (post-unlearning, if it ran this task)
         # weights, for ALL tasks -- ready as next task's start-of-task SI anchor.

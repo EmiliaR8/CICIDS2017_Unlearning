@@ -133,21 +133,26 @@ POISON_TEST_DATA = True  # REWORK: matches madar_unlearning_cl_pipeline.py's POI
 # POISON_FRACTION=0.3). Linear interpolation from task 1 to task NUM_TASKS-1
 # (task 0 has no red agent, so no poisoning either way). TRAIN and TEST are
 # deliberate mirror images of each other -- train front-loads poison (heavy
-# early, tapering later), test back-loads it (light early, heavy later) --
-# crossing at ~0.30 around the midpoint task, matching the flat fraction
-# this replaces. Plain global variables (not derived/computed) specifically
-# so they're easy to change later -- see poison_fraction_for_task() below.
+# early, tapering later), test back-loads it (light early, heavy later).
+# REWORK 2: endpoints pushed to a much more drastic 0.99/0.01 split (was
+# 0.50/0.10) -- crossing point is now ~0.50 around the midpoint task, no
+# longer ~0.30. POISON_FRACTION_FLAT (below) was NOT changed to match --
+# it's an independently-set fallback for the schedule-off case, not derived
+# from the schedule's endpoints, so it no longer coincides with the
+# schedule's midpoint the way it used to. Plain global variables (not
+# derived/computed) specifically so they're easy to change later -- see
+# poison_fraction_for_task() below.
 POISON_SCHEDULE_ENABLED = True  # toggle: True = the linear train/test schedule below.
                                  # False = flat POISON_FRACTION_FLAT for BOTH train and
                                  # test, every task -- restores pre-schedule behavior.
 POISON_FRACTION_FLAT = 0.30  # fallback fraction (both train and test) when
-                              # POISON_SCHEDULE_ENABLED is False. Matches the old flat
-                              # POISON_FRACTION this schedule replaced, and the
-                              # schedule's own midpoint/crossing value.
-POISON_FRACTION_TRAIN_START = 0.50  # task 1
-POISON_FRACTION_TRAIN_END = 0.10    # task NUM_TASKS-1
-POISON_FRACTION_TEST_START = 0.10   # task 1
-POISON_FRACTION_TEST_END = 0.50     # task NUM_TASKS-1
+                              # POISON_SCHEDULE_ENABLED is False. Originally matched the
+                              # schedule's own midpoint/crossing value; no longer does
+                              # since REWORK 2 moved the schedule's endpoints (see above).
+POISON_FRACTION_TRAIN_START = 0.99  # task 1
+POISON_FRACTION_TRAIN_END = 0.01    # task NUM_TASKS-1
+POISON_FRACTION_TEST_START = 0.01   # task 1
+POISON_FRACTION_TEST_END = 0.99     # task NUM_TASKS-1
 
 
 def poison_fraction_for_task(t, start, end, num_tasks=NUM_TASKS):
