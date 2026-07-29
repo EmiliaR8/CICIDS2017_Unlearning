@@ -1365,6 +1365,10 @@ def main():
         return torch.tensor(X_scaled, dtype=torch.float32)
 
     task_test_splits = {}
+    task_test_gids = {}  # t -> gid_test, so later checkpoints can identify which rows in
+                          # task_test_splits[t] are the poisoned ones (see task_poisoned_test_gids)
+    task_poisoned_test_gids = {}  # t -> that task's own poisoned_test_sample_ids, recorded once
+                                   # per task (immutable afterward) -- feeds perturbed_test_eval
     results = []
     warnings_log = []
 
@@ -1377,6 +1381,7 @@ def main():
             X, y, gid, test_size=TASK_TEST_FRAC, random_state=args.seed, stratify=y
         )
         task_test_splits[t] = (X_test, y_test)
+        task_test_gids[t] = gid_test
 
         mal_idx_train = np.where(y_train == mal_label)[0]
         red_report = None
@@ -1562,6 +1567,29 @@ def main():
         pooled_y = np.concatenate([task_test_splits[j][1] for j in range(t + 1)])
         pooled_eval = evaluate_classifier(classifier_wrapper, pooled_X, pooled_y)
         mean_per_task_bal_acc = float(np.mean([per_task_eval[j]["balanced_accuracy"] for j in range(t + 1)]))
+
+        # perturbed_test_eval: accuracy computed ONLY on the poisoned rows of
+        # each earlier task's test split (cross-referenced by global sample_id
+        # against that task's own poisoned_test_sample_ids), tracked at EVERY
+        # checkpoint the same way per_task_eval is -- unlike per_task_eval,
+        # which mixes clean+poisoned test rows together. Computed here (step
+        # 2, PRE-unlearning) to match per_task_eval's own timing -- this file
+        # doesn't also log a post-unlearning version of this, mirroring how
+        # per_task_eval itself isn't re-computed post-unlearning either
+        # (post_unlearn_this_task_eval is the only post-unlearning snapshot,
+        # scoped to THIS task only). Omits task j entirely if it has no
+        # poisoned test rows (task 0, or POISON_TEST_DATA off).
+        task_poisoned_test_gids[t] = poisoned_test_sample_ids
+        perturbed_test_eval = {}
+        for j in range(t + 1):
+            poisoned_gids_j = set(task_poisoned_test_gids.get(j, []))
+            if not poisoned_gids_j:
+                continue
+            mask = np.isin(task_test_gids[j], list(poisoned_gids_j))
+            if mask.sum() == 0:
+                continue
+            X_test_j, y_test_j = task_test_splits[j]
+            perturbed_test_eval[j] = evaluate_classifier(classifier_wrapper, X_test_j[mask], y_test_j[mask])
 
         print(f"[Task {t} classifier, PRE-unlearning] this-task bal_acc={per_task_eval[t]['balanced_accuracy']:.4f} "
               f"pooled bal_acc={pooled_eval['balanced_accuracy']:.4f} "
@@ -1776,6 +1804,7 @@ def main():
             "poisoned_test_sample_ids": poisoned_test_sample_ids,
             "red_agent": red_report,
             "per_task_eval": per_task_eval,
+            "perturbed_test_eval": perturbed_test_eval,
             "pooled_eval": pooled_eval,
             "mean_per_task_balanced_accuracy": mean_per_task_bal_acc,
             "grad_steps": grad_steps,
