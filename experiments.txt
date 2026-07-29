@@ -1,10 +1,10 @@
 Terminal command (Tasks always 10)                                            Model    Notes     
 python naive_cl_pipeline.py --seed 42 --log_name naive1                       Naive    Had wrong poisoning logic, fixed in next iteration
 python naive_cl_pipeline.py --seed 42 --log_name naive2                       Naive    MAX_EVAL_SAMPLES_PER_TASK and RED_TIMESTEPS_PER_TASK were too low
-python naive_cl_pipeline.py --seed 42 --log_name naive3*                       Naive    Good, unstable accuracy, evasion almost always 100% // runs/naive/naive3/naive3.json
+python naive_cl_pipeline.py --seed 42 --log_name naive3*                      Naive    Good, unstable accuracy, evasion almost always 100% // runs/naive/naive3/naive3.json
 
 
-python joint_cl_pipeline.py --seed 42 --log_name joint1*                      Joint    Good to go, other than the fact that it uses an XGBoost model, may need to change //runs/joint/joint1/joint1.json
+python joint_cl_pipeline.py --seed 42 --log_name joint1*                     Joint    Good to go, other than the fact that it uses an XGBoost model, may need to change //runs/joint/joint1/joint1.json
 python joint_cl_pipeline.py --seed 42 --log_name joint2                      Joint    Increased the poison cap to test if that will bring down the acc: did almost nothing for joint, was kinda silly to try it on this CL strat lol, just made it take forever
 
 
@@ -13,28 +13,40 @@ python madar_cl_pipeline.py --seed 42 --log_name madar1                       MA
 python madar_cl_pipeline.py --seed 42 --log_name madar2                       MADAR   Better than madar 1, checking to see if we can make it better for task 8 and 9 by increasing rnt to 0.5// runs/madar/madar2/madar2.json
 python madar_cl_pipeline.py --seed 42 --log_name madar3                       MADAR   It was not better at learning newer tasks by increasing rnt, Keep at 0.3
 python madar_cl_pipeline.py --seed 42 --log_name madar4                       MADAR   Checking to see if increasing the poison cap to 1000 will change any results: **Have claude compare the logs for MADAR2 and MADAR4, because the perforamnce is better with more poisoned samples
-python madar_cl_pipeline.py --seed 42 --log_name madar5*                       MADAR   Changing logic to ensure that perturbed samples are included in the testing batch, and logging the pertrubed samples like MADAR_UnlEARNING// did change the results to what we need, might want to optimize with other hyper parameters
+python madar_cl_pipeline.py --seed 42 --log_name madar5*                      MADAR   Changing logic to ensure that perturbed samples are included in the testing batch, and logging the pertrubed samples like MADAR_UnlEARNING// did change the results to what we need, might want to optimize with other hyper parameters
+
+python madar_cl_pipeline.py --seed 42 --log_name madar6*                      MADAR   increased MAX.. variable
+python madar_cl_pipeline.py --seed 42 --log_name madar7                       MADAR   Include logic to make poisoning schedule
+
 
 
 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u1         MADAR+U  First iteration of the MADAR+Unlearning pipeline, donut hole implementation (like EMBER): Many issues logged in chat with piplai, need to modify donut, SI, and isolation forest logic
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u2         MADAR+U  First iteration v2, but with softened SI and logs that ensure that this was the right move: SI did nothing, not better or worse, 
-
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u3_oracle  MADAR+U  Uses the oracle to tell what samples to unlearn: 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u4_oracle  MADAR+U  Incliude pertrubed samples in the test set, lower:  
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u5_oracle  MADAR+U  Swap the order of the pipeline: This did not make the results much better, maybe by 1% 
-
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u6_oracle  MADAR+U  and forgetting only a fraction of the malcious samples (0.1): performed well, though some samples did make it to the replay buffer
 
 
 
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active1   MADAR+U  Restructured full pipeline, 
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active2   MADAR+U   Include logic for poisoning schedule 
 
 
 
+Next: 
+python naive_cl_pipeline.py --seed 42 --log_name naive4                       Naive   Change XGBoost to NN and include poisoning schedule
+python joint_cl_pipeline.py --seed 42 --log_name joint2                       Joint   Change XGBoost to NN and include poisoning schedule
 
 
-python compare_cl_runs.py  runs/madar/madar5/madar5.json runs/madar_unlearning/madar_u6_oracle/madar_u6_oracle.json --out madaru_v_madaru6.png --include_table
 
+fill replay buffer with not pertrubed samples for MADR+U
+
+
+ python compare_cl_runs.py runs/madar_unlearning/madar_active2/madar_active2.json  runs/madar/madar7/madar7.json --out madar_u_v_madar_no_u.png  --include_table
+
+conda
 
 
 Tasks:
@@ -47,9 +59,5 @@ then try iteration 2 of madar_u BUT include the logic for donut home, toggle on/
 
 Push baseline pipelines to main, then start a new branch where we create more dramatic scenarios
 **Make MLP more simple, hand in hand with scenario X
+
 **Do scenario where the majority of the pertrubed samples are used in the test batch not train batch
-
-
-Backlog:
-Compare MADAR2 and MADAR4 to see how increasing malicious cap affect results
-See what may happen when you turn off REQUIRE_EVASION_SUCCESS **If that makes sense to do

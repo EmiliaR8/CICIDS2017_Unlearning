@@ -1024,7 +1024,7 @@ def main():
             update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
 
         buffer_summary = buffer_composition_summary()
-        print(f"    [Buffer] composition: {buffer_summary}")
+        #print(f"    [Buffer] composition: {buffer_summary}")
 
         per_task_eval = {j: evaluate_classifier(classifier_wrapper, *task_test_splits[j]) for j in range(t + 1)}
         pooled_X = np.concatenate([task_test_splits[j][0] for j in range(t + 1)])

@@ -1764,7 +1764,7 @@ def main():
                 p_old_task[n.replace('.', '__')] = p.detach().clone()
 
         buffer_summary = buffer_composition_summary()
-        print(f"    [Buffer] composition: {buffer_summary}")
+        #print(f"    [Buffer] composition: {buffer_summary}")
 
         results.append({
             "task_id": t,
