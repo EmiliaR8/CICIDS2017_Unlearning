@@ -1,0 +1,3 @@
+run,strategy,final_pooled_balanced_accuracy,final_mean_per_task_balanced_accuracy,final_test_evasion_rate,avg_poison_rate_achieved
+madar_u_crosstask_refill,madar_er_kd_si_plus_unlearning,0.7701565093778249,0.7174930146373136,1.0,0.4079795728080516
+madar_crosstask_baseline,madar_er_kd_si,0.8778514028152675,0.8347907857343744,1.0,0.4079795728080516

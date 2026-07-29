@@ -20,7 +20,7 @@ python madar_cl_pipeline.py --seed 42 --log_name madar7                       MA
 python madar_cl_pipeline.py --seed 42 --log_name madar8                       MADAR   make the poisoning schedule more drastic
 
 
-
+python madar_cl_pipeline.py --seed 42 --log_name madar_crosstask_baseline     MADAR Baseline to compare against madar_u_crosstask_refill
 
 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u1         MADAR+U  First iteration of the MADAR+Unlearning pipeline, donut hole implementation (like EMBER): Many issues logged in chat with piplai, need to modify donut, SI, and isolation forest logic
@@ -35,10 +35,9 @@ python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u6_oracle  MAD
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active1   MADAR+U  Restructured full pipeline, 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active2   MADAR+U   Include logic for poisoning schedule 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active3   MADAR+U   Refull replay buffer with clean malicious samples, and make the poisoning schedule more drastic
-python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active4   MADAR+U   Refull replay buffer with clean malicious samples, from current and previous tasks
 
 
-
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u_crosstask_refill   MADAR+U   Refill replay buffer with clean malicious samples, from current and previous tasks
 
 
 Next: 
@@ -47,7 +46,7 @@ python joint_cl_pipeline.py --seed 42 --log_name joint2                       Jo
 
 
 
-python compare_cl_runs.py runs/madar_unlearning/madar_active1/madar_active1.json runs/madar_unlearning/madar_active2/madar_active2.json --out madaru_active2_v_madaru_active3.png  --include_table
+python compare_cl_runs.py runs/madar_unlearning/madar_u_crosstask_refill/madar_u_crosstask_refill.json runs/madar/madar_crosstask_baseline/madar_crosstask_baseline.json --out madar_v_madaru_refillbuffer.png  --include_table
 
 
 
