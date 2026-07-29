@@ -17,6 +17,8 @@ python madar_cl_pipeline.py --seed 42 --log_name madar5*                      MA
 
 python madar_cl_pipeline.py --seed 42 --log_name madar6*                      MADAR   increased MAX.. variable
 python madar_cl_pipeline.py --seed 42 --log_name madar7                       MADAR   Include logic to make poisoning schedule
+python madar_cl_pipeline.py --seed 42 --log_name madar8                       MADAR   make the poisoning schedule more drastic
+
 
 
 
@@ -32,6 +34,8 @@ python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u6_oracle  MAD
 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active1   MADAR+U  Restructured full pipeline, 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active2   MADAR+U   Include logic for poisoning schedule 
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active3   MADAR+U   Refull replay buffer with clean malicious samples, and make the poisoning schedule more drastic
+
 
 
 
@@ -41,12 +45,8 @@ python joint_cl_pipeline.py --seed 42 --log_name joint2                       Jo
 
 
 
-fill replay buffer with not pertrubed samples for MADR+U
+python compare_cl_runs.py runs/madar_unlearning/madar_active1/madar_active1.json runs/madar_unlearning/madar_active2/madar_active2.json --out madaru_active2_v_madaru_active3.png  --include_table
 
-
- python compare_cl_runs.py runs/madar_unlearning/madar_active2/madar_active2.json  runs/madar/madar7/madar7.json --out madar_u_v_madar_no_u.png  --include_table
-
-conda
 
 
 Tasks:
