@@ -20,6 +20,8 @@ python madar_cl_pipeline.py --seed 42 --log_name madar7                       MA
 
 python madar_cl_pipeline.py --seed 42 --log_name madar_dual_agent1            MADAR   1 train agent, 1 test agent
 
+python madar_cl_pipeline.py --seed 42 --log_name madar_4agents                MADAR   1 train agent per classification, 1 test agent per classfication
+
 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u1         MADAR+U  First iteration of the MADAR+Unlearning pipeline, donut hole implementation (like EMBER): Many issues logged in chat with piplai, need to modify donut, SI, and isolation forest logic
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u2         MADAR+U  First iteration v2, but with softened SI and logs that ensure that this was the right move: SI did nothing, not better or worse, 
@@ -33,8 +35,9 @@ python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u6_oracle  MAD
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active1   MADAR+U  Restructured full pipeline, 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active2   MADAR+U   Include logic for poisoning schedule 
 
-python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u_dual_agent
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u_dual_agent  MADAR+U   1 train agent, 1 test agent
 
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u_4agents   MADAR+U   1 train agent per classification, 1 test agent per classfication, also includes 
 
 Next: 
 python naive_cl_pipeline.py --seed 42 --log_name naive4                       Naive   Change XGBoost to NN and include poisoning schedule
@@ -42,10 +45,10 @@ python joint_cl_pipeline.py --seed 42 --log_name joint2                       Jo
 
 
 
-fill replay buffer with not pertrubed samples for MADR+U
+fill replay buffer with not pertrubed samples for MADR+U               
 
 
- python compare_cl_runs.py  runs/madar_unlearning/madar_u_dual_agent/madar_u_dual_agent.json  runs/madar/madar_dual_agent1/madar_dual_agent1.json --out madar_dual_v_madaru_dual.png  --include_table
+python compare_cl_runs.py runs/madar/madar_4agents/madar_4agents.json runs/madar_unlearning/madar_u_4agents/madar_u_4agents.json  --out madar_v_madaru_4Agents.png  --include_table
 
 conda
 
