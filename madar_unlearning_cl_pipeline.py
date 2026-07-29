@@ -224,6 +224,34 @@ prev_active_count:active_count "newly introduced class range" to target
 specifically) is carried over from the two references unchanged; see the
 docstrings on unlearn_teacher_guided / measure_unlearning_efficacy below for
 exactly what and why.
+
+UPDATE (REWORK, dual red agents): each task now trains TWO red agents
+instead of one -- red_train_pert_agent (env built directly from X_train,
+only ever perturbs train data) and red_test_pert_agent (env built directly
+from X_test, only ever perturbs test data, trained second). This fixes a
+latent bug in the old single-agent design: NetworkAttackEnv.reset() always
+samples from self.X_data, fixed at construction; the old code built ONE env
+from X_train and reused it unmodified for the "test" evaluate_agent_on_batch
+call (update_data() existed on the class but was never called), so what was
+logged as test_evasion_rate/X_test_pert was actually attacking train rows at
+test-derived indices, never real test data. agent_id is now a compound
+"{task_id}_{agent_type}" string registered in the SAME contrastive bank, so
+each agent's reward is pushed away from every previously-registered agent
+(train and test, all earlier tasks) via the existing recency-weighted
+mechanism -- train_t vs train_{t-1}, test_t vs test_{t-1}, and (since test
+trains second, same task) test_t vs train_t, though that last one is
+necessarily one-directional: train_t finishes training before test_t exists,
+so train_t's reward never references test_t. Evasion success stays a hard
+requirement independent of this diversity pressure: the +10 reward bonus for
+successful misclassification dominates the reward magnitude, and
+REQUIRE_EVASION_SUCCESS (unchanged) still means only genuinely-evasive
+perturbations (evaded_mask=True) ever become poison candidates for either
+pool. red_test_pert_agent only trains when POISON_TEST_DATA is on AND this
+task actually has malicious test samples, to avoid training a whole second
+SAC agent for nothing. Also: POISON_SCHEDULE_ENABLED flipped to False (flat
+POISON_FRACTION_FLAT=0.30 for both train and test, every task) -- moving
+away from the per-task schedule per explicit request; the schedule code
+itself is untouched and can be re-enabled by flipping the toggle back.
 """
 import argparse
 import copy
@@ -299,13 +327,17 @@ POISON_TEST_DATA = True  # BRANCH-SPECIFIC divergence from naive/joint/madar_cl_
 # it's an independently-set fallback for the schedule-off case, not derived
 # from the schedule's endpoints, so it no longer coincides with the
 # schedule's midpoint the way it used to.
-POISON_SCHEDULE_ENABLED = True  # toggle: True = the linear train/test schedule below.
-                                 # False = flat POISON_FRACTION_FLAT for BOTH train and
-                                 # test, every task -- restores pre-schedule behavior.
+POISON_SCHEDULE_ENABLED = False  # REWORK 3: off by default now -- moving away from the
+                                 # per-task schedule in favor of a flat rate, per explicit
+                                 # request, alongside the dual train/test red-agent rework
+                                 # below. toggle: True = the linear train/test schedule
+                                 # below. False = flat POISON_FRACTION_FLAT for BOTH train
+                                 # and test, every task (current setting).
 POISON_FRACTION_FLAT = 0.30  # fallback fraction (both train and test) when
-                              # POISON_SCHEDULE_ENABLED is False. Originally matched the
-                              # schedule's own midpoint/crossing value; no longer does
-                              # since REWORK 2 moved the schedule's endpoints (see above).
+                              # POISON_SCHEDULE_ENABLED is False -- i.e. the ACTIVE rate
+                              # right now. Originally matched the schedule's own
+                              # midpoint/crossing value; no longer does since REWORK 2
+                              # moved the schedule's endpoints (see above).
 POISON_FRACTION_TRAIN_START = 0.99  # task 1
 POISON_FRACTION_TRAIN_END = 0.01    # task NUM_TASKS-1
 POISON_FRACTION_TEST_START = 0.01   # task 1
@@ -554,25 +586,49 @@ def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
     return X_pert, evasion_rate, rewards, avg_pert_norm, attacked, evaded_mask
 
 
-def train_red_agent_for_task(task_id, classifier, X_train, y_train, benign_label, bank, seed, out_dir):
+def train_red_agent_for_task(task_id, agent_type, classifier, X_data, y_data, benign_label, bank, seed, out_dir):
+    """
+    REWORK: one call per (task, agent_type) pair now, not one call per task.
+    agent_type in {"train", "test"} -- the caller passes X_data/y_data as
+    whichever split this agent is dedicated to (X_train for the train-side
+    perturbation agent, X_test for the test-side one), and this builds a
+    NetworkAttackEnv directly over THAT data. Fixes a latent bug: previously
+    a single agent's env was built once from X_train, then reused unmodified
+    for the "test" evaluate_agent_on_batch call -- NetworkAttackEnv.reset()
+    always samples from self.X_data (fixed at construction, update_data()
+    existed but was never called), so that second call was actually
+    attacking train rows at test-derived indices, not test data at all.
+
+    agent_id is now a compound "{task_id}_{agent_type}" string (was task_id
+    alone) so the contrastive bank tracks train/test agents as fully
+    distinct entries -- train_t's reward pushes it away from every agent
+    registered before it (..., test_{t-1}, train_{t-1}, ...), and test_t's
+    reward (trained second, see main()) additionally sees train_t's
+    now-registered prototype, giving same-task train/test dissimilarity.
+    Distinct seed offset per agent_type so the two agents' SAC init/training
+    RNG streams don't collide within the same task.
+    """
+    seed_offset = 0 if agent_type == "train" else 100_000
+    agent_id = f"{task_id}_{agent_type}"
+
     def _thunk():
         return NetworkAttackEnv(
-            classifier, X_train, y_train,
+            classifier, X_data, y_data,
             benign_label=benign_label,
             max_steps=RED_MAX_STEPS,
             epsilon=RED_EPSILON,
-            agent_id=task_id,
+            agent_id=agent_id,
             contrastive_bank=bank,
             alpha_contrast=ALPHA_CONTRAST,
         )
 
-    vec_env = make_vec_env(_thunk, n_envs=1, seed=seed + task_id)
+    vec_env = make_vec_env(_thunk, n_envs=1, seed=seed + task_id + seed_offset)
     agent = SAC(
         "MlpPolicy", vec_env, verbose=0, policy_kwargs=SAC_POLICY_KWARGS,
-        seed=seed + task_id, **SAC_KWARGS,
+        seed=seed + task_id + seed_offset, **SAC_KWARGS,
     )
     timer_cb = EpisodeTimerCallback(
-        log_path=os.path.join(out_dir, "logs", f"red_episode_times_task{task_id}.txt")
+        log_path=os.path.join(out_dir, "logs", f"red_episode_times_task{task_id}_{agent_type}.txt")
     )
     agent.learn(total_timesteps=RED_TIMESTEPS_PER_TASK, callback=timer_cb)
     return vec_env.envs[0], agent
@@ -1250,7 +1306,11 @@ def plot_unlearning_metrics(results, out_path):
 
 
 def plot_prototype_heatmap(bank, out_path):
-    agent_ids, S = bank.cosine_matrix(agent_ids=sorted(bank.protos.keys()))
+    # REWORK: agent_ids are "{task_id}_train"/"{task_id}_test" compound strings
+    # now -- plain sorted() would put "10_x" before "2_x" and "0_test" before
+    # "0_train" (alphabetical), so sort by (task number, train-before-test).
+    ordered_ids = sorted(bank.protos.keys(), key=lambda pid: (int(pid.split("_")[0]), pid.split("_")[1] != "train"))
+    agent_ids, S = bank.cosine_matrix(agent_ids=ordered_ids)
     if S is None or len(agent_ids) < 2:
         print("[Plot] Not enough task prototypes to plot a heatmap yet.")
         return
@@ -1269,7 +1329,12 @@ def plot_prototype_heatmap(bank, out_path):
 
 
 def plot_episode_clouds(bank, out_path):
-    task_ids = sorted(bank.episode_embs.keys())
+    # REWORK: agent_ids are "{task_id}_train"/"{task_id}_test" compound
+    # strings now, not bare ints -- sort chronologically (task number, then
+    # train-before-test) rather than alphabetically, and derive the color
+    # index/marker from the parsed task number/type instead of `tid % 10`
+    # (which would TypeError on a string).
+    task_ids = sorted(bank.episode_embs.keys(), key=lambda pid: (int(pid.split("_")[0]), pid.split("_")[1] != "train"))
     X, y = [], []
     for tid in task_ids:
         for e in bank.episode_embs.get(tid, []):
@@ -1293,7 +1358,10 @@ def plot_episode_clouds(bank, out_path):
         mask = y == tid
         if mask.sum() == 0:
             continue
-        plt.scatter(Z[mask, 0], Z[mask, 1], s=12, alpha=0.6, color=cmap(tid % 10), label=f"task {tid}")
+        task_num, agent_type = tid.split("_")
+        marker = "o" if agent_type == "train" else "^"
+        plt.scatter(Z[mask, 0], Z[mask, 1], s=12, alpha=0.6, color=cmap(int(task_num) % 10),
+                    marker=marker, label=f"task {tid}")
 
     plt.title("Episode embedding clouds (PCA-2D of cumulative perturbations)")
     plt.xlabel("PC1")
@@ -1349,9 +1417,15 @@ def main():
     bank = RecencyWeightedContrastiveBank(
         dim=feature_dim, ema=CONTRASTIVE_EMA, recency_decay=CONTRASTIVE_RECENCY_DECAY
     )
+    # REWORK: agent_ids are now "{task_id}_train"/"{task_id}_test" compound
+    # strings (one train + one test agent per task), not bare task ids -- see
+    # train_red_agent_for_task's docstring. Chronological registration order
+    # (train before test, same task) fixed explicitly here rather than left
+    # to sorted(), since string-sorting "0_test" before "0_train" would
+    # misorder the log/plots relative to when each agent actually trained.
     bank.init_distance_logger(
         path=os.path.join(out_dir, "logs", "prototype_cosine_over_time.txt"),
-        agent_ids=list(range(NUM_TASKS)),
+        agent_ids=[f"{t}_{typ}" for t in range(NUM_TASKS) for typ in ("train", "test")],
     )
 
     scaler = None
@@ -1399,22 +1473,25 @@ def main():
             print(f"\n===== Task {t}: training fresh red agent against pre-task-{t} classifier "
                   f"({len(y_train)} train / {len(y_test)} test, {len(mal_idx_train)} malicious train) =====")
 
+            mal_idx_test = np.where(y_test == mal_label)[0]
+
             if len(mal_idx_train) == 0:
-                warnings_log.append(f"Task {t}: no malicious training samples, skipping red agent.")
+                warnings_log.append(f"Task {t}: no malicious training samples, skipping red agents.")
                 X_train_for_classifier = X_train
             else:
-                env, agent = train_red_agent_for_task(
-                    t, classifier_wrapper, X_train, y_train, benign_label, bank, args.seed, out_dir
+                # REWORK: two separate agents per task -- red_train_pert_agent
+                # trains directly against X_train and only ever perturbs train
+                # data; red_test_pert_agent trains second (so its contrastive
+                # reward can reference train's now-registered prototype) and
+                # only ever perturbs test data. See train_red_agent_for_task's
+                # docstring for why this also fixes a latent env/data mismatch
+                # bug in the old single-agent design.
+                env_train, agent_train = train_red_agent_for_task(
+                    t, "train", classifier_wrapper, X_train, y_train, benign_label, bank, args.seed, out_dir
                 )
-
                 X_train_pert, train_evasion_rate, train_rewards, train_avg_norm, train_attacked, evaded_mask = \
                     evaluate_agent_on_batch(
-                        env, agent, X_train, y_train, benign_label,
-                        only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
-                    )
-                X_test_pert, test_evasion_rate, test_rewards, test_avg_norm, test_attacked, evaded_mask_test = \
-                    evaluate_agent_on_batch(
-                        env, agent, X_test, y_test, benign_label,
+                        env_train, agent_train, X_train, y_train, benign_label,
                         only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
                     )
 
@@ -1422,12 +1499,9 @@ def main():
                     "train_evasion_rate": train_evasion_rate, "train_attacked": train_attacked,
                     "train_avg_reward": float(np.mean(train_rewards)) if train_rewards else 0.0,
                     "train_avg_pert_l2": train_avg_norm,
-                    "test_evasion_rate": test_evasion_rate, "test_attacked": test_attacked,
-                    "test_avg_reward": float(np.mean(test_rewards)) if test_rewards else 0.0,
-                    "test_avg_pert_l2": test_avg_norm,
                 }
-                print(f"[Task {t} red agent] train_evasion={train_evasion_rate:.3f} "
-                      f"test_evasion={test_evasion_rate:.3f} avg_pert_L2={train_avg_norm:.3f}")
+                print(f"[Task {t} red_train_pert_agent] train_evasion={train_evasion_rate:.3f} "
+                      f"avg_pert_L2={train_avg_norm:.3f}")
 
                 poison_fraction_train = poison_fraction_for_task(
                     t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
@@ -1445,19 +1519,33 @@ def main():
                       f"(poison_fraction_train={poison_fraction_train:.3f})")
 
                 # TEST-SIDE poisoning (POISON_TEST_DATA, this branch only -- see module
-                # docstring BRANCH NOTE and POISON_TEST_DATA's definition for why). Same
-                # evaded-mask restriction, sized per poison_fraction_for_task() (mirror
-                # image of train's schedule -- rises across tasks instead of falling),
-                # applied to this task's own test split. Overwrites task_test_splits[t]
-                # so every downstream eval (per_task_eval, pooled_eval, prior_tasks_recovery)
-                # for this task sees the poisoned test set from here on. The perturbation
-                # classifier / unlearning never sees this -- it stays scoped to Xtr/ytr
-                # (training data) only, unchanged below.
-                if POISON_TEST_DATA:
+                # docstring BRANCH NOTE and POISON_TEST_DATA's definition for why).
+                # red_test_pert_agent (its own dedicated agent, see above) is only
+                # trained when there's actually test-side poisoning to do, to avoid
+                # the compute cost otherwise. Overwrites task_test_splits[t] so every
+                # downstream eval (per_task_eval, pooled_eval, prior_tasks_recovery)
+                # for this task sees the poisoned test set from here on. The
+                # perturbation classifier / unlearning never sees this -- it stays
+                # scoped to Xtr/ytr (training data) only, unchanged below.
+                if POISON_TEST_DATA and len(mal_idx_test) > 0:
+                    env_test, agent_test = train_red_agent_for_task(
+                        t, "test", classifier_wrapper, X_test, y_test, benign_label, bank, args.seed, out_dir
+                    )
+                    X_test_pert, test_evasion_rate, test_rewards, test_avg_norm, test_attacked, evaded_mask_test = \
+                        evaluate_agent_on_batch(
+                            env_test, agent_test, X_test, y_test, benign_label,
+                            only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                        )
+                    red_report["test_evasion_rate"] = test_evasion_rate
+                    red_report["test_attacked"] = test_attacked
+                    red_report["test_avg_reward"] = float(np.mean(test_rewards)) if test_rewards else 0.0
+                    red_report["test_avg_pert_l2"] = test_avg_norm
+                    print(f"[Task {t} red_test_pert_agent] test_evasion={test_evasion_rate:.3f} "
+                          f"avg_pert_L2={test_avg_norm:.3f}")
+
                     poison_fraction_test = poison_fraction_for_task(
                         t, POISON_FRACTION_TEST_START, POISON_FRACTION_TEST_END
                     )
-                    mal_idx_test = np.where(y_test == mal_label)[0]
                     poison_pool_test = np.where(evaded_mask_test)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_test
                     n_to_poison_test = min(int(round(poison_fraction_test * len(mal_idx_test))), len(poison_pool_test))
                     rng_test = np.random.RandomState(args.seed + t + 10_000)  # distinct stream from train's rng
