@@ -18,7 +18,7 @@ python madar_cl_pipeline.py --seed 42 --log_name madar5*                      MA
 python madar_cl_pipeline.py --seed 42 --log_name madar6*                      MADAR   increased MAX.. variable
 python madar_cl_pipeline.py --seed 42 --log_name madar7                       MADAR   Include logic to make poisoning schedule
 
-
+python madar_cl_pipeline.py --seed 42 --log_name madar_dual_agent1            MADAR   1 train agent, 1 test agent
 
 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u1         MADAR+U  First iteration of the MADAR+Unlearning pipeline, donut hole implementation (like EMBER): Many issues logged in chat with piplai, need to modify donut, SI, and isolation forest logic
@@ -33,6 +33,7 @@ python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u6_oracle  MAD
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active1   MADAR+U  Restructured full pipeline, 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active2   MADAR+U   Include logic for poisoning schedule 
 
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u_dual_agent
 
 
 Next: 
