@@ -35,6 +35,8 @@ python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u6_oracle  MAD
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active1   MADAR+U  Restructured full pipeline, 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active2   MADAR+U   Include logic for poisoning schedule 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active3   MADAR+U   Refull replay buffer with clean malicious samples, and make the poisoning schedule more drastic
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active4   MADAR+U   Refull replay buffer with clean malicious samples, from current and previous tasks
+
 
 
 
