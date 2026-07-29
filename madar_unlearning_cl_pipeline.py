@@ -138,6 +138,22 @@ construction no longer draws directly from oracle ground truth. Instead:
      malicious_clean rows it mislabeled as perturbed -- is directly visible
      without cross-referencing anything else.
 
+UPDATE (REWORK, uncertainty-sampling buffer refill): point 4's refill
+candidate pool is now cross-task (historical_clean_mal_pool, a running list
+of every past task's clean-malicious samples, grown after each task's own
+refill so a task's samples are never candidates for its own refill -- same
+sourcing claude/cross-task-buffer-refill introduced). What changed from that
+branch: refill selection is no longer IsolationForest anomaly/inlier
+ranking. Instead, _predict_confidence scores every candidate under the
+CURRENT model (post this task's training + unlearning) and refill takes the
+LEAST confident ones first -- i.e. the malicious samples the model is
+currently most unsure about, on the theory that these are the ones most
+useful to keep rehearsing since they're closest to being forgotten or
+misclassified next. Still only fills the deficit left by cleaning (the slot
+isn't fully replaced). plain MADAR is untouched by this branch -- it has no
+forget/clean step at all, so there's no discrepancy this refill change could
+introduce into the comparison.
+
 Outline this implements (task loop, for each task t with a red agent):
   1. Train on Tt via MADAR's existing ER+KD+SI step (train_cl_er, unchanged).
   2/6. Update replay buffer P -- see "buffer ordering" below for the one change
@@ -727,6 +743,24 @@ def _embed(model, Xt: torch.Tensor, device):
         for (v,) in loader:
             _, latent = model(v.to(device), return_latent=True)
             parts.append(latent.cpu())
+    return torch.cat(parts).numpy()
+
+
+def _predict_confidence(model, Xt: torch.Tensor, device):
+    """Per-sample confidence = max class probability under the CURRENT model
+    (softmax over its raw logits; Xt is already-scaled, same convention as
+    _embed). For this 2-class problem, ranking by this ascending is
+    equivalent to ranking by |P(malicious) - 0.5| ascending -- i.e. "closest
+    to the decision boundary first". Used by the buffer refill step's
+    uncertainty-sampling selection (see main(), REWORK) in place of
+    IsolationForest anomaly/inlier ranking."""
+    loader = data.DataLoader(data.TensorDataset(Xt), batch_size=EVAL_BATCH_SIZE, shuffle=False)
+    parts = []
+    model.eval()
+    with torch.no_grad():
+        for (v,) in loader:
+            probs = F.softmax(model(v.to(device)), dim=1)
+            parts.append(probs.max(dim=1).values.cpu())
     return torch.cat(parts).numpy()
 
 
@@ -1446,6 +1480,18 @@ def main():
     results = []
     warnings_log = []
 
+    historical_clean_mal_pool = []  # REWORK (uncertainty-based cross-task refill): list of
+                                     # (X, y, category, gid) 4-tuples -- every PAST task's
+                                     # clean-malicious samples (malicious AND NOT in that
+                                     # task's own potentially_perturbed_pool, the classifier's
+                                     # own judgment, never oracle ground truth), accumulated
+                                     # across the whole run. Grown AFTER each task's own
+                                     # refill step (see below) so a task's own samples are
+                                     # never candidates for its own refill -- only genuinely
+                                     # PAST tasks' samples are. No eviction -- grows unbounded
+                                     # over the run, same known tradeoff as elsewhere this
+                                     # pattern is used.
+
     for t, task in enumerate(tasks):
         X = np.clip(task["features"].astype(np.float32), 0.0, 1.0)  # data is documented [0,1]-scaled already
         y = task["labels"].astype(np.int64)
@@ -1825,17 +1871,27 @@ def main():
                 ]
                 n_removed = before - len(label_buffers[mal_label])
 
-                # REFILL (REWORK): top the malicious slot back up to budget with
-                # this task's own clean-malicious samples -- i.e. malicious AND
-                # NOT in potentially_perturbed_pool (the classifier's judgment,
-                # not oracle ground truth -- staying consistent with the rest of
-                # this pipeline never peeking at poison_idx beyond seeding the
-                # classifier's training labels). Without this, the slot stays
-                # under-filled until the NEXT task's refresh happens to top it
-                # back up on its own, confounding "effect of forgetting
-                # perturbed samples" with "effect of a chronically smaller
-                # buffer" -- plain MADAR's buffer never shrinks this way, so an
-                # uncontrolled size gap would bias any comparison between them.
+                # REFILL (REWORK, uncertainty sampling): top the malicious slot
+                # back up to budget with clean-malicious samples -- i.e.
+                # malicious AND NOT in potentially_perturbed_pool (the
+                # classifier's judgment, not oracle ground truth -- staying
+                # consistent with the rest of this pipeline never peeking at
+                # poison_idx beyond seeding the classifier's training labels).
+                # Candidates come from THIS task's own leftovers AND every past
+                # task's clean-malicious samples (historical_clean_mal_pool,
+                # see its definition above), combined into one pool -- same
+                # cross-task sourcing as claude/cross-task-buffer-refill. What
+                # changed from that branch: selection is no longer
+                # IsolationForest anomaly/inlier ranking. Instead, the CURRENT
+                # model (post this task's CL training + unlearning) scores
+                # every candidate's confidence (_predict_confidence, max class
+                # probability), and refill takes the LEAST confident first --
+                # i.e. the samples this task's model is currently most unsure
+                # are malicious, prioritized as replay exemplars precisely
+                # because they're the ones most likely to be forgotten/
+                # misclassified next. Still only fills the deficit left by
+                # cleaning, same as before -- not a full replace of whatever
+                # survived cleaning.
                 budget_per_label = MEM_SIZE // 2
                 deficit = budget_per_label - len(label_buffers[mal_label])
                 n_refilled = 0
@@ -1843,35 +1899,51 @@ def main():
                     already_buffered = set(int(e[3]) for e in label_buffers[mal_label])
                     ytr_np = ytr.numpy()
                     forgotten_set = set(int(i) for i in pc_result["forget_idx"])
-                    refill_candidates = np.array([
-                        i for i in range(len(Xtr))
+                    this_task_entries = [
+                        (Xtr[i].clone(), ytr[i].clone(), category[i], int(gid_train[i]))
+                        for i in range(len(Xtr))
                         if ytr_np[i] == mal_label and i not in forgotten_set
                         and int(gid_train[i]) not in already_buffered
-                    ], dtype=np.int64)
+                    ]
+                    historical_entries = [
+                        e for e in historical_clean_mal_pool if e[3] not in already_buffered
+                    ]
+                    combined_entries = this_task_entries + historical_entries
 
-                    if len(refill_candidates) > 0:
-                        n_refill = min(deficit, len(refill_candidates))
-                        cand_X = Xtr[torch.tensor(refill_candidates, dtype=torch.long)]
-                        cand_L = _embed(model, cand_X, DEVICE)
-                        iso = IsolationForest(contamination=MADAR_CONTAMINATION, n_jobs=-1, random_state=SEED)
-                        iso.fit(cand_L)
-                        scores = iso.decision_function(cand_L)
-                        local_idx = _anomaly_inlier_interleave(scores, n_refill)
+                    if combined_entries:
+                        n_refill = min(deficit, len(combined_entries))
+                        cand_X = torch.stack([e[0] for e in combined_entries])
+                        confidence = _predict_confidence(model, cand_X, DEVICE)
+                        ranked_idx = np.argsort(confidence)  # ascending: least confident first
+                        local_idx = ranked_idx[:n_refill]
 
                         for li in local_idx:
-                            orig_i = int(refill_candidates[li])
-                            label_buffers[mal_label].append((
-                                Xtr[orig_i].clone(), ytr[orig_i].clone(),
-                                category[orig_i], int(gid_train[orig_i]),
-                            ))
+                            label_buffers[mal_label].append(combined_entries[li])
                         n_refilled = len(local_idx)
 
                 replay_buffer.clear()
                 for buf in label_buffers.values():
                     replay_buffer.extend(buf)
                 print(f"    [Buffer clean] removed {n_removed} potentially_perturbed_pool matches, "
-                      f"refilled {n_refilled}/{deficit} with clean-malicious samples "
+                      f"refilled {n_refilled}/{deficit} with least-confident clean-malicious samples "
+                      f"(this task + {len(historical_clean_mal_pool)} historical candidates) "
                       f"in the malicious-label buffer slot.")
+
+            # Grow the cross-task historical pool with THIS task's own
+            # clean-malicious samples, AFTER this task's own refill above (so
+            # a task's own samples are never candidates for its own refill --
+            # only genuinely PAST tasks' samples are). Independent of the
+            # CLEAN_REPLAY_BUFFER_OF_PERTURBED toggle -- the pool is always
+            # maintained when a classifier judgment exists, regardless of
+            # whether cleaning/refill happened to run this task.
+            if pc_result is not None:
+                ytr_np = ytr.numpy()
+                forgotten_set = set(int(i) for i in pc_result["forget_idx"])
+                for i in range(len(Xtr)):
+                    if ytr_np[i] == mal_label and i not in forgotten_set:
+                        historical_clean_mal_pool.append(
+                            (Xtr[i].clone(), ytr[i].clone(), category[i], int(gid_train[i]))
+                        )
 
         # p_old_task updated to the FINAL (post-unlearning, if it ran this task)
         # weights, for ALL tasks -- ready as next task's start-of-task SI anchor.
