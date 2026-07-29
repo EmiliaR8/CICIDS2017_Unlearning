@@ -1,3 +1,5 @@
 Contrastive_Drift/
 __pycache__/
 *.pyc
+runs/madar/madar_dual_agent1/logs/prototype_cosine_over_time.txt
+runs/madar_unlearning/madar_u_dual_agent/logs/prototype_cosine_over_time.txt

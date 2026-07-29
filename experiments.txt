@@ -45,7 +45,7 @@ python joint_cl_pipeline.py --seed 42 --log_name joint2                       Jo
 fill replay buffer with not pertrubed samples for MADR+U
 
 
- python compare_cl_runs.py runs/madar_unlearning/madar_active2/madar_active2.json  runs/madar/madar7/madar7.json --out madar_u_v_madar_no_u.png  --include_table
+ python compare_cl_runs.py  runs/madar_unlearning/madar_u_dual_agent/madar_u_dual_agent.json  runs/madar/madar_dual_agent1/madar_dual_agent1.json --out madar_dual_v_madaru_dual.png  --include_table
 
 conda
 
