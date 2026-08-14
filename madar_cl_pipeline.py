@@ -164,6 +164,7 @@ from h5_data_loader import load_pooled_chronological_tasks
 # so runs are directly comparable. Only --seed and --log_name are CLI.
 # ---------------------------------------------------------------------------
 H5_DATASET_PATH = "/mnt/processed_data/subsampled_dataset.h5"
+RUNS_BASE_DIR = "/mnt/erivas6/runs"  # base directory for all run outputs (logs/plots/results json)
 
 SEED = 42  # overwritten from --seed at the top of main(); module-level so
            # update_buffer_madar's IsolationForest(random_state=SEED) sees it.
@@ -960,7 +961,7 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    out_dir = os.path.join("runs", "madar", args.log_name)
+    out_dir = os.path.join(RUNS_BASE_DIR, "madar", args.log_name)
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
 
