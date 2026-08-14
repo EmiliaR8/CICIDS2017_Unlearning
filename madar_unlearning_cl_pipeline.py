@@ -1495,6 +1495,153 @@ def plot_clean_vs_perturbed(Xtr, category, task_id, out_path):
 
 
 # ---------------------------------------------------------------------------
+# Decision-boundary visualization (NEW, identical to madar_cl_pipeline.py's
+# copy of the same section -- see its comments for the full rationale).
+# Evaluates the CLASSIFIER itself over a dense grid on a FIXED run-wide 2D
+# PCA plane (pca_mean/pca_components/pca_extent, computed once in main()
+# right after the scaler is fit at task 0), reused unchanged for every
+# task/checkpoint so panels are directly comparable. In THIS file, two
+# checkpoints get captured per task where unlearning actually ran:
+# "pre_unlearn" (right after CL training) and "post_unlearn" (right after
+# unlearn_teacher_guided) -- isolating what unlearning itself does to the
+# boundary. Tasks where unlearning didn't run get just the one
+# "pre_unlearn"-labeled snapshot. Reuses AGENT_TYPE_MARKERS/CATEGORY_COLORS
+# (defined above) for visual consistency with plot_clean_vs_perturbed/
+# plot_episode_clouds/plot_prototype_heatmap.
+# ---------------------------------------------------------------------------
+AGENT_PERTURBED_COLORS = {
+    "train": "tab:red", "test": "firebrick",
+    "train_benign": "tab:purple", "test_benign": "indigo",
+}
+CATEGORY_BG_COLORS = {"benign": CATEGORY_COLORS["benign"], "malicious_clean": CATEGORY_COLORS["malicious_clean"]}
+
+
+def _pca_project(X_scaled_np, mean, components):
+    return (X_scaled_np - mean) @ components.T
+
+
+def _decision_grid(model, mean, components, extent, device, mal_label, resolution=150):
+    """Dense grid over the FIXED 2D PCA plane, inverse-transformed back into
+    the model's actual input space, evaluated through `model` for real --
+    returns (xx, yy, proba_malicious) for contour plotting."""
+    xmin, xmax, ymin, ymax = extent
+    xx, yy = np.meshgrid(np.linspace(xmin, xmax, resolution), np.linspace(ymin, ymax, resolution))
+    grid_2d = np.stack([xx.ravel(), yy.ravel()], axis=1)
+    grid_highdim = grid_2d @ components + mean
+
+    model.eval()
+    with torch.no_grad():
+        logits = model(torch.tensor(grid_highdim, dtype=torch.float32, device=device))
+        proba = F.softmax(logits, dim=1)[:, mal_label].cpu().numpy()
+    return xx, yy, proba.reshape(xx.shape)
+
+
+def _draw_decision_boundary(ax, xx, yy, proba, Z_train, category_train, Z_test, category_test):
+    """Draws one panel from PRECOMPUTED grid/scatter data onto `ax`. Shared
+    by plot_decision_boundary (computes then draws, saves its own file) and
+    plot_decision_boundary_grid (redraws every checkpoint's cached data into
+    one summary figure). Returns per-agent perturbed counts (for the
+    caller's legend)."""
+    ax.contourf(xx, yy, proba, levels=np.linspace(0, 1, 21), cmap="RdBu_r", alpha=0.6, vmin=0, vmax=1)
+    ax.contour(xx, yy, proba, levels=[0.5], colors="black", linewidths=1.2, linestyles="--")
+
+    for cat, color in CATEGORY_BG_COLORS.items():
+        mask = category_train == cat
+        if mask.sum() > 0:
+            ax.scatter(Z_train[mask, 0], Z_train[mask, 1], s=5, alpha=0.2, color=color, marker=".")
+
+    n_by_agent = {}
+    for cat, agent_type, Z, cat_arr in [
+        ("malicious_perturbed", "train", Z_train, category_train),
+        ("malicious_perturbed", "test", Z_test, category_test),
+        ("benign_perturbed", "train_benign", Z_train, category_train),
+        ("benign_perturbed", "test_benign", Z_test, category_test),
+    ]:
+        mask = cat_arr == cat
+        n_by_agent[agent_type] = int(mask.sum())
+        if mask.sum() == 0:
+            continue
+        ax.scatter(Z[mask, 0], Z[mask, 1], s=22, alpha=0.85,
+                   color=AGENT_PERTURBED_COLORS[agent_type], marker=AGENT_TYPE_MARKERS[agent_type],
+                   edgecolors="black", linewidths=0.3)
+    return n_by_agent
+
+
+def plot_decision_boundary(model, device, pca_mean, pca_components, pca_extent, mal_label,
+                            X_train_scaled_np, category_train,
+                            X_test_scaled_np, category_test,
+                            task_id, out_path, checkpoint_label=""):
+    """One task/checkpoint's decision-boundary figure. Returns a dict of the
+    computed grid/scatter data so main() can cache it and reuse it in
+    plot_decision_boundary_grid's end-of-run summary without recomputing."""
+    xx, yy, proba = _decision_grid(model, pca_mean, pca_components, pca_extent, device, mal_label)
+    Z_train = _pca_project(X_train_scaled_np, pca_mean, pca_components)
+    Z_test = _pca_project(X_test_scaled_np, pca_mean, pca_components)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    n_by_agent = _draw_decision_boundary(ax, xx, yy, proba, Z_train, category_train, Z_test, category_test)
+
+    handles = [
+        plt.Line2D([0], [0], marker=".", color=c, linestyle="", markersize=8,
+                   label=f"{cat} (n={int((category_train == cat).sum())})")
+        for cat, c in CATEGORY_BG_COLORS.items()
+    ] + [
+        plt.Line2D([0], [0], marker=AGENT_TYPE_MARKERS[agent], color=AGENT_PERTURBED_COLORS[agent],
+                   linestyle="", markersize=8, label=f"perturbed via {agent} (n={n_by_agent.get(agent, 0)})")
+        for agent in ("train", "test", "train_benign", "test_benign") if n_by_agent.get(agent, 0) > 0
+    ]
+    ax.legend(handles=handles, fontsize=7, loc="best")
+
+    title = f"Task {task_id} decision boundary"
+    if checkpoint_label:
+        title += f" ({checkpoint_label})"
+    ax.set_title(title)
+    ax.set_xlabel("PC1 (fixed, run-wide)")
+    ax.set_ylabel("PC2 (fixed, run-wide)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+    return {
+        "xx": xx, "yy": yy, "proba": proba,
+        "Z_train": Z_train, "category_train": category_train,
+        "Z_test": Z_test, "category_test": category_test,
+        "task_id": task_id, "checkpoint_label": checkpoint_label,
+    }
+
+
+def plot_decision_boundary_grid(panels, out_path):
+    """panels: list of dicts as returned by plot_decision_boundary, one per
+    captured checkpoint across the whole run -- laid out as a grid of
+    subplots (same fixed PCA basis, so directly comparable) for an
+    at-a-glance view of how the boundary drifts as poisoning accumulates,
+    and (unique to this file) how unlearning shifts it back within a task."""
+    n = len(panels)
+    if n == 0:
+        print("[Plot] No decision-boundary panels captured -- skipping summary grid.")
+        return
+    ncols = min(3, n)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows), squeeze=False)
+
+    for i, p in enumerate(panels):
+        ax = axes[i // ncols][i % ncols]
+        _draw_decision_boundary(ax, p["xx"], p["yy"], p["proba"], p["Z_train"], p["category_train"],
+                                 p["Z_test"], p["category_test"])
+        label = f"Task {p['task_id']}" + (f" ({p['checkpoint_label']})" if p["checkpoint_label"] else "")
+        ax.set_title(label, fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+
+    for i in range(n, nrows * ncols):
+        axes[i // ncols][i % ncols].axis("off")
+
+    fig.suptitle("Decision boundary evolution across the run (fixed PCA basis)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -1568,6 +1715,9 @@ def main():
                                    # per task (immutable afterward) -- feeds perturbed_test_eval
     results = []
     warnings_log = []
+    boundary_panels = []  # accumulates plot_decision_boundary's return dict per captured
+                           # checkpoint, for the end-of-run summary grid (plot_decision_boundary_grid)
+    pca_mean = pca_components = pca_extent = None  # set once at task 0, below
 
     for t, task in enumerate(tasks):
         X = np.clip(task["features"].astype(np.float32), 0.0, 1.0)  # data is documented [0,1]-scaled already
@@ -1586,10 +1736,14 @@ def main():
         n_poisoned = 0
         poison_idx = np.array([], dtype=int)
         n_poisoned_test = 0
+        poison_idx_test = np.array([], dtype=int)  # initialized here (not just inside the nested
+                                                     # TEST-SIDE block) so category_test construction
+                                                     # below can always safely reference it
         poisoned_test_sample_ids = []
         n_poisoned_benign = 0
         poison_idx_benign = np.array([], dtype=int)
         n_poisoned_test_benign = 0
+        poison_idx_test_benign = np.array([], dtype=int)  # same reasoning as poison_idx_test above
         poisoned_test_sample_ids_benign = []
 
         if t == 0:
@@ -1802,6 +1956,17 @@ def main():
         poisoned_sample_ids = gid_train[poison_idx].tolist() if len(poison_idx) > 0 else []
         poisoned_sample_ids_benign = gid_train[poison_idx_benign].tolist() if len(poison_idx_benign) > 0 else []
 
+        # TEST-side mirror of the category array above -- NEW, feeds
+        # plot_decision_boundary's test-split scatter. poison_idx_test /
+        # poison_idx_test_benign rows are exactly what red_test_pert_agent /
+        # red_test_benign_pert_agent produced.
+        category_test = np.full(len(y_test), "malicious_clean", dtype=object)
+        category_test[y_test == benign_label] = "benign"
+        if len(poison_idx_test) > 0:
+            category_test[poison_idx_test] = "malicious_perturbed"
+        if len(poison_idx_test_benign) > 0:
+            category_test[poison_idx_test_benign] = "benign_perturbed"
+
         if t == 0:
             scaler = StandardScaler()
             scaler.fit(X_train_for_classifier)
@@ -1811,6 +1976,24 @@ def main():
             W = {n.replace('.', '__'): torch.zeros_like(p).to(DEVICE) for n, p in model.named_parameters() if p.requires_grad}
             p_old_task = {n.replace('.', '__'): p.detach().clone().to(DEVICE) for n, p in model.named_parameters() if p.requires_grad}
             omega = {n.replace('.', '__'): torch.zeros_like(p).to(DEVICE) for n, p in model.named_parameters() if p.requires_grad}
+
+            # GLOBAL (run-wide) PCA basis for plot_decision_boundary -- fit
+            # ONCE, here, reused unchanged for every task/checkpoint's
+            # boundary plot for the rest of the run. See
+            # plot_decision_boundary's module-level comment for why.
+            all_X_scaled = to_tensor(
+                np.concatenate([np.clip(tk["features"].astype(np.float32), 0.0, 1.0) for tk in tasks], axis=0)
+            ).numpy()
+            pca_mean = all_X_scaled.mean(axis=0)
+            _, _, pca_Vt = np.linalg.svd(all_X_scaled - pca_mean, full_matrices=False)
+            pca_components = pca_Vt[:2]
+            Z_all = (all_X_scaled - pca_mean) @ pca_components.T
+            pca_pad = 0.5
+            pca_extent = (
+                float(Z_all[:, 0].min() - pca_pad), float(Z_all[:, 0].max() + pca_pad),
+                float(Z_all[:, 1].min() - pca_pad), float(Z_all[:, 1].max() + pca_pad),
+            )
+            del all_X_scaled, Z_all
 
         Xtr = to_tensor(X_train_for_classifier)
         ytr = torch.tensor(y_train, dtype=torch.long)
@@ -1872,6 +2055,20 @@ def main():
                     p_post_cl = p.detach().clone()
                     omega[n_key] += W[n_key] / ((p_post_cl - p_old_task[n_key]) ** 2 + SI_EPS)
                     W[n_key].zero_()
+
+        # Decision-boundary snapshot -- model state right after CL training,
+        # BEFORE any unlearning attempt for this task (task 0 has no
+        # unlearning phase at all, so this is its only snapshot). Whether
+        # unlearning actually runs for t>0 is decided further below, so this
+        # is captured unconditionally here and labeled "pre_unlearn" for
+        # every t>0 regardless of outcome.
+        X_test_scaled_np = to_tensor(task_test_splits[t][0]).numpy()
+        boundary_panels.append(plot_decision_boundary(
+            model, DEVICE, pca_mean, pca_components, pca_extent, mal_label,
+            Xtr.numpy(), category, X_test_scaled_np, category_test,
+            t, os.path.join(out_dir, "plots", f"decision_boundary_task{t}.png"),
+            checkpoint_label="pre_unlearn" if t > 0 else "",
+        ))
 
         # ============================================================
         # 2. TEST on the (poisoned) test split -- REORDERED here, right after
@@ -2002,6 +2199,17 @@ def main():
                           f"forget={unlearn_diag['raw_forget_loss_mean']:.4f} "
                           f"retain={unlearn_diag['raw_retain_loss_mean']:.4f} "
                           f"si={unlearn_diag['raw_si_loss_mean']:.4f} (unweighted, before alpha/si_c)")
+
+                    # Decision-boundary snapshot -- model state right after
+                    # unlearning, paired with the "pre_unlearn" snapshot taken
+                    # above (same task, same fixed PCA basis, same category
+                    # arrays) so the two are directly comparable.
+                    boundary_panels.append(plot_decision_boundary(
+                        model, DEVICE, pca_mean, pca_components, pca_extent, mal_label,
+                        Xtr.numpy(), category, X_test_scaled_np, category_test,
+                        t, os.path.join(out_dir, "plots", f"decision_boundary_task{t}_post_unlearn.png"),
+                        checkpoint_label="post_unlearn",
+                    ))
 
                     f_m = measure_unlearning_efficacy(model_pre_unlearn, model, forget_loader, DEVICE)
                     r_m = measure_unlearning_efficacy(model_pre_unlearn, model, retain_loader, DEVICE)
@@ -2192,6 +2400,7 @@ def main():
     plot_unlearning_metrics(results, os.path.join(out_dir, "plots", "unlearning_metrics.png"))
     plot_prototype_heatmap(bank, os.path.join(out_dir, "plots", "prototype_heatmap.png"))
     plot_episode_clouds(bank, os.path.join(out_dir, "plots", "episode_clouds.png"))
+    plot_decision_boundary_grid(boundary_panels, os.path.join(out_dir, "plots", "decision_boundary_evolution.png"))
 
     print(f"\nDone. Results + plots written to {out_dir}/")
     print("full time elapsed: %.2f seconds" % (time.perf_counter() - start_time))
