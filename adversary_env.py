@@ -129,7 +129,7 @@ class NetworkAttackEnv(gym.Env):
     The agent applies perturbations to a non-benign sample to fool a classifier into classifying it as benign.
     """
 
-    def __init__(self, classifier, X_data, y_data, benign_label=0, max_steps=25, epsilon=0.25, agent_id=0, contrastive_bank=None, alpha_contrast=0.5):
+    def __init__(self, classifier, X_data, y_data, benign_label=0, max_steps=25, epsilon=0.25, agent_id=0, contrastive_bank=None, alpha_contrast=0.5, target_margin_confidence=None):
         super(NetworkAttackEnv, self).__init__()
         print(f"\n==== Agent Epsilon is -{epsilon} and {epsilon} ===== ")
 
@@ -140,6 +140,13 @@ class NetworkAttackEnv(gym.Env):
         self.max_steps = max_steps  # Max perturbation attempts per episode
         self.epsilon = epsilon  # Perturbation strength
         self.last_sample_index = 0
+        # None (default) = today's behavior: monotonically reward pushing
+        # confidence as deep into the target class as possible. When set
+        # (e.g. 0.55), reward instead PEAKS at that confidence value and
+        # falls off in both directions -- so the agent is rewarded for
+        # landing just past the decision boundary rather than deep past it.
+        # See step()'s confidence_term for the exact shape.
+        self.target_margin_confidence = target_margin_confidence
 
         self.non_benign_indices = np.where(y_data != benign_label)[0]
         feature_dim = X_data.shape[1]  # Ensure action space matches feature dimension
@@ -192,7 +199,17 @@ class NetworkAttackEnv(gym.Env):
         # Reward is based on classifier's confidence change
         confidence = predicted_proba[self.benign_label]  # Probability of benign class
         #reward = confidence - 0.5  # Encourage increasing benign probability
-        reward = 5 * (confidence - 0.5) - 0.3 * np.linalg.norm(action, ord=2)  # L2 penalty
+        if self.target_margin_confidence is not None:
+            # Margin-minimizing mode: peak reward (2.5, matching the default
+            # mode's max at confidence=1.0) sits at target_margin_confidence
+            # -- a small margin PAST 0.5 toward the target class -- and falls
+            # off symmetrically as confidence moves either further short of
+            # or further past that point, unlike the default's monotonic
+            # "deeper is always better".
+            confidence_term = 5 * (0.5 - abs(confidence - self.target_margin_confidence))
+        else:
+            confidence_term = 5 * (confidence - 0.5)
+        reward = confidence_term - 0.3 * np.linalg.norm(action, ord=2)  # L2 penalty
 
         # Large reward for successful misclassification
         if predicted_label == self.benign_label:
