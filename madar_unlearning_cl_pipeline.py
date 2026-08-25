@@ -404,6 +404,25 @@ EVAL_BATCH_SIZE = 512
 MEM_SIZE = 4000
 MADAR_CONTAMINATION = 0.1
 
+HISTORICAL_POOL_MAX_SIZE = MEM_SIZE * 2  # REWORK (task 8/9 collapse investigation):
+                                          # historical_clean_mal_pool (see its definition
+                                          # below) used to grow unbounded over the whole run.
+                                          # Uncertainty-sampling refill always pulls the LEAST
+                                          # confident candidates from it first, every task --
+                                          # so an ever-larger pool means an ever-larger set of
+                                          # ambiguous, boundary-hugging exemplars competing to
+                                          # get selected, which can compound over tasks even
+                                          # though the pool isn't dominated by literally STALE
+                                          # (old-task) samples (checked directly against
+                                          # madar_u_0824.json's replay_buffer_composition --
+                                          # task 9's buffer was 79% from tasks 8/9 themselves).
+                                          # Capped here via FIFO eviction (oldest-appended
+                                          # samples dropped first) right after each task's
+                                          # growth step. 2x MEM_SIZE is a first-pass guess --
+                                          # big enough to keep real cross-task diversity, small
+                                          # enough to stop the pool from just accumulating every
+                                          # ambiguous sample from every task forever.
+
 KD_TEMP = 2.0
 SI_C = 1.0
 SI_EPS = 0.1
@@ -1654,9 +1673,10 @@ def main():
                                      # across the whole run. Grown AFTER each task's own
                                      # refill step (see below) so a task's own samples are
                                      # never candidates for its own refill -- only genuinely
-                                     # PAST tasks' samples are. No eviction -- grows unbounded
-                                     # over the run, same known tradeoff as elsewhere this
-                                     # pattern is used.
+                                     # PAST tasks' samples are. Capped to HISTORICAL_POOL_MAX_SIZE
+                                     # via FIFO eviction after each task's growth step (REWORK,
+                                     # task 8/9 collapse investigation -- see that constant's
+                                     # definition for rationale).
 
     for t, task in enumerate(tasks):
         X = np.clip(task["features"].astype(np.float32), 0.0, 1.0)  # data is documented [0,1]-scaled already
@@ -2114,6 +2134,7 @@ def main():
                 budget_per_label = MEM_SIZE // 2
                 deficit = budget_per_label - len(label_buffers[mal_label])
                 n_refilled = 0
+                refill_confidence_diag = None
                 if deficit > 0:
                     already_buffered = set(int(e[3]) for e in label_buffers[mal_label])
                     ytr_np = ytr.numpy()
@@ -2140,6 +2161,24 @@ def main():
                             label_buffers[mal_label].append(combined_entries[li])
                         n_refilled = len(local_idx)
 
+                        # Diagnostic (task 8/9 collapse investigation): confidence
+                        # distribution of the SELECTED refill samples vs. the full
+                        # candidate pool, so a future run can directly check whether
+                        # refill is pulling from a narrow band of near-boundary
+                        # samples and whether that band shifts/widens across tasks.
+                        selected_conf = confidence[local_idx]
+                        refill_confidence_diag = {
+                            "n_candidates": int(len(combined_entries)),
+                            "n_this_task_candidates": int(len(this_task_entries)),
+                            "n_historical_candidates": int(len(historical_entries)),
+                            "pool_confidence_mean": float(np.mean(confidence)),
+                            "pool_confidence_min": float(np.min(confidence)),
+                            "pool_confidence_max": float(np.max(confidence)),
+                            "selected_confidence_mean": float(np.mean(selected_conf)),
+                            "selected_confidence_min": float(np.min(selected_conf)),
+                            "selected_confidence_max": float(np.max(selected_conf)),
+                        }
+
                 replay_buffer.clear()
                 for buf in label_buffers.values():
                     replay_buffer.extend(buf)
@@ -2147,6 +2186,20 @@ def main():
                       f"refilled {n_refilled}/{deficit} with least-confident clean-malicious samples "
                       f"(this task + {len(historical_clean_mal_pool)} historical candidates) "
                       f"in the malicious-label buffer slot.")
+                if refill_confidence_diag is not None:
+                    print(f"    [Buffer refill confidence] selected mean/min/max="
+                          f"{refill_confidence_diag['selected_confidence_mean']:.3f}/"
+                          f"{refill_confidence_diag['selected_confidence_min']:.3f}/"
+                          f"{refill_confidence_diag['selected_confidence_max']:.3f} "
+                          f"vs. pool mean={refill_confidence_diag['pool_confidence_mean']:.3f}")
+
+                unlearning_metrics["buffer_refill"] = {
+                    "n_removed": int(n_removed),
+                    "deficit": int(deficit),
+                    "n_refilled": int(n_refilled),
+                    "historical_pool_size_before_refill": int(len(historical_clean_mal_pool)),
+                    "refill_confidence": refill_confidence_diag,
+                }
 
             # Grow the cross-task historical pool with THIS task's own
             # clean-malicious samples, AFTER this task's own refill above (so
@@ -2163,6 +2216,14 @@ def main():
                         historical_clean_mal_pool.append(
                             (Xtr[i].clone(), ytr[i].clone(), category[i], int(gid_train[i]))
                         )
+                # FIFO cap (see HISTORICAL_POOL_MAX_SIZE definition): drop the
+                # oldest-appended entries first once the pool exceeds budget.
+                if len(historical_clean_mal_pool) > HISTORICAL_POOL_MAX_SIZE:
+                    historical_clean_mal_pool[:] = historical_clean_mal_pool[-HISTORICAL_POOL_MAX_SIZE:]
+                # Always logged (regardless of whether cleaning/refill ran this
+                # task) so pool-size-over-time is visible in the results JSON
+                # even on tasks where the classifier found nothing to forget.
+                unlearning_metrics["historical_pool_size"] = int(len(historical_clean_mal_pool))
 
         # p_old_task updated to the FINAL (post-unlearning, if it ran this task)
         # weights, for ALL tasks -- ready as next task's start-of-task SI anchor.
