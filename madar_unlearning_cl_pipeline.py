@@ -496,6 +496,28 @@ CLEAN_REPLAY_BUFFER_OF_PERTURBED = True  # toggle: after IsolationForest/buffer 
                                           # everywhere else. Stays under-filled only if too few
                                           # clean-malicious candidates exist this task to cover
                                           # the deficit.
+RETAIN_LOADER_INCLUDES_BUFFER = True  # REWORK (buffer-anchored retain, targeted forgetting):
+                                       # when True, unlearning's retain_loader (the CE+KD anchor
+                                       # signal in unlearn_teacher_guided) is augmented with actual
+                                       # replay_buffer samples -- genuinely OLD-task exemplars, not
+                                       # just this task's own retain_idx rows -- so the forget step
+                                       # gets a DIRECT gradient signal to preserve old-task
+                                       # predictions, instead of relying solely on SI's
+                                       # omega-weighted regularization. Motivated by the task 8-10
+                                       # investigation: raw_retain_loss_mean spikes ~8x by late
+                                       # tasks while omega_l2_norm keeps climbing monotonically,
+                                       # consistent with SI's protection alone becoming
+                                       # insufficient once enough importance has accumulated.
+                                       # Does NOT change what gets forgotten -- forget_idx is still
+                                       # built purely from THIS task's own perturbation_classifier
+                                       # judgment; only what ANCHORS the retain loss during that
+                                       # step changes. Sampled from replay_buffer as it stood at
+                                       # the END of the PREVIOUS task (update_buffer_madar's
+                                       # refresh for THIS task hasn't run yet at this point in the
+                                       # loop -- see step 4 below), so these are genuinely stale/
+                                       # old-task samples, never this task's own data relabeled.
+                                       # Set False to restore the original this-task-only retain
+                                       # anchor, for A/B comparison.
 
 
 # ---------------------------------------------------------------------------
@@ -2208,8 +2230,24 @@ def main():
                     forget_loader = data.DataLoader(
                         data.TensorDataset(Xtr[forget_idx_t], ytr[forget_idx_t]), batch_size=BATCH_SIZE, shuffle=True
                     )
+
+                    # REWORK (buffer-anchored retain, see RETAIN_LOADER_INCLUDES_BUFFER's
+                    # definition for the full rationale): mix in actual replay_buffer
+                    # samples -- old-task exemplars, since this task's own
+                    # update_buffer_madar refresh (step 4) hasn't run yet -- alongside
+                    # this task's own retain rows, so the retain/CE+KD anchor has direct
+                    # gradient exposure to old-task data during the forget step.
+                    n_buffer_added = 0
+                    if RETAIN_LOADER_INCLUDES_BUFFER and replay_buffer:
+                        buffer_X = torch.stack([e[0] for e in replay_buffer])
+                        buffer_y = torch.stack([e[1] for e in replay_buffer])
+                        retain_X = torch.cat([Xtr[retain_idx_t], buffer_X], dim=0)
+                        retain_y = torch.cat([ytr[retain_idx_t], buffer_y], dim=0)
+                        n_buffer_added = len(replay_buffer)
+                    else:
+                        retain_X, retain_y = Xtr[retain_idx_t], ytr[retain_idx_t]
                     retain_loader = data.DataLoader(
-                        data.TensorDataset(Xtr[retain_idx_t], ytr[retain_idx_t]), batch_size=BATCH_SIZE, shuffle=True
+                        data.TensorDataset(retain_X, retain_y), batch_size=BATCH_SIZE, shuffle=True
                     )
 
                     # --- Step 5 setup: snapshot prior-task held-out accuracy BEFORE
@@ -2273,6 +2311,7 @@ def main():
                     unlearning_metrics = {
                         "detector": POISON_DETECTOR,
                         "n_forget": int(len(forget_idx)), "n_retain": int(len(retain_idx)),
+                        "n_retain_buffer_added": int(n_buffer_added),
                         "n_forget_malicious": int(len(pc_result["forget_idx_malicious"])),
                         "n_forget_benign": int(len(pc_result["forget_idx_benign"])),
                         "perturbation_classifier": {
@@ -2497,6 +2536,7 @@ def main():
         "poison_test_data": POISON_TEST_DATA,
         "perturbation_classifier_n": PERTURBATION_CLASSIFIER_N,
         "clean_replay_buffer_of_perturbed": CLEAN_REPLAY_BUFFER_OF_PERTURBED,
+        "retain_loader_includes_buffer": RETAIN_LOADER_INCLUDES_BUFFER,
         "red_epsilon": RED_EPSILON, "red_max_steps": RED_MAX_STEPS,
         "red_timesteps_per_task": RED_TIMESTEPS_PER_TASK, "alpha_contrast": ALPHA_CONTRAST,
         "contrastive_ema": CONTRASTIVE_EMA, "contrastive_recency_decay": CONTRASTIVE_RECENCY_DECAY,
