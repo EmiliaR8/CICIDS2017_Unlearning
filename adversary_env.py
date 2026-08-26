@@ -129,7 +129,7 @@ class NetworkAttackEnv(gym.Env):
     The agent applies perturbations to a non-benign sample to fool a classifier into classifying it as benign.
     """
 
-    def __init__(self, classifier, X_data, y_data, benign_label=0, max_steps=25, epsilon=0.25, agent_id=0, contrastive_bank=None, alpha_contrast=0.5, target_margin_confidence=None):
+    def __init__(self, classifier, X_data, y_data, benign_label=0, max_steps=25, epsilon=0.25, agent_id=0, contrastive_bank=None, alpha_contrast=0.5, target_margin_confidence=None, shift_reference_classifier=None, pocket_shift_weight=None):
         super(NetworkAttackEnv, self).__init__()
         print(f"\n==== Agent Epsilon is -{epsilon} and {epsilon} ===== ")
 
@@ -147,6 +147,22 @@ class NetworkAttackEnv(gym.Env):
         # landing just past the decision boundary rather than deep past it.
         # See step()'s confidence_term for the exact shape.
         self.target_margin_confidence = target_margin_confidence
+        # REWORK (pocket-targeted test poisoning): shift_reference_classifier,
+        # when set, is a FROZEN snapshot of `classifier` from an earlier point
+        # in time (e.g. before this task's CL training ran) -- `classifier`
+        # itself is expected to be the CURRENT/live model. pocket_shift_weight
+        # scales a reward bonus for the SIGNED CHANGE in confidence toward
+        # `benign_label` between the two, at the agent's current perturbed
+        # point: positive when the live model classifies this exact point
+        # MORE toward benign_label than the frozen reference did. This
+        # specifically hunts for "pockets" the boundary has moved through --
+        # points a prior classifier state would have called non-benign that
+        # the current one now calls benign -- rather than just any generic
+        # evasion direction. See step() for the exact reward term. Both must
+        # be set together for this to activate; either left None (default)
+        # disables it and reward is unchanged from before.
+        self.shift_reference_classifier = shift_reference_classifier
+        self.pocket_shift_weight = pocket_shift_weight
 
         self.non_benign_indices = np.where(y_data != benign_label)[0]
         feature_dim = X_data.shape[1]  # Ensure action space matches feature dimension
@@ -209,7 +225,21 @@ class NetworkAttackEnv(gym.Env):
             confidence_term = 5 * (0.5 - abs(confidence - self.target_margin_confidence))
         else:
             confidence_term = 5 * (confidence - 0.5)
-        reward = confidence_term - 0.3 * np.linalg.norm(action, ord=2)  # L2 penalty
+
+        # REWORK (pocket-targeted test poisoning): bonus for landing where the
+        # CURRENT (live) classifier's confidence toward benign_label at this
+        # exact point exceeds the FROZEN reference classifier's confidence at
+        # the same point -- i.e. this specific point is inside a region the
+        # boundary moved through, not just generically evasive. Zero/no-op
+        # unless both shift_reference_classifier and pocket_shift_weight are
+        # set (see __init__).
+        pocket_term = 0.0
+        if self.shift_reference_classifier is not None and self.pocket_shift_weight:
+            ref_proba = self.shift_reference_classifier.predict_proba(self.state.reshape(1, -1))[0]
+            ref_confidence = ref_proba[self.benign_label]
+            pocket_term = self.pocket_shift_weight * (confidence - ref_confidence)
+
+        reward = confidence_term + pocket_term - 0.3 * np.linalg.norm(action, ord=2)  # L2 penalty
 
         # Large reward for successful misclassification
         if predicted_label == self.benign_label:
