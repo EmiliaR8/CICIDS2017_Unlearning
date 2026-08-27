@@ -322,6 +322,12 @@ MADAR_CONTAMINATION = 0.1  # only shifts IsolationForest's decision threshold; s
 KD_TEMP = 2.0
 SI_C = 1.0
 SI_EPS = 0.1
+SI_OMEGA_DECAY = 0.9  # REWORK (SI capacity investigation): see
+                       # madar_unlearning_cl_pipeline.py's definition for the
+                       # full rationale -- applied identically here so plain
+                       # MADAR and MADAR+Unlearning stay directly comparable.
+                       # Set to 1.0 to restore the old unbounded-accumulation
+                       # behavior.
 # rnt = max(1/(tid+1), RNT_FLOOR): weight of current-task hard-label loss vs.
 # replay KD loss (see train_cl_er). Unfloored 1/(tid+1) (borrowed from the
 # EMBER class-incremental reference, where "new" each round is a handful of
@@ -1461,7 +1467,10 @@ def main():
                 if p.requires_grad:
                     n_key = n.replace('.', '__')
                     p_current = p.detach().clone()
-                    omega[n_key] += W[n_key] / ((p_current - p_old_task[n_key]) ** 2 + SI_EPS)
+                    # SI_OMEGA_DECAY (REWORK, SI capacity investigation): see
+                    # its definition for the full rationale.
+                    omega[n_key] = SI_OMEGA_DECAY * omega[n_key] + \
+                        W[n_key] / ((p_current - p_old_task[n_key]) ** 2 + SI_EPS)
                     W[n_key].zero_()
                     p_old_task[n_key] = p_current
 

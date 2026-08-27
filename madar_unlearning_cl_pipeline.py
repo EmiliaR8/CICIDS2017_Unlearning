@@ -523,6 +523,35 @@ HISTORICAL_POOL_MAX_SIZE = MEM_SIZE * 2  # REWORK (task 8/9 collapse investigati
 KD_TEMP = 2.0
 SI_C = 1.0
 SI_EPS = 0.1
+SI_OMEGA_DECAY = 0.9  # REWORK (SI capacity investigation): applied to `omega`
+                       # (SI's accumulated per-parameter importance) each task,
+                       # BEFORE that task's new contribution is added --
+                       # omega[k] = SI_OMEGA_DECAY * omega[k] + this_task's_delta
+                       # -- same "online EWC" forgetting-factor idea (Schwarz et
+                       # al. 2018) used to stop Fisher/importance accumulation
+                       # from growing without bound over many tasks. Previously
+                       # omega had NO cap or decay at all, unlike every other
+                       # accumulating state in this pipeline (replay buffer,
+                       # historical_clean_mal_pool/historical_clean_benign_pool
+                       # -- both since capped). Motivated by a recurring pattern
+                       # across three separate experiments (margin-evasion-only,
+                       # quad-agent, and pocket-anchored runs): a SPECIFIC subset
+                       # of early tasks (task 1 in one run; tasks 0/1/5 in
+                       # another) collapses hard (-17 to -19pp) at the FINAL
+                       # checkpoint only, while omega_l2_norm climbs
+                       # monotonically the whole run with no anomalous jump at
+                       # that point -- consistent with SI's "protected" subspace
+                       # quietly shrinking every task until there's no longer
+                       # enough free capacity left, at which point fitting new
+                       # data forces a large, uncontrolled reallocation.
+                       # 0.9 is a first-pass guess (not yet tuned) -- at 0.9,
+                       # omega converges toward a geometric-series steady state
+                       # instead of growing linearly forever; lower values decay
+                       # faster (less long-run protection, more plasticity),
+                       # 1.0 exactly reproduces the old unbounded-growth
+                       # behavior. Applied identically in madar_cl_pipeline.py
+                       # (plain MADAR also uses SI, though it has no unlearning
+                       # step to interact with) so results stay comparable.
 RNT_FLOOR = 0.3  # see madar_cl_pipeline.py's definition of this constant for the
                   # full rationale (madar1.json vs madar2.json validated the fix)
 
@@ -1433,26 +1462,59 @@ def measure_unlearning_efficacy(model_before, model_after, loader, device):
 # Plots
 # ---------------------------------------------------------------------------
 def plot_task_metrics(results, out_path):
-    """Identical to madar_cl_pipeline.py's plot_task_metrics, title relabeled, plus
-    a third panel (REWORK, pocket-targeted test poisoning follow-up) showing THIS
-    task's own pocket-targeted test batch accuracy at decision boundary N
-    (pre-unlearning, perturbed_test_eval) vs. decision boundary J (post-unlearning,
-    post_unlearn_perturbed_test_eval) -- the direct before/after comparison on the
-    identical rows, rather than inferring recovery from the whole-test-set
+    """Identical to madar_cl_pipeline.py's plot_task_metrics, title relabeled,
+    plus (REWORK, task_metrics.png follow-up): the main panel now plots BOTH
+    the PRE-unlearning snapshot (pooled_eval/mean_per_task_balanced_accuracy,
+    computed at step 2, before this task's forget step) and the POST-unlearning
+    one (post_unlearn_pooled_eval/post_unlearn_mean_per_task_balanced_accuracy,
+    computed right after unlearning finishes) -- previously only the PRE
+    numbers were plotted here (despite the title's own disclaimer), so the
+    plot never actually showed the classifier's real, deployed post-unlearning
+    performance. Tasks where unlearning didn't run this checkpoint (task 0, or
+    any task whose forget set ended up empty) fall back to the PRE value for
+    the POST line, since PRE *is* the final state there -- there's no separate
+    post-unlearning snapshot to show. Also adds a third panel (REWORK,
+    pocket-targeted test poisoning follow-up) showing THIS task's own
+    pocket-targeted test batch accuracy at decision boundary N (pre-unlearning,
+    perturbed_test_eval) vs. decision boundary J (post-unlearning,
+    post_unlearn_perturbed_test_eval) -- the direct before/after comparison on
+    the identical rows, rather than inferring recovery from the whole-test-set
     post_unlearn_this_task_eval number."""
     task_ids = [r["task_id"] for r in results]
-    pooled_bal_acc = [r["pooled_eval"]["balanced_accuracy"] for r in results]
-    mean_per_task_bal_acc = [r["mean_per_task_balanced_accuracy"] for r in results]
+    pooled_bal_acc_pre = [r["pooled_eval"]["balanced_accuracy"] for r in results]
+    mean_per_task_bal_acc_pre = [r["mean_per_task_balanced_accuracy"] for r in results]
+
+    def _post_or_fallback(r, key, fallback):
+        u = r.get("unlearning") or {}
+        v = u.get(key)
+        if isinstance(v, dict):
+            v = v.get("balanced_accuracy")
+        return fallback if v is None else v
+
+    pooled_bal_acc_post = [
+        _post_or_fallback(r, "post_unlearn_pooled_eval", pre)
+        for r, pre in zip(results, pooled_bal_acc_pre)
+    ]
+    mean_per_task_bal_acc_post = [
+        _post_or_fallback(r, "post_unlearn_mean_per_task_balanced_accuracy", pre)
+        for r, pre in zip(results, mean_per_task_bal_acc_pre)
+    ]
     train_evasion = [r["red_agent"]["train_evasion_rate"] if r["red_agent"] else None for r in results]
     test_evasion = [r["red_agent"]["test_evasion_rate"] if r["red_agent"] else None for r in results]
 
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 11), sharex=True)
 
-    ax1.plot(task_ids, pooled_bal_acc, marker="o", label="pooled balanced accuracy")
-    ax1.plot(task_ids, mean_per_task_bal_acc, marker="s", label="mean per-task balanced accuracy")
+    ax1.plot(task_ids, pooled_bal_acc_pre, marker="o", linestyle="--", color="tab:blue", alpha=0.5,
+              label="pooled balanced accuracy (pre-unlearn)")
+    ax1.plot(task_ids, pooled_bal_acc_post, marker="o", color="tab:blue",
+              label="pooled balanced accuracy (post-unlearn)")
+    ax1.plot(task_ids, mean_per_task_bal_acc_pre, marker="s", linestyle="--", color="tab:orange", alpha=0.5,
+              label="mean per-task balanced accuracy (pre-unlearn)")
+    ax1.plot(task_ids, mean_per_task_bal_acc_post, marker="s", color="tab:orange",
+              label="mean per-task balanced accuracy (post-unlearn)")
     ax1.set_ylabel("Balanced accuracy")
-    ax1.set_title("MADAR+Unlearning: classifier accuracy per task boundary (PRE-unlearning snapshot)")
-    ax1.legend()
+    ax1.set_title("MADAR+Unlearning: classifier accuracy per task boundary (PRE- vs. POST-unlearning)")
+    ax1.legend(fontsize=8)
     ax1.grid(alpha=0.3)
 
     xs = [t for t, v in zip(task_ids, train_evasion) if v is not None]
@@ -2136,7 +2198,13 @@ def main():
                 if p.requires_grad:
                     n_key = n.replace('.', '__')
                     p_post_cl = p.detach().clone()
-                    omega[n_key] += W[n_key] / ((p_post_cl - p_old_task[n_key]) ** 2 + SI_EPS)
+                    # SI_OMEGA_DECAY (REWORK, SI capacity investigation): decay
+                    # applied to the EXISTING accumulated importance before
+                    # adding this task's contribution, so omega converges
+                    # instead of growing unboundedly over the whole run -- see
+                    # that constant's definition for the full rationale.
+                    omega[n_key] = SI_OMEGA_DECAY * omega[n_key] + \
+                        W[n_key] / ((p_post_cl - p_old_task[n_key]) ** 2 + SI_EPS)
                     W[n_key].zero_()
 
         # TEST-SIDE poisoning (REWORK, pocket-targeted test poisoning): runs HERE,
@@ -2449,6 +2517,24 @@ def main():
                           f"{per_task_eval[t]['balanced_accuracy']:.4f} -> "
                           f"{post_unlearn_this_task_eval['balanced_accuracy']:.4f}")
 
+                    # POST-unlearn per_task_eval/pooled_eval/mean_per_task_balanced_
+                    # accuracy (REWORK, task_metrics.png follow-up): the pre-unlearn
+                    # versions of these (per_task_eval/pooled_eval/mean_per_task_
+                    # bal_acc, computed at step 2 above) are what task_metrics.png's
+                    # main panel plots today, labeled "PRE-unlearning snapshot" --
+                    # this is the complete POST-unlearning equivalent, at this same
+                    # checkpoint, so the plot can show the classifier's ACTUAL
+                    # deployed performance instead. post_unlearn_prior_eval already
+                    # covers tasks 0..t-1; post_unlearn_this_task_eval covers task t;
+                    # combined they span the same range per_task_eval does, with no
+                    # extra evaluate_classifier calls beyond pooled_eval's own.
+                    post_unlearn_per_task_eval = dict(post_unlearn_prior_eval)
+                    post_unlearn_per_task_eval[t] = post_unlearn_this_task_eval
+                    post_unlearn_mean_per_task_bal_acc = float(np.mean(
+                        [v["balanced_accuracy"] for v in post_unlearn_per_task_eval.values()]
+                    ))
+                    post_unlearn_pooled_eval = evaluate_classifier(classifier_wrapper, pooled_X, pooled_y)
+
                     # POST-unlearn perturbed_test_eval (REWORK, pocket-targeted test
                     # poisoning follow-up): same rows/mask logic as perturbed_test_eval
                     # above (isolated to just the poisoned test rows, per earlier task
@@ -2499,6 +2585,9 @@ def main():
                         "forget_set": f_m, "retain_set": r_m,
                         "post_unlearn_this_task_eval": post_unlearn_this_task_eval,
                         "post_unlearn_perturbed_test_eval": post_unlearn_perturbed_test_eval,
+                        "post_unlearn_per_task_eval": post_unlearn_per_task_eval,
+                        "post_unlearn_pooled_eval": post_unlearn_pooled_eval,
+                        "post_unlearn_mean_per_task_balanced_accuracy": post_unlearn_mean_per_task_bal_acc,
                         "prior_tasks_recovery": {
                             "pre_unlearn": pre_unlearn_prior_eval,
                             "post_unlearn": post_unlearn_prior_eval,
