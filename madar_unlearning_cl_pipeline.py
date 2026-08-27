@@ -1392,14 +1392,20 @@ def measure_unlearning_efficacy(model_before, model_after, loader, device):
 # Plots
 # ---------------------------------------------------------------------------
 def plot_task_metrics(results, out_path):
-    """Identical to madar_cl_pipeline.py's plot_task_metrics, title relabeled."""
+    """Identical to madar_cl_pipeline.py's plot_task_metrics, title relabeled, plus
+    a third panel (REWORK, pocket-targeted test poisoning follow-up) showing THIS
+    task's own pocket-targeted test batch accuracy at decision boundary N
+    (pre-unlearning, perturbed_test_eval) vs. decision boundary J (post-unlearning,
+    post_unlearn_perturbed_test_eval) -- the direct before/after comparison on the
+    identical rows, rather than inferring recovery from the whole-test-set
+    post_unlearn_this_task_eval number."""
     task_ids = [r["task_id"] for r in results]
     pooled_bal_acc = [r["pooled_eval"]["balanced_accuracy"] for r in results]
     mean_per_task_bal_acc = [r["mean_per_task_balanced_accuracy"] for r in results]
     train_evasion = [r["red_agent"]["train_evasion_rate"] if r["red_agent"] else None for r in results]
     test_evasion = [r["red_agent"]["test_evasion_rate"] if r["red_agent"] else None for r in results]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 11), sharex=True)
 
     ax1.plot(task_ids, pooled_bal_acc, marker="o", label="pooled balanced accuracy")
     ax1.plot(task_ids, mean_per_task_bal_acc, marker="s", label="mean per-task balanced accuracy")
@@ -1413,12 +1419,36 @@ def plot_task_metrics(results, out_path):
     ys_test = [v for v in test_evasion if v is not None]
     ax2.plot(xs, ys_train, marker="o", color="tab:red", label="evasion rate (train samples)")
     ax2.plot(xs, ys_test, marker="s", color="tab:orange", label="evasion rate (held-out test samples)")
-    ax2.set_xlabel("Task id")
     ax2.set_ylabel("Evasion rate")
     ax2.set_title("Red agent evasion rate per task boundary (task 0 has no red agent)")
     ax2.set_ylim(-0.05, 1.05)
     ax2.legend()
     ax2.grid(alpha=0.3)
+
+    pocket_task_ids, pocket_pre, pocket_post = [], [], []
+    for r in results:
+        t = r["task_id"]
+        pre = r.get("perturbed_test_eval", {}).get(t)
+        u = r.get("unlearning") or {}
+        post = u.get("post_unlearn_perturbed_test_eval", {}).get(t)
+        if pre is not None and post is not None:
+            pocket_task_ids.append(t)
+            pocket_pre.append(pre["balanced_accuracy"])
+            pocket_post.append(post["balanced_accuracy"])
+    if pocket_task_ids:
+        ax3.plot(pocket_task_ids, pocket_pre, marker="o", color="tab:red",
+                  label="pocket-targeted test batch, boundary N (pre-unlearn)")
+        ax3.plot(pocket_task_ids, pocket_post, marker="s", color="tab:green",
+                  label="pocket-targeted test batch, boundary J (post-unlearn)")
+        ax3.set_ylim(-0.05, 1.05)
+    else:
+        ax3.text(0.5, 0.5, "No task ran unlearning with a pocket-targeted test batch yet",
+                  ha="center", va="center", transform=ax3.transAxes)
+    ax3.set_xlabel("Task id")
+    ax3.set_ylabel("Balanced accuracy")
+    ax3.set_title("This task's own pocket-targeted test batch: before vs. after its unlearning step")
+    ax3.legend()
+    ax3.grid(alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
@@ -2210,12 +2240,16 @@ def main():
         # against that task's own poisoned_test_sample_ids), tracked at EVERY
         # checkpoint the same way per_task_eval is -- unlike per_task_eval,
         # which mixes clean+poisoned test rows together. Computed here (step
-        # 2, PRE-unlearning) to match per_task_eval's own timing -- this file
-        # doesn't also log a post-unlearning version of this, mirroring how
-        # per_task_eval itself isn't re-computed post-unlearning either
-        # (post_unlearn_this_task_eval is the only post-unlearning snapshot,
-        # scoped to THIS task only). Omits task j entirely if it has no
-        # poisoned test rows (task 0, or POISON_TEST_DATA off).
+        # 2, PRE-unlearning) to match per_task_eval's own timing. REWORK
+        # (pocket-targeted test poisoning follow-up): a POST-unlearning
+        # version of this exact computation (post_unlearn_perturbed_test_eval)
+        # is now ALSO logged, further below where post_unlearn_this_task_eval
+        # is -- so both decision-boundary-N (this dict) and decision-boundary-J
+        # (the post-unlearn one) accuracy on the identical pocket-targeted
+        # batch are directly comparable, not just inferred from the
+        # whole-test-set post_unlearn_this_task_eval number. Omits task j
+        # entirely if it has no poisoned test rows (task 0, or POISON_TEST_DATA
+        # off).
         task_poisoned_test_gids[t] = poisoned_test_sample_ids
         perturbed_test_eval = {}
         for j in range(t + 1):
@@ -2347,6 +2381,34 @@ def main():
                           f"{per_task_eval[t]['balanced_accuracy']:.4f} -> "
                           f"{post_unlearn_this_task_eval['balanced_accuracy']:.4f}")
 
+                    # POST-unlearn perturbed_test_eval (REWORK, pocket-targeted test
+                    # poisoning follow-up): same rows/mask logic as perturbed_test_eval
+                    # above (isolated to just the poisoned test rows, per earlier task
+                    # j), re-scored against THIS classifier state -- i.e. decision
+                    # boundary J from the pocket-targeting algorithm: A (pre-training)
+                    # -> N (post-CL-training, what perturbed_test_eval above already
+                    # measures) -> J (post-unlearning, measured here). Lets a future
+                    # run check directly whether unlearning recovers accuracy on the
+                    # exact pocket-targeted batch, instead of only inferring it from
+                    # post_unlearn_this_task_eval's whole-test-set number (which mixes
+                    # in clean rows too).
+                    post_unlearn_perturbed_test_eval = {}
+                    for j in range(t + 1):
+                        poisoned_gids_j = set(task_poisoned_test_gids.get(j, []))
+                        if not poisoned_gids_j:
+                            continue
+                        mask = np.isin(task_test_gids[j], list(poisoned_gids_j))
+                        if mask.sum() == 0:
+                            continue
+                        X_test_j, y_test_j = task_test_splits[j]
+                        post_unlearn_perturbed_test_eval[j] = evaluate_classifier(
+                            classifier_wrapper, X_test_j[mask], y_test_j[mask]
+                        )
+                    if t in perturbed_test_eval and t in post_unlearn_perturbed_test_eval:
+                        print(f"    [Pocket-targeted test batch] bal_acc after this task's unlearning: "
+                              f"{perturbed_test_eval[t]['balanced_accuracy']:.4f} -> "
+                              f"{post_unlearn_perturbed_test_eval[t]['balanced_accuracy']:.4f}")
+
                     for tag, m in (("Forget set", f_m), ("Retain set", r_m)):
                         print(f"    [{tag}] acc {m['acc_before']:.4f} -> {m['acc_after']:.4f}, "
                               f"entropy_norm={m['entropy_norm']:.3f}, latent shift "
@@ -2368,6 +2430,7 @@ def main():
                         "unlearn_diagnostics": unlearn_diag,
                         "forget_set": f_m, "retain_set": r_m,
                         "post_unlearn_this_task_eval": post_unlearn_this_task_eval,
+                        "post_unlearn_perturbed_test_eval": post_unlearn_perturbed_test_eval,
                         "prior_tasks_recovery": {
                             "pre_unlearn": pre_unlearn_prior_eval,
                             "post_unlearn": post_unlearn_prior_eval,
