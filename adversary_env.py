@@ -129,7 +129,7 @@ class NetworkAttackEnv(gym.Env):
     The agent applies perturbations to a non-benign sample to fool a classifier into classifying it as benign.
     """
 
-    def __init__(self, classifier, X_data, y_data, benign_label=0, max_steps=25, epsilon=0.25, agent_id=0, contrastive_bank=None, alpha_contrast=0.5, target_margin_confidence=None, shift_reference_classifier=None, pocket_shift_weight=None):
+    def __init__(self, classifier, X_data, y_data, benign_label=0, max_steps=25, epsilon=0.25, agent_id=0, contrastive_bank=None, alpha_contrast=0.5, target_margin_confidence=None, shift_reference_classifier=None, pocket_shift_weight=None, proximity_anchor_X=None, proximity_weight=None, proximity_length_scale=5.0):
         super(NetworkAttackEnv, self).__init__()
         print(f"\n==== Agent Epsilon is -{epsilon} and {epsilon} ===== ")
 
@@ -163,6 +163,26 @@ class NetworkAttackEnv(gym.Env):
         # disables it and reward is unchanged from before.
         self.shift_reference_classifier = shift_reference_classifier
         self.pocket_shift_weight = pocket_shift_weight
+        # REWORK (proximity-anchored pocket targeting): proximity_anchor_X, when
+        # set, is a small array of raw ([0,1]) feature vectors -- typically THIS
+        # task's actual TRAIN-side poisoned exemplars, the exact rows that will
+        # become the forget set. proximity_weight scales a reward bonus that
+        # peaks (at proximity_weight) when the agent's current point sits AT an
+        # anchor and decays smoothly (exp(-nearest_dist / proximity_length_scale))
+        # as it moves away -- pulling this INDEPENDENTLY-trained agent toward the
+        # same neighborhood unlearning will actually correct, without forcing it
+        # to reproduce the exact same perturbation (still a genuinely separate,
+        # RL-discovered attack, still testing real generalization). Both
+        # proximity_anchor_X and proximity_weight must be set together for this
+        # to activate. proximity_length_scale is a first-pass guess (raw feature
+        # space is unnormalized here, so this should be tuned against actually
+        # observed anchor distances for a given dataset).
+        self.proximity_anchor_X = (
+            np.asarray(proximity_anchor_X, dtype=np.float32)
+            if proximity_anchor_X is not None and len(proximity_anchor_X) > 0 else None
+        )
+        self.proximity_weight = proximity_weight
+        self.proximity_length_scale = proximity_length_scale
 
         self.non_benign_indices = np.where(y_data != benign_label)[0]
         feature_dim = X_data.shape[1]  # Ensure action space matches feature dimension
@@ -239,7 +259,18 @@ class NetworkAttackEnv(gym.Env):
             ref_confidence = ref_proba[self.benign_label]
             pocket_term = self.pocket_shift_weight * (confidence - ref_confidence)
 
-        reward = confidence_term + pocket_term - 0.3 * np.linalg.norm(action, ord=2)  # L2 penalty
+        # REWORK (proximity-anchored pocket targeting): bonus that peaks when
+        # the agent's current point sits at (or very near) one of
+        # proximity_anchor_X's rows, decaying smoothly with distance -- pulls
+        # this attack toward the SAME region unlearning will forget. Zero/no-op
+        # unless both proximity_anchor_X and proximity_weight are set.
+        proximity_term = 0.0
+        if self.proximity_anchor_X is not None and self.proximity_weight:
+            dists = np.linalg.norm(self.proximity_anchor_X - self.state.reshape(1, -1), axis=1)
+            nearest_dist = float(dists.min())
+            proximity_term = self.proximity_weight * np.exp(-nearest_dist / self.proximity_length_scale)
+
+        reward = confidence_term + pocket_term + proximity_term - 0.3 * np.linalg.norm(action, ord=2)  # L2 penalty
 
         # Large reward for successful misclassification
         if predicted_label == self.benign_label:

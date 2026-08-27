@@ -279,6 +279,18 @@ POCKET_SHIFT_WEIGHT = 5.0  # REWORK (pocket-targeted test poisoning): weight on
                             # None/0 to disable (falls back to whatever
                             # target_margin_confidence alone produces).
 
+PROXIMITY_WEIGHT = 3.0  # REWORK (proximity-anchored pocket targeting): weight on
+                         # NetworkAttackEnv's proximity_term (see its docstring) for
+                         # red_test_pert_agent/red_test_benign_pert_agent ONLY.
+                         # Identical constant/value to madar_unlearning_cl_pipeline.py's
+                         # (see that file's definition for the full rationale), so both
+                         # pipelines face the same attack -- plain MADAR has no
+                         # unlearning step to anchor toward, but the test-side agent
+                         # construction stays identical between the two files either
+                         # way. Set to None/0 to disable.
+PROXIMITY_LENGTH_SCALE = 5.0  # See madar_unlearning_cl_pipeline.py's definition.
+PROXIMITY_ANCHOR_MAX = 200  # See madar_unlearning_cl_pipeline.py's definition.
+
 # Caps evaluate_agent_on_batch's per-task episode count for runtime; None = every malicious sample.
 MAX_EVAL_SAMPLES_PER_TASK = 5000
 
@@ -480,7 +492,8 @@ RED_AGENT_SEED_OFFSETS = {"train": 0, "test": 100_000, "train_benign": 200_000, 
 
 def train_red_agent_for_task(task_id, agent_type, classifier, X_data, y_data, benign_label, bank, seed, out_dir,
                               target_margin_confidence=None, shift_reference_classifier=None,
-                              pocket_shift_weight=None):
+                              pocket_shift_weight=None, proximity_anchor_X=None, proximity_weight=None,
+                              proximity_length_scale=5.0):
     """
     REWORK: one call per (task, agent_type) pair now, not one call per task.
     agent_type in {"train", "test", "train_benign", "test_benign"} -- the
@@ -529,6 +542,12 @@ def train_red_agent_for_task(task_id, agent_type, classifier, X_data, y_data, be
     docstring. Only meaningful for "test"/"test_benign", passed a FROZEN
     pre-CL-training snapshot by main() (train-side agents have no "before"
     state to compare against, since they're what shifts the boundary).
+
+    proximity_anchor_X/proximity_weight/proximity_length_scale (REWORK,
+    proximity-anchored pocket targeting): forwarded straight to
+    NetworkAttackEnv -- see its docstring. Only meaningful for "test"/
+    "test_benign", passed this task's own TRAIN-side poisoned exemplars by
+    main().
     """
     seed_offset = RED_AGENT_SEED_OFFSETS.get(agent_type, 0)
     agent_id = f"{task_id}_{agent_type}"
@@ -545,6 +564,9 @@ def train_red_agent_for_task(task_id, agent_type, classifier, X_data, y_data, be
             target_margin_confidence=target_margin_confidence,
             shift_reference_classifier=shift_reference_classifier,
             pocket_shift_weight=pocket_shift_weight,
+            proximity_anchor_X=proximity_anchor_X,
+            proximity_weight=proximity_weight,
+            proximity_length_scale=proximity_length_scale,
         )
 
     vec_env = make_vec_env(_thunk, n_envs=1, seed=seed + task_id + seed_offset)
@@ -1454,11 +1476,23 @@ def main():
             # code used to live inside, before the reorder).
             if len(mal_idx_train) > 0:
                 if POISON_TEST_DATA and len(mal_idx_test) > 0:
+                    # REWORK (proximity-anchored pocket targeting): this task's
+                    # own TRAIN-side poisoned malicious exemplars, subsampled to
+                    # PROXIMITY_ANCHOR_MAX. See PROXIMITY_WEIGHT's definition.
+                    mal_anchor_X = X_train_pert[poison_idx]
+                    if len(mal_anchor_X) > PROXIMITY_ANCHOR_MAX:
+                        anchor_rng = np.random.RandomState(args.seed + t + 50_000)
+                        anchor_sel = anchor_rng.choice(len(mal_anchor_X), size=PROXIMITY_ANCHOR_MAX, replace=False)
+                        mal_anchor_X = mal_anchor_X[anchor_sel]
+
                     env_test, agent_test = train_red_agent_for_task(
                         t, "test", classifier_wrapper, X_test, y_test, benign_label, bank, args.seed, out_dir,
                         target_margin_confidence=RED_TARGET_MARGIN_CONFIDENCE,
                         shift_reference_classifier=pre_train_classifier_wrapper,
                         pocket_shift_weight=POCKET_SHIFT_WEIGHT,
+                        proximity_anchor_X=mal_anchor_X,
+                        proximity_weight=PROXIMITY_WEIGHT,
+                        proximity_length_scale=PROXIMITY_LENGTH_SCALE,
                     )
                     X_test_pert, test_evasion_rate, test_rewards, test_avg_norm, test_attacked, evaded_mask_test = \
                         evaluate_agent_on_batch(
@@ -1491,10 +1525,23 @@ def main():
                           f"test_evasion_rate was {test_evasion_rate:.3f}")
 
                 if len(benign_idx_train) > 0 and POISON_TEST_DATA and len(benign_idx_test) > 0:
+                    # REWORK (proximity-anchored pocket targeting): mirror of
+                    # mal_anchor_X above, on the benign side.
+                    benign_anchor_X = X_train_pert_benign[poison_idx_benign]
+                    if len(benign_anchor_X) > PROXIMITY_ANCHOR_MAX:
+                        anchor_rng_benign = np.random.RandomState(args.seed + t + 60_000)
+                        anchor_sel_benign = anchor_rng_benign.choice(
+                            len(benign_anchor_X), size=PROXIMITY_ANCHOR_MAX, replace=False
+                        )
+                        benign_anchor_X = benign_anchor_X[anchor_sel_benign]
+
                     env_test_benign, agent_test_benign = train_red_agent_for_task(
                         t, "test_benign", classifier_wrapper, X_test, y_test, mal_label, bank, args.seed, out_dir,
                         shift_reference_classifier=pre_train_classifier_wrapper,
                         pocket_shift_weight=POCKET_SHIFT_WEIGHT,
+                        proximity_anchor_X=benign_anchor_X,
+                        proximity_weight=PROXIMITY_WEIGHT,
+                        proximity_length_scale=PROXIMITY_LENGTH_SCALE,
                     )
                     (X_test_pert_benign, test_evasion_rate_benign, test_rewards_benign, test_avg_norm_benign,
                      test_attacked_benign, evaded_mask_test_benign) = evaluate_agent_on_batch(
