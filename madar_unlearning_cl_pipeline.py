@@ -1157,6 +1157,99 @@ def evaluate_classifier(classifier, X, y):
 
 
 # ---------------------------------------------------------------------------
+# TEMPORARY DIAGNOSTIC (pocket-targeting investigation) -- see module-level
+# pocket_diag_log_path's header comment in main() for context on why this
+# exists. Not part of the pipeline's normal metrics.
+# ---------------------------------------------------------------------------
+def write_pocket_targeting_diagnostic(log_path, task_id, entries, unlearning_ran,
+                                       benign_label, mal_label):
+    """
+    Appends one human-readable section to `log_path` for this task's
+    test-side perturbed samples (both malicious_perturbed and
+    benign_perturbed). `entries` is a list of dicts, each:
+        {"gid": int, "group": "malicious_perturbed"|"benign_perturbed",
+         "true_label": int, "c1_pred": int, "c2_pred": int, "c3_pred": int}
+    C1/C2/C3 are as defined in the log's header (see main()): C1 = classifier
+    at the end of the previous task, C2 = after this task's CL training
+    (before unlearning), C3 = after this task's unlearning step (or the same
+    model as C2, unchanged, if unlearning did not run this task).
+
+    This function only reads/formats -- it never decides what "success"
+    means, since that's the judgment call this diagnostic exists to inform.
+    It does group entries by (C1,C2,C3) correctness pattern in the summary,
+    since eyeballing that distribution directly answers:
+      - "correct -> WRONG -> correct" count: pocket-targeting AND unlearning
+        both worked as intended on these samples.
+      - "correct -> WRONG -> WRONG" count: pocket-targeting found a real
+        pocket, but unlearning failed to recover it.
+      - "correct -> correct -> *" count: this task's poisoned training didn't
+        actually move the boundary through this exact point -- pocket-
+        targeting missed (unlearning has nothing to recover here regardless).
+      - any pattern starting "WRONG -> ...": C1 itself already misclassified
+        this sample -- a pre-existing error unrelated to this task's
+        poisoning, not informative for this diagnosis.
+    """
+    if not entries:
+        with open(log_path, "a") as f:
+            f.write(f"--- Task {task_id} " + "-" * 50 + "\n"
+                    "No test-side perturbed samples this task (no red agents ran, "
+                    "POISON_TEST_DATA off, or nothing evaded) -- nothing to check.\n\n")
+        return
+
+    def _fmt(pred, true_label):
+        correct = (pred == true_label)
+        tag = "correct" if correct else "WRONG  "
+        return tag, correct
+
+    pattern_counts = {}
+    lines_by_group = {"malicious_perturbed": [], "benign_perturbed": []}
+    for e in entries:
+        true_label = e["true_label"]
+        true_name = "malicious" if true_label == mal_label else "benign"
+        c1_tag, c1_ok = _fmt(e["c1_pred"], true_label)
+        c2_tag, c2_ok = _fmt(e["c2_pred"], true_label)
+        c3_tag, c3_ok = _fmt(e["c3_pred"], true_label)
+        pattern = f"{'correct' if c1_ok else 'WRONG'} -> {'correct' if c2_ok else 'WRONG'} -> {'correct' if c3_ok else 'WRONG'}"
+        pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
+
+        pred_name = lambda p: "malicious" if p == mal_label else "benign"
+        lines_by_group[e["group"]].append(
+            f"    gid={e['gid']:<8} true={true_name:<9} "
+            f"C1={c1_tag}(pred={pred_name(e['c1_pred'])})  "
+            f"C2={c2_tag}(pred={pred_name(e['c2_pred'])})  "
+            f"C3={c3_tag}(pred={pred_name(e['c3_pred'])})"
+        )
+
+    n_mal = len(lines_by_group["malicious_perturbed"])
+    n_ben = len(lines_by_group["benign_perturbed"])
+
+    with open(log_path, "a") as f:
+        f.write(f"--- Task {task_id} (unlearning ran this task: {unlearning_ran}) " + "-" * 20 + "\n")
+        f.write(f"{len(entries)} total perturbed test samples "
+                f"({n_mal} malicious_perturbed, {n_ben} benign_perturbed)\n\n")
+        f.write("Summary by C1 -> C2 -> C3 correctness pattern:\n")
+        for pattern, count in sorted(pattern_counts.items(), key=lambda kv: -kv[1]):
+            note = ""
+            if pattern == "correct -> WRONG -> correct":
+                note = "  <- pocket-targeting AND unlearning working as intended"
+            elif pattern == "correct -> WRONG -> WRONG":
+                note = "  <- pocket found, but unlearning failed to recover it"
+            elif pattern.startswith("correct -> correct"):
+                note = "  <- boundary didn't move here -- pocket-targeting missed"
+            elif pattern.startswith("WRONG"):
+                note = "  <- C1 was already wrong here (pre-existing error, not this task's doing)"
+            f.write(f"  {pattern:<30}: {count:>4}{note}\n")
+        f.write("\n")
+
+        if lines_by_group["malicious_perturbed"]:
+            f.write(f"  Malicious-perturbed samples ({n_mal}):\n")
+            f.write("\n".join(lines_by_group["malicious_perturbed"]) + "\n\n")
+        if lines_by_group["benign_perturbed"]:
+            f.write(f"  Benign-perturbed samples ({n_ben}):\n")
+            f.write("\n".join(lines_by_group["benign_perturbed"]) + "\n\n")
+
+
+# ---------------------------------------------------------------------------
 # Step 3 -- forget-set construction, PERTURBATION-CLASSIFIER REWORK (see
 # module docstring). Replaces the old detect_poison_oracle/ORACLE_FORGET_FRACTION
 # entirely -- oracle ground truth (poison_idx) is now used only to SEED a
@@ -1862,6 +1955,40 @@ def main():
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
 
+    # TEMPORARY DIAGNOSTIC (pocket-targeting investigation): separate,
+    # human-readable log checking whether red_test_pert_agent/
+    # red_test_benign_pert_agent are actually landing where the boundary
+    # moves, and whether unlearning recovers accuracy there. See
+    # write_pocket_targeting_diagnostic()'s docstring for the full field
+    # definitions. Not part of the pipeline's normal metrics -- delete this
+    # file/call sites once the investigation concludes.
+    pocket_diag_log_path = os.path.join(out_dir, "logs", "pocket_targeting_diagnostic.txt")
+    with open(pocket_diag_log_path, "w") as f:
+        f.write(
+            "POCKET-TARGETING DIAGNOSTIC LOG\n"
+            "================================\n"
+            "Checks whether red_test_pert_agent/red_test_benign_pert_agent are landing\n"
+            "where the decision boundary actually moves, and whether unlearning recovers\n"
+            "accuracy on those exact points. One section per task (tasks > 0 only -- task 0\n"
+            "has no red agents/perturbed test samples).\n\n"
+            "Three classifier snapshots, all scored on the SAME perturbed test sample:\n"
+            "  C1 = classifier at the END of the PREVIOUS task -- this is the exact\n"
+            "       classifier state red_test_pert_agent/red_test_benign_pert_agent\n"
+            "       perturbed this sample against.\n"
+            "  C2 = classifier AFTER this task's CL training (ER+KD+SI), BEFORE this\n"
+            "       task's unlearning step. If pocket-targeting worked, this is where a\n"
+            "       sample that C1 got right should flip to wrong -- i.e. this task's own\n"
+            "       poisoned training moved the boundary through this exact point.\n"
+            "  C3 = classifier AFTER this task's unlearning step. If unlearning worked,\n"
+            "       a sample that flipped wrong at C2 should flip back to correct here.\n"
+            "       If unlearning did NOT run this task (no forget set found), C3 is the\n"
+            "       same model as C2 -- logged as 'unlearning ran: False' in the section\n"
+            "       header so a C2==C3 result isn't mistaken for a failed recovery.\n"
+            "'correct'/'WRONG' always means: does the prediction match the sample's TRUE\n"
+            "(pre-perturbation) label -- malicious for malicious_perturbed rows, benign for\n"
+            "benign_perturbed rows.\n\n"
+        )
+
     print(f"Loading {args.h5_path} and building {NUM_TASKS} pooled chronological tasks...")
     tasks, day_mapping, label_mapping = load_pooled_chronological_tasks(args.h5_path, TASK_FRACTIONS)
     benign_label = label_mapping["Benign"]
@@ -2139,6 +2266,14 @@ def main():
 
         unlearning_metrics = None
 
+        # TEMPORARY DIAGNOSTIC (pocket-targeting investigation): populated
+        # below (step 2 area) with C1/C2 predictions, then C3 filled in near
+        # the end of the loop body. Declared here so it's always defined,
+        # even for t==0 (no red agents -> stays empty -> logged as "nothing
+        # to check" by write_pocket_targeting_diagnostic).
+        pocket_diag_entries = []
+        unlearning_ran_this_task = False
+
         # ============================================================
         # 1. TRAIN on this task's train split.
         # ============================================================
@@ -2402,6 +2537,41 @@ def main():
               f"pooled bal_acc={pooled_eval['balanced_accuracy']:.4f} "
               f"mean-per-task bal_acc={mean_per_task_bal_acc:.4f}")
 
+        # TEMPORARY DIAGNOSTIC (pocket-targeting investigation), C1/C2 capture:
+        # `classifier_wrapper` right now IS C2 (post-CL-training this task,
+        # pre-unlearning -- nothing has touched `model` since train_cl_er/the
+        # omega update above). `pre_train_classifier_wrapper` (captured before
+        # train_cl_er, in the t>0 branch of step 1 above) is C1. Both are
+        # frozen/live at exactly the point pocket-targeting is meant to check:
+        # did this task's own poisoned training flip a sample C1 got right?
+        # task_test_splits[t] already reflects this task's test-side poisoning
+        # (X_test was overwritten in place at the poison indices, same array
+        # positions as poison_idx_test/poison_idx_test_benign below).
+        if t > 0:
+            X_test_diag, _ = task_test_splits[t]
+            if len(poison_idx_test) > 0:
+                X_mal_pert_diag = X_test_diag[poison_idx_test]
+                c1_mal = pre_train_classifier_wrapper.predict(X_mal_pert_diag)
+                c2_mal = classifier_wrapper.predict(X_mal_pert_diag)
+                for local_i, idx in enumerate(poison_idx_test):
+                    pocket_diag_entries.append({
+                        "gid": int(gid_test[idx]), "group": "malicious_perturbed",
+                        "true_label": int(mal_label),
+                        "c1_pred": int(c1_mal[local_i]), "c2_pred": int(c2_mal[local_i]),
+                        "c3_pred": None,
+                    })
+            if len(poison_idx_test_benign) > 0:
+                X_ben_pert_diag = X_test_diag[poison_idx_test_benign]
+                c1_ben = pre_train_classifier_wrapper.predict(X_ben_pert_diag)
+                c2_ben = classifier_wrapper.predict(X_ben_pert_diag)
+                for local_i, idx in enumerate(poison_idx_test_benign):
+                    pocket_diag_entries.append({
+                        "gid": int(gid_test[idx]), "group": "benign_perturbed",
+                        "true_label": int(benign_label),
+                        "c1_pred": int(c1_ben[local_i]), "c2_pred": int(c2_ben[local_i]),
+                        "c3_pred": None,
+                    })
+
         # ============================================================
         # 3. FORGET SET POPULATION -- build_perturbation_classifier_forget_set
         # trains a small 3-class RandomForest per task on PERTURBATION_
@@ -2484,6 +2654,7 @@ def main():
                         epochs=UNLEARN_EPOCHS, lr=UNLEARN_LR, alpha=UNLEARN_ALPHA, device=DEVICE,
                     )
                     grad_steps += UNLEARN_EPOCHS * len(forget_loader)
+                    unlearning_ran_this_task = True  # TEMPORARY DIAGNOSTIC (pocket-targeting)
                     print(f"    [Unlearn diag] omega_l2={unlearn_diag['omega_l2_norm']:.3f}, raw losses "
                           f"forget={unlearn_diag['raw_forget_loss_mean']:.4f} "
                           f"retain={unlearn_diag['raw_retain_loss_mean']:.4f} "
@@ -2757,6 +2928,31 @@ def main():
                     "benign": int(len(historical_clean_benign_pool)),
                 }
 
+        # TEMPORARY DIAGNOSTIC (pocket-targeting investigation), C3 fill-in:
+        # `classifier_wrapper` now reflects the FINAL model state for this
+        # task -- post-unlearning if it ran (unlearning_ran_this_task=True),
+        # otherwise identical to C2 (nothing touched `model` since the C1/C2
+        # capture above). Reuses the same poison_idx_test/poison_idx_test_benign
+        # positional indices as the C1/C2 capture (task_test_splits[t]'s row
+        # order is unchanged since then -- only values were overwritten, never
+        # reordered), so no gid re-lookup is needed.
+        if pocket_diag_entries:
+            X_test_diag, _ = task_test_splits[t]
+            c3_mal = classifier_wrapper.predict(X_test_diag[poison_idx_test]) if len(poison_idx_test) > 0 else None
+            c3_ben = classifier_wrapper.predict(X_test_diag[poison_idx_test_benign]) \
+                if len(poison_idx_test_benign) > 0 else None
+            mal_i = ben_i = 0
+            for e in pocket_diag_entries:
+                if e["group"] == "malicious_perturbed":
+                    e["c3_pred"] = int(c3_mal[mal_i]); mal_i += 1
+                else:
+                    e["c3_pred"] = int(c3_ben[ben_i]); ben_i += 1
+
+        write_pocket_targeting_diagnostic(
+            pocket_diag_log_path, t, pocket_diag_entries, unlearning_ran_this_task,
+            benign_label, mal_label,
+        )
+
         # p_old_task updated to the FINAL (post-unlearning, if it ran this task)
         # weights, for ALL tasks -- ready as next task's start-of-task SI anchor.
         for n, p in model.named_parameters():
@@ -2788,6 +2984,16 @@ def main():
             "replay_buffer_composition": buffer_summary,
             "unlearning": unlearning_metrics,
         })
+
+        # TEMPORARY DIAGNOSTIC (pocket-targeting investigation): pause at the
+        # end of every task after task 2, so pocket_diag_entries / the
+        # written log section / any live variable above can be inspected
+        # interactively before the run continues into the next task. Remove
+        # once the investigation concludes.
+        if t > 2:
+            print(f"[Diagnostic] Pausing at breakpoint() after task {t} -- "
+                  f"see {pocket_diag_log_path} for this task's pocket-targeting section.")
+            breakpoint()
 
     config = {
         "strategy": "madar_er_kd_si_plus_unlearning",
