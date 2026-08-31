@@ -42,12 +42,11 @@ python joint_cl_pipeline.py --seed 42 --log_name joint2                       Jo
 
 
 
-fill replay buffer with not pertrubed samples for MADR+U
+python compare_cl_runs.py  runs/madar_unlearning/madar_u_dual_agent/madar_u_dual_agent.json  runs/madar/madar_dual_agent1/madar_dual_agent1.json --out madar_dual_v_madaru_dual.png  --include_table
+python compare_cl_runs.py runs/madar_unlearning/madar_active1/madar_active1.json runs/madar_unlearning/madar_active2/madar_active2.json --out madaru_active2_v_madaru_active3.png  --include_table
 
 
- python compare_cl_runs.py  runs/madar_unlearning/madar_u_dual_agent/madar_u_dual_agent.json  runs/madar/madar_dual_agent1/madar_dual_agent1.json --out madar_dual_v_madaru_dual.png  --include_table
-
-conda
+python3 madar_unlearning_cl_pipeline.py --log_name pocket_targeting_diag_run  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
 
 
 Tasks:
