@@ -129,7 +129,7 @@ class NetworkAttackEnv(gym.Env):
     The agent applies perturbations to a non-benign sample to fool a classifier into classifying it as benign.
     """
 
-    def __init__(self, classifier, X_data, y_data, benign_label=0, max_steps=25, epsilon=0.25, agent_id=0, contrastive_bank=None, alpha_contrast=0.5, target_margin_confidence=None, shift_reference_classifier=None, pocket_shift_weight=None, proximity_anchor_X=None, proximity_weight=None, proximity_length_scale=5.0):
+    def __init__(self, classifier, X_data, y_data, benign_label=0, max_steps=25, epsilon=0.25, agent_id=0, contrastive_bank=None, alpha_contrast=0.5, target_margin_confidence=None, shift_reference_classifier=None, pocket_shift_weight=None, proximity_anchor_X=None, proximity_weight=None, proximity_length_scale=5.0, allowed_start_indices=None):
         super(NetworkAttackEnv, self).__init__()
         print(f"\n==== Agent Epsilon is -{epsilon} and {epsilon} ===== ")
 
@@ -184,7 +184,22 @@ class NetworkAttackEnv(gym.Env):
         self.proximity_weight = proximity_weight
         self.proximity_length_scale = proximity_length_scale
 
-        self.non_benign_indices = np.where(y_data != benign_label)[0]
+        # PROTOTYPE (C1-correct-only sampling): allowed_start_indices, when
+        # set, restricts reset() to picking its starting row from this array
+        # instead of every same-label row in X_data/y_data. X_data/y_data
+        # themselves stay full-size and unchanged -- callers pass e.g. the
+        # subset of mal_idx_train/mal_idx_test whose ORIGINAL (pre-
+        # perturbation) row a reference classifier already gets right, so
+        # every episode starts from a genuinely "was correct" state instead
+        # of a uniformly-random one. Deliberately intersected with the
+        # label-derived indices (not just used standalone) so a caller
+        # passing a stale/mismatched index array can't accidentally start
+        # an episode on a benign row inside the "non-benign" env, etc.
+        label_indices = np.where(y_data != benign_label)[0]
+        if allowed_start_indices is not None and len(allowed_start_indices) > 0:
+            self.non_benign_indices = np.intersect1d(label_indices, np.asarray(allowed_start_indices))
+        else:
+            self.non_benign_indices = label_indices
         feature_dim = X_data.shape[1]  # Ensure action space matches feature dimension
 
         self.observation_space = spaces.Box(low=0, high=1, shape=(feature_dim,), dtype=np.float32)
