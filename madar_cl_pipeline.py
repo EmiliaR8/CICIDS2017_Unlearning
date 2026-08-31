@@ -496,10 +496,36 @@ def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
 RED_AGENT_SEED_OFFSETS = {"train": 0, "test": 100_000, "train_benign": 200_000, "test_benign": 300_000}
 
 
+def c1_correct_pool(classifier_c1, X_full, idx_pool, target_label, task_id, agent_label):
+    """
+    PROTOTYPE (C1-correct-only sampling): narrows idx_pool (indices into
+    X_full, e.g. mal_idx_train/mal_idx_test/benign_idx_train/benign_idx_test)
+    down to the subset that classifier_c1 -- the classifier state a red
+    agent's episodes are meant to be judged against as "before" -- already
+    classifies as target_label. Passed to train_red_agent_for_task as
+    allowed_start_indices, so every episode starts from a genuinely "was
+    correct under C1" row instead of a uniformly-random one.
+
+    Kept byte-for-byte in step with madar_unlearning_cl_pipeline.py's copy
+    of this function (minus the diagnostic-log write, which only exists over
+    there) -- see the module docstring's note on why poisoning must stay
+    identical between the two pipelines. Logs the raw pool size to the
+    console either way, purely as data for recalibrating the minimum-pool
+    fallback threshold later.
+    """
+    if len(idx_pool) == 0:
+        return idx_pool
+    preds = classifier_c1.predict(X_full[idx_pool])
+    correct_pool = idx_pool[preds == target_label]
+    print(f"    [C1-pool] Task {task_id} {agent_label}: {len(correct_pool)}/{len(idx_pool)} "
+          f"candidates are C1-correct.")
+    return correct_pool
+
+
 def train_red_agent_for_task(task_id, agent_type, classifier, X_data, y_data, benign_label, bank, seed, out_dir,
                               target_margin_confidence=None, shift_reference_classifier=None,
                               pocket_shift_weight=None, proximity_anchor_X=None, proximity_weight=None,
-                              proximity_length_scale=5.0):
+                              proximity_length_scale=5.0, allowed_start_indices=None):
     """
     REWORK: one call per (task, agent_type) pair now, not one call per task.
     agent_type in {"train", "test", "train_benign", "test_benign"} -- the
@@ -573,6 +599,7 @@ def train_red_agent_for_task(task_id, agent_type, classifier, X_data, y_data, be
             proximity_anchor_X=proximity_anchor_X,
             proximity_weight=proximity_weight,
             proximity_length_scale=proximity_length_scale,
+            allowed_start_indices=allowed_start_indices,
         )
 
     vec_env = make_vec_env(_thunk, n_envs=1, seed=seed + task_id + seed_offset)
@@ -1271,38 +1298,71 @@ def main():
                 # only ever perturbs test data. See train_red_agent_for_task's
                 # docstring for why this also fixes a latent env/data mismatch
                 # bug in the old single-agent design.
-                env_train, agent_train = train_red_agent_for_task(
-                    t, "train", classifier_wrapper, X_train, y_train, benign_label, bank, args.seed, out_dir,
-                    target_margin_confidence=RED_TARGET_MARGIN_CONFIDENCE,
+                # PROTOTYPE (C1-correct-only sampling): classifier_wrapper right
+                # here IS C1 -- nothing has trained this task yet. Restrict the
+                # train-side malicious agent's starting pool to rows C1 already
+                # gets right, so this task's poisoning has to move the boundary
+                # through a genuinely correct point instead of just reinforcing
+                # an already-wrong one. See c1_correct_pool()'s docstring. Kept
+                # in step with madar_unlearning_cl_pipeline.py's identical filter
+                # -- see module docstring's note on why poisoning must stay
+                # identical between the two pipelines.
+                mal_idx_train_c1 = c1_correct_pool(
+                    classifier_wrapper, X_train, mal_idx_train, mal_label, t, "train-side malicious",
                 )
-                X_train_pert, train_evasion_rate, train_rewards, train_avg_norm, train_attacked, evaded_mask = \
-                    evaluate_agent_on_batch(
-                        env_train, agent_train, X_train, y_train, benign_label,
-                        only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                if len(mal_idx_train_c1) == 0:
+                    warnings_log.append(
+                        f"Task {t}: no C1-correct malicious training candidates, "
+                        f"skipping red_train_pert_agent."
                     )
+                    # Placeholder so the test-side proximity-anchor lookup below
+                    # (X_train_pert[poison_idx]) stays safe -- poison_idx is still
+                    # the empty array initialized at the top of the loop.
+                    X_train_pert = X_train.copy()
+                    # red_report defaults to None (see top of loop) and is only
+                    # ever built as a dict inside the "agent ran" branch below --
+                    # the benign block further down now runs independently of
+                    # whether THIS branch ran, and writes into red_report
+                    # unconditionally, so it must already be a dict by then.
+                    red_report = {}
+                else:
+                    env_train, agent_train = train_red_agent_for_task(
+                        t, "train", classifier_wrapper, X_train, y_train, benign_label, bank, args.seed, out_dir,
+                        target_margin_confidence=RED_TARGET_MARGIN_CONFIDENCE,
+                        allowed_start_indices=mal_idx_train_c1,
+                    )
+                    X_train_pert, train_evasion_rate, train_rewards, train_avg_norm, train_attacked, evaded_mask = \
+                        evaluate_agent_on_batch(
+                            env_train, agent_train, X_train, y_train, benign_label,
+                            only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                        )
 
-                red_report = {
-                    "train_evasion_rate": train_evasion_rate, "train_attacked": train_attacked,
-                    "train_avg_reward": float(np.mean(train_rewards)) if train_rewards else 0.0,
-                    "train_avg_pert_l2": train_avg_norm,
-                }
-                print(f"[Task {t} red_train_pert_agent] train_evasion={train_evasion_rate:.3f} "
-                      f"avg_pert_L2={train_avg_norm:.3f}")
+                    red_report = {
+                        "train_evasion_rate": train_evasion_rate, "train_attacked": train_attacked,
+                        "train_avg_reward": float(np.mean(train_rewards)) if train_rewards else 0.0,
+                        "train_avg_pert_l2": train_avg_norm,
+                    }
+                    print(f"[Task {t} red_train_pert_agent] train_evasion={train_evasion_rate:.3f} "
+                          f"avg_pert_L2={train_avg_norm:.3f}")
 
-                poison_fraction_train = poison_fraction_for_task(
-                    t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
-                )
-                poison_pool = np.where(evaded_mask)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_train
-                n_to_poison = min(int(round(poison_fraction_train * len(mal_idx_train))), len(poison_pool))
-                rng = np.random.RandomState(args.seed + t)
-                poison_idx = rng.choice(poison_pool, size=n_to_poison, replace=False) if n_to_poison > 0 else \
-                    np.array([], dtype=int)
-                n_poisoned = len(poison_idx)
+                    poison_fraction_train = poison_fraction_for_task(
+                        t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
+                    )
+                    poison_pool = np.where(evaded_mask)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_train_c1
+                    n_to_poison = min(int(round(poison_fraction_train * len(mal_idx_train))), len(poison_pool))
+                    rng = np.random.RandomState(args.seed + t)
+                    poison_idx = rng.choice(poison_pool, size=n_to_poison, replace=False) if n_to_poison > 0 else \
+                        np.array([], dtype=int)
+                    n_poisoned = len(poison_idx)
 
+                    print(f"[Task {t}] poisoned {n_poisoned}/{len(mal_idx_train)} malicious train samples "
+                          f"(poison_fraction_train={poison_fraction_train:.3f})")
+
+                # Applies uniformly whether or not the agent above ran -- poison_idx
+                # is the empty array from the top of the loop in the skip case, so
+                # this is a no-op then.
                 X_train_for_classifier = X_train.copy()
                 X_train_for_classifier[poison_idx] = X_train_pert[poison_idx]
-                print(f"[Task {t}] poisoned {n_poisoned}/{len(mal_idx_train)} malicious train samples "
-                      f"(poison_fraction_train={poison_fraction_train:.3f})")
 
                 # TEST-SIDE poisoning (POISON_TEST_DATA -- see module docstring
                 # BRANCH NOTE and POISON_TEST_DATA's definition for why).
@@ -1329,38 +1389,57 @@ def main():
                 # confidence-maximizing evasion.
                 if len(benign_idx_train) == 0:
                     warnings_log.append(f"Task {t}: no benign training samples, skipping benign red agents.")
+                    X_train_pert_benign = X_train.copy()  # placeholder, mirrors the malicious side
                 else:
-                    env_train_benign, agent_train_benign = train_red_agent_for_task(
-                        t, "train_benign", classifier_wrapper, X_train, y_train, mal_label, bank, args.seed, out_dir,
+                    # PROTOTYPE (C1-correct-only sampling): same reasoning as the
+                    # malicious side above, checked independently -- an empty
+                    # malicious pool should not also skip the benign agent, and
+                    # vice versa.
+                    benign_idx_train_c1 = c1_correct_pool(
+                        classifier_wrapper, X_train, benign_idx_train, benign_label, t, "train-side benign",
                     )
-                    (X_train_pert_benign, train_evasion_rate_benign, train_rewards_benign, train_avg_norm_benign,
-                     train_attacked_benign, evaded_mask_benign) = evaluate_agent_on_batch(
-                        env_train_benign, agent_train_benign, X_train, y_train, mal_label,
-                        only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
-                    )
+                    if len(benign_idx_train_c1) == 0:
+                        warnings_log.append(
+                            f"Task {t}: no C1-correct benign training candidates, "
+                            f"skipping red_train_benign_pert_agent."
+                        )
+                        X_train_pert_benign = X_train.copy()
+                    else:
+                        env_train_benign, agent_train_benign = train_red_agent_for_task(
+                            t, "train_benign", classifier_wrapper, X_train, y_train, mal_label, bank, args.seed, out_dir,
+                            allowed_start_indices=benign_idx_train_c1,
+                        )
+                        (X_train_pert_benign, train_evasion_rate_benign, train_rewards_benign, train_avg_norm_benign,
+                         train_attacked_benign, evaded_mask_benign) = evaluate_agent_on_batch(
+                            env_train_benign, agent_train_benign, X_train, y_train, mal_label,
+                            only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                        )
 
-                    red_report["train_benign_evasion_rate"] = train_evasion_rate_benign
-                    red_report["train_benign_attacked"] = train_attacked_benign
-                    red_report["train_benign_avg_reward"] = float(np.mean(train_rewards_benign)) if train_rewards_benign else 0.0
-                    red_report["train_benign_avg_pert_l2"] = train_avg_norm_benign
-                    print(f"[Task {t} red_train_benign_pert_agent] train_evasion={train_evasion_rate_benign:.3f} "
-                          f"avg_pert_L2={train_avg_norm_benign:.3f}")
+                        red_report["train_benign_evasion_rate"] = train_evasion_rate_benign
+                        red_report["train_benign_attacked"] = train_attacked_benign
+                        red_report["train_benign_avg_reward"] = float(np.mean(train_rewards_benign)) if train_rewards_benign else 0.0
+                        red_report["train_benign_avg_pert_l2"] = train_avg_norm_benign
+                        print(f"[Task {t} red_train_benign_pert_agent] train_evasion={train_evasion_rate_benign:.3f} "
+                              f"avg_pert_L2={train_avg_norm_benign:.3f}")
 
-                    poison_fraction_train_benign = poison_fraction_for_task(
-                        t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
-                    )
-                    poison_pool_benign = np.where(evaded_mask_benign)[0] if REQUIRE_EVASION_SUCCESS else benign_idx_train
-                    n_to_poison_benign = min(
-                        int(round(poison_fraction_train_benign * len(benign_idx_train))), len(poison_pool_benign)
-                    )
-                    rng_benign = np.random.RandomState(args.seed + t + 20_000)  # distinct stream from mal train/test rngs
-                    poison_idx_benign = rng_benign.choice(poison_pool_benign, size=n_to_poison_benign, replace=False) \
-                        if n_to_poison_benign > 0 else np.array([], dtype=int)
-                    n_poisoned_benign = len(poison_idx_benign)
+                        poison_fraction_train_benign = poison_fraction_for_task(
+                            t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
+                        )
+                        poison_pool_benign = np.where(evaded_mask_benign)[0] if REQUIRE_EVASION_SUCCESS \
+                            else benign_idx_train_c1
+                        n_to_poison_benign = min(
+                            int(round(poison_fraction_train_benign * len(benign_idx_train))), len(poison_pool_benign)
+                        )
+                        rng_benign = np.random.RandomState(args.seed + t + 20_000)  # distinct stream from mal train/test rngs
+                        poison_idx_benign = rng_benign.choice(poison_pool_benign, size=n_to_poison_benign, replace=False) \
+                            if n_to_poison_benign > 0 else np.array([], dtype=int)
+                        n_poisoned_benign = len(poison_idx_benign)
 
+                        print(f"[Task {t}] poisoned {n_poisoned_benign}/{len(benign_idx_train)} benign train samples "
+                              f"(poison_fraction_train_benign={poison_fraction_train_benign:.3f})")
+
+                    # Applies uniformly whether or not the agent above ran.
                     X_train_for_classifier[poison_idx_benign] = X_train_pert_benign[poison_idx_benign]
-                    print(f"[Task {t}] poisoned {n_poisoned_benign}/{len(benign_idx_train)} benign train samples "
-                          f"(poison_fraction_train_benign={poison_fraction_train_benign:.3f})")
 
                     # TEST-SIDE (REWORK, pocket-targeted test poisoning): moved to
                     # after CL training, mirroring the malicious side -- see the
@@ -1485,110 +1564,139 @@ def main():
             # code used to live inside, before the reorder).
             if len(mal_idx_train) > 0:
                 if POISON_TEST_DATA and len(mal_idx_test) > 0:
-                    # REWORK (proximity-anchored pocket targeting): this task's
-                    # own TRAIN-side poisoned malicious exemplars, subsampled to
-                    # PROXIMITY_ANCHOR_MAX. See PROXIMITY_WEIGHT's definition.
-                    mal_anchor_X = X_train_pert[poison_idx]
-                    if len(mal_anchor_X) > PROXIMITY_ANCHOR_MAX:
-                        anchor_rng = np.random.RandomState(args.seed + t + 50_000)
-                        anchor_sel = anchor_rng.choice(len(mal_anchor_X), size=PROXIMITY_ANCHOR_MAX, replace=False)
-                        mal_anchor_X = mal_anchor_X[anchor_sel]
-
-                    env_test, agent_test = train_red_agent_for_task(
-                        t, "test", classifier_wrapper, X_test, y_test, benign_label, bank, args.seed, out_dir,
-                        target_margin_confidence=RED_TARGET_MARGIN_CONFIDENCE,
-                        shift_reference_classifier=pre_train_classifier_wrapper,
-                        pocket_shift_weight=POCKET_SHIFT_WEIGHT,
-                        proximity_anchor_X=mal_anchor_X,
-                        proximity_weight=PROXIMITY_WEIGHT,
-                        proximity_length_scale=PROXIMITY_LENGTH_SCALE,
+                    # PROTOTYPE (C1-correct-only sampling): pre_train_classifier_wrapper
+                    # is C1 here -- the exact "before" reference this agent's pockets
+                    # are meant to be judged against. Restrict red_test_pert_agent's
+                    # starting pool to test rows C1 already gets right, same
+                    # reasoning as the train-side filter above.
+                    mal_idx_test_c1 = c1_correct_pool(
+                        pre_train_classifier_wrapper, X_test, mal_idx_test, mal_label, t, "test-side malicious",
                     )
-                    X_test_pert, test_evasion_rate, test_rewards, test_avg_norm, test_attacked, evaded_mask_test = \
-                        evaluate_agent_on_batch(
-                            env_test, agent_test, X_test, y_test, benign_label,
-                            only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                    if len(mal_idx_test_c1) == 0:
+                        warnings_log.append(
+                            f"Task {t}: no C1-correct malicious test candidates, "
+                            f"skipping red_test_pert_agent."
                         )
-                    red_report["test_evasion_rate"] = test_evasion_rate
-                    red_report["test_attacked"] = test_attacked
-                    red_report["test_avg_reward"] = float(np.mean(test_rewards)) if test_rewards else 0.0
-                    red_report["test_avg_pert_l2"] = test_avg_norm
-                    print(f"[Task {t} red_test_pert_agent] test_evasion={test_evasion_rate:.3f} "
-                          f"avg_pert_L2={test_avg_norm:.3f}")
+                    else:
+                        # REWORK (proximity-anchored pocket targeting): this task's
+                        # own TRAIN-side poisoned malicious exemplars, subsampled to
+                        # PROXIMITY_ANCHOR_MAX. See PROXIMITY_WEIGHT's definition.
+                        mal_anchor_X = X_train_pert[poison_idx]
+                        if len(mal_anchor_X) > PROXIMITY_ANCHOR_MAX:
+                            anchor_rng = np.random.RandomState(args.seed + t + 50_000)
+                            anchor_sel = anchor_rng.choice(len(mal_anchor_X), size=PROXIMITY_ANCHOR_MAX, replace=False)
+                            mal_anchor_X = mal_anchor_X[anchor_sel]
 
-                    poison_fraction_test = poison_fraction_for_task(
-                        t, POISON_FRACTION_TEST_START, POISON_FRACTION_TEST_END
-                    )
-                    poison_pool_test = np.where(evaded_mask_test)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_test
-                    n_to_poison_test = min(int(round(poison_fraction_test * len(mal_idx_test))), len(poison_pool_test))
-                    rng_test = np.random.RandomState(args.seed + t + 10_000)  # distinct stream from train's rng
-                    poison_idx_test = rng_test.choice(poison_pool_test, size=n_to_poison_test, replace=False) \
-                        if n_to_poison_test > 0 else np.array([], dtype=int)
-                    n_poisoned_test = len(poison_idx_test)
+                        env_test, agent_test = train_red_agent_for_task(
+                            t, "test", classifier_wrapper, X_test, y_test, benign_label, bank, args.seed, out_dir,
+                            target_margin_confidence=RED_TARGET_MARGIN_CONFIDENCE,
+                            shift_reference_classifier=pre_train_classifier_wrapper,
+                            pocket_shift_weight=POCKET_SHIFT_WEIGHT,
+                            proximity_anchor_X=mal_anchor_X,
+                            proximity_weight=PROXIMITY_WEIGHT,
+                            proximity_length_scale=PROXIMITY_LENGTH_SCALE,
+                            allowed_start_indices=mal_idx_test_c1,
+                        )
+                        X_test_pert, test_evasion_rate, test_rewards, test_avg_norm, test_attacked, evaded_mask_test = \
+                            evaluate_agent_on_batch(
+                                env_test, agent_test, X_test, y_test, benign_label,
+                                only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                            )
+                        red_report["test_evasion_rate"] = test_evasion_rate
+                        red_report["test_attacked"] = test_attacked
+                        red_report["test_avg_reward"] = float(np.mean(test_rewards)) if test_rewards else 0.0
+                        red_report["test_avg_pert_l2"] = test_avg_norm
+                        print(f"[Task {t} red_test_pert_agent] test_evasion={test_evasion_rate:.3f} "
+                              f"avg_pert_L2={test_avg_norm:.3f}")
 
-                    X_test = X_test.copy()
-                    X_test[poison_idx_test] = X_test_pert[poison_idx_test]
-                    task_test_splits[t] = (X_test, y_test)
-                    poisoned_test_sample_ids = gid_test[poison_idx_test].tolist() if n_poisoned_test > 0 else []
-                    print(f"[Task {t}] poisoned {n_poisoned_test}/{len(mal_idx_test)} malicious TEST samples "
-                          f"(poison_fraction_test={poison_fraction_test:.3f}) -- "
-                          f"test_evasion_rate was {test_evasion_rate:.3f}")
+                        poison_fraction_test = poison_fraction_for_task(
+                            t, POISON_FRACTION_TEST_START, POISON_FRACTION_TEST_END
+                        )
+                        poison_pool_test = np.where(evaded_mask_test)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_test_c1
+                        n_to_poison_test = min(int(round(poison_fraction_test * len(mal_idx_test))), len(poison_pool_test))
+                        rng_test = np.random.RandomState(args.seed + t + 10_000)  # distinct stream from train's rng
+                        poison_idx_test = rng_test.choice(poison_pool_test, size=n_to_poison_test, replace=False) \
+                            if n_to_poison_test > 0 else np.array([], dtype=int)
+                        n_poisoned_test = len(poison_idx_test)
+
+                        X_test = X_test.copy()
+                        X_test[poison_idx_test] = X_test_pert[poison_idx_test]
+                        task_test_splits[t] = (X_test, y_test)
+                        poisoned_test_sample_ids = gid_test[poison_idx_test].tolist() if n_poisoned_test > 0 else []
+                        print(f"[Task {t}] poisoned {n_poisoned_test}/{len(mal_idx_test)} malicious TEST samples "
+                              f"(poison_fraction_test={poison_fraction_test:.3f}) -- "
+                              f"test_evasion_rate was {test_evasion_rate:.3f}")
 
                 if len(benign_idx_train) > 0 and POISON_TEST_DATA and len(benign_idx_test) > 0:
-                    # REWORK (proximity-anchored pocket targeting): mirror of
-                    # mal_anchor_X above, on the benign side.
-                    benign_anchor_X = X_train_pert_benign[poison_idx_benign]
-                    if len(benign_anchor_X) > PROXIMITY_ANCHOR_MAX:
-                        anchor_rng_benign = np.random.RandomState(args.seed + t + 60_000)
-                        anchor_sel_benign = anchor_rng_benign.choice(
-                            len(benign_anchor_X), size=PROXIMITY_ANCHOR_MAX, replace=False
+                    # PROTOTYPE (C1-correct-only sampling): mirror of mal_idx_test_c1
+                    # above, on the benign side. Checked independently of the
+                    # malicious test-side pool -- an empty one shouldn't skip the
+                    # other.
+                    benign_idx_test_c1 = c1_correct_pool(
+                        pre_train_classifier_wrapper, X_test, benign_idx_test, benign_label, t, "test-side benign",
+                    )
+                    if len(benign_idx_test_c1) == 0:
+                        warnings_log.append(
+                            f"Task {t}: no C1-correct benign test candidates, "
+                            f"skipping red_test_benign_pert_agent."
                         )
-                        benign_anchor_X = benign_anchor_X[anchor_sel_benign]
+                    else:
+                        # REWORK (proximity-anchored pocket targeting): mirror of
+                        # mal_anchor_X above, on the benign side.
+                        benign_anchor_X = X_train_pert_benign[poison_idx_benign]
+                        if len(benign_anchor_X) > PROXIMITY_ANCHOR_MAX:
+                            anchor_rng_benign = np.random.RandomState(args.seed + t + 60_000)
+                            anchor_sel_benign = anchor_rng_benign.choice(
+                                len(benign_anchor_X), size=PROXIMITY_ANCHOR_MAX, replace=False
+                            )
+                            benign_anchor_X = benign_anchor_X[anchor_sel_benign]
 
-                    env_test_benign, agent_test_benign = train_red_agent_for_task(
-                        t, "test_benign", classifier_wrapper, X_test, y_test, mal_label, bank, args.seed, out_dir,
-                        shift_reference_classifier=pre_train_classifier_wrapper,
-                        pocket_shift_weight=POCKET_SHIFT_WEIGHT,
-                        proximity_anchor_X=benign_anchor_X,
-                        proximity_weight=PROXIMITY_WEIGHT,
-                        proximity_length_scale=PROXIMITY_LENGTH_SCALE,
-                    )
-                    (X_test_pert_benign, test_evasion_rate_benign, test_rewards_benign, test_avg_norm_benign,
-                     test_attacked_benign, evaded_mask_test_benign) = evaluate_agent_on_batch(
-                        env_test_benign, agent_test_benign, X_test, y_test, mal_label,
-                        only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
-                    )
-                    red_report["test_benign_evasion_rate"] = test_evasion_rate_benign
-                    red_report["test_benign_attacked"] = test_attacked_benign
-                    red_report["test_benign_avg_reward"] = float(np.mean(test_rewards_benign)) if test_rewards_benign else 0.0
-                    red_report["test_benign_avg_pert_l2"] = test_avg_norm_benign
-                    print(f"[Task {t} red_test_benign_pert_agent] test_evasion={test_evasion_rate_benign:.3f} "
-                          f"avg_pert_L2={test_avg_norm_benign:.3f}")
+                        env_test_benign, agent_test_benign = train_red_agent_for_task(
+                            t, "test_benign", classifier_wrapper, X_test, y_test, mal_label, bank, args.seed, out_dir,
+                            shift_reference_classifier=pre_train_classifier_wrapper,
+                            pocket_shift_weight=POCKET_SHIFT_WEIGHT,
+                            proximity_anchor_X=benign_anchor_X,
+                            proximity_weight=PROXIMITY_WEIGHT,
+                            proximity_length_scale=PROXIMITY_LENGTH_SCALE,
+                            allowed_start_indices=benign_idx_test_c1,
+                        )
+                        (X_test_pert_benign, test_evasion_rate_benign, test_rewards_benign, test_avg_norm_benign,
+                         test_attacked_benign, evaded_mask_test_benign) = evaluate_agent_on_batch(
+                            env_test_benign, agent_test_benign, X_test, y_test, mal_label,
+                            only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                        )
+                        red_report["test_benign_evasion_rate"] = test_evasion_rate_benign
+                        red_report["test_benign_attacked"] = test_attacked_benign
+                        red_report["test_benign_avg_reward"] = float(np.mean(test_rewards_benign)) if test_rewards_benign else 0.0
+                        red_report["test_benign_avg_pert_l2"] = test_avg_norm_benign
+                        print(f"[Task {t} red_test_benign_pert_agent] test_evasion={test_evasion_rate_benign:.3f} "
+                              f"avg_pert_L2={test_avg_norm_benign:.3f}")
 
-                    poison_fraction_test_benign = poison_fraction_for_task(
-                        t, POISON_FRACTION_TEST_START, POISON_FRACTION_TEST_END
-                    )
-                    poison_pool_test_benign = np.where(evaded_mask_test_benign)[0] if REQUIRE_EVASION_SUCCESS \
-                        else benign_idx_test
-                    n_to_poison_test_benign = min(
-                        int(round(poison_fraction_test_benign * len(benign_idx_test))), len(poison_pool_test_benign)
-                    )
-                    rng_test_benign = np.random.RandomState(args.seed + t + 40_000)  # distinct stream, avoids
-                                                                                      # colliding with rng_test
-                                                                                      # (+10_000) and rng_benign
-                                                                                      # (+20_000) above
-                    poison_idx_test_benign = rng_test_benign.choice(
-                        poison_pool_test_benign, size=n_to_poison_test_benign, replace=False
-                    ) if n_to_poison_test_benign > 0 else np.array([], dtype=int)
-                    n_poisoned_test_benign = len(poison_idx_test_benign)
+                        poison_fraction_test_benign = poison_fraction_for_task(
+                            t, POISON_FRACTION_TEST_START, POISON_FRACTION_TEST_END
+                        )
+                        poison_pool_test_benign = np.where(evaded_mask_test_benign)[0] if REQUIRE_EVASION_SUCCESS \
+                            else benign_idx_test_c1
+                        n_to_poison_test_benign = min(
+                            int(round(poison_fraction_test_benign * len(benign_idx_test))), len(poison_pool_test_benign)
+                        )
+                        rng_test_benign = np.random.RandomState(args.seed + t + 40_000)  # distinct stream, avoids
+                                                                                          # colliding with rng_test
+                                                                                          # (+10_000) and rng_benign
+                                                                                          # (+20_000) above
+                        poison_idx_test_benign = rng_test_benign.choice(
+                            poison_pool_test_benign, size=n_to_poison_test_benign, replace=False
+                        ) if n_to_poison_test_benign > 0 else np.array([], dtype=int)
+                        n_poisoned_test_benign = len(poison_idx_test_benign)
 
-                    X_test = X_test.copy()
-                    X_test[poison_idx_test_benign] = X_test_pert_benign[poison_idx_test_benign]
-                    task_test_splits[t] = (X_test, y_test)
-                    poisoned_test_sample_ids_benign = gid_test[poison_idx_test_benign].tolist() \
-                        if n_poisoned_test_benign > 0 else []
-                    print(f"[Task {t}] poisoned {n_poisoned_test_benign}/{len(benign_idx_test)} benign TEST samples "
-                          f"(poison_fraction_test_benign={poison_fraction_test_benign:.3f}) -- "
-                          f"test_evasion_rate was {test_evasion_rate_benign:.3f}")
+                        X_test = X_test.copy()
+                        X_test[poison_idx_test_benign] = X_test_pert_benign[poison_idx_test_benign]
+                        task_test_splits[t] = (X_test, y_test)
+                        poisoned_test_sample_ids_benign = gid_test[poison_idx_test_benign].tolist() \
+                            if n_poisoned_test_benign > 0 else []
+                        print(f"[Task {t}] poisoned {n_poisoned_test_benign}/{len(benign_idx_test)} benign TEST samples "
+                              f"(poison_fraction_test_benign={poison_fraction_test_benign:.3f}) -- "
+                              f"test_evasion_rate was {test_evasion_rate_benign:.3f}")
 
             teacher_model = copy.deepcopy(model); teacher_model.eval()
             update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
