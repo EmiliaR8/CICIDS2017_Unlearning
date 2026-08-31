@@ -710,13 +710,26 @@ def run_single_agent_attack(env, model, start_index, benign_label, deterministic
 
 
 def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
-                             deterministic=True, max_test=None):
+                             deterministic=True, max_test=None, allowed_start_indices=None):
     """
     Runs the agent over (up to max_test of) the malicious samples. Returns
     (X_pert, evasion_rate, rewards, avg_pert_norm, n_attacked, evaded_mask).
     evaded_mask[i] is True only for samples where the attack succeeded -- this is
     the exact set poisoning (and, downstream, the oracle detector) should draw
     from.
+
+    BUGFIX (C1-correct-only sampling prototype): allowed_start_indices, when
+    given, restricts `indices` to that set -- MUST be the same array passed as
+    `env`'s allowed_start_indices (or a subset of it). Without this, `indices`
+    here defaults to the FULL only_malicious pool, independent of whatever
+    `env.non_benign_indices` was restricted to at construction. run_single_agent_attack
+    calls env.reset(options={"index": i}) for each i; NetworkAttackEnv.reset()
+    silently substitutes a RANDOM row from env.non_benign_indices whenever the
+    requested i isn't in it -- so for any i outside the allowed set, this loop
+    was attacking some other, unrelated row and recording the result under i's
+    slot in X_pert/evaded_mask anyway. That silent substitution path was dead
+    code before allowed_start_indices existed (indices and non_benign_indices
+    were always the same set), which is why it went unnoticed until enabled.
     """
     X_pert = X.copy()
     evaded_mask = np.zeros(X.shape[0], dtype=bool)
@@ -728,6 +741,8 @@ def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
         indices = np.where(y != benign_label)[0]
     else:
         indices = np.arange(X.shape[0])
+    if allowed_start_indices is not None:
+        indices = np.intersect1d(indices, np.asarray(allowed_start_indices))
     if max_test is not None:
         indices = indices[:max_test]
 
@@ -2192,6 +2207,7 @@ def main():
                         evaluate_agent_on_batch(
                             env_train, agent_train, X_train, y_train, benign_label,
                             only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                            allowed_start_indices=mal_idx_train_c1,
                         )
 
                     red_report = {
@@ -2277,6 +2293,7 @@ def main():
                          train_attacked_benign, evaded_mask_benign) = evaluate_agent_on_batch(
                             env_train_benign, agent_train_benign, X_train, y_train, mal_label,
                             only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                            allowed_start_indices=benign_idx_train_c1,
                         )
 
                         red_report["train_benign_evasion_rate"] = train_evasion_rate_benign
@@ -2490,6 +2507,7 @@ def main():
                         evaluate_agent_on_batch(
                             env_test, agent_test, X_test, y_test, benign_label,
                             only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                            allowed_start_indices=mal_idx_test_c1,
                         )
                     red_report["test_evasion_rate"] = test_evasion_rate
                     red_report["test_attacked"] = test_attacked
@@ -2554,6 +2572,7 @@ def main():
                      test_attacked_benign, evaded_mask_test_benign) = evaluate_agent_on_batch(
                         env_test_benign, agent_test_benign, X_test, y_test, mal_label,
                         only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                        allowed_start_indices=benign_idx_test_c1,
                     )
                     red_report["test_benign_evasion_rate"] = test_evasion_rate_benign
                     red_report["test_benign_attacked"] = test_attacked_benign
