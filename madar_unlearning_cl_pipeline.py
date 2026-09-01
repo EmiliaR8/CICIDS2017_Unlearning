@@ -1691,12 +1691,20 @@ def plot_task_metrics(results, out_path):
     ax2.legend()
     ax2.grid(alpha=0.3)
 
+    # BUGFIX: perturbed_test_eval/post_unlearn_perturbed_test_eval are built
+    # with int task-id keys during a live run, but a dict loaded back from
+    # JSON (e.g. via regenerate_task_plots.py) always has STRING keys --
+    # dict.get(1) never matches key "1". Try both so this panel works
+    # whether `results` came straight from main()'s in-memory list or from
+    # a reloaded results JSON.
     pocket_task_ids, pocket_pre, pocket_post = [], [], []
     for r in results:
         t = r["task_id"]
-        pre = r.get("perturbed_test_eval", {}).get(t)
+        pte = r.get("perturbed_test_eval", {})
+        pre = pte.get(t, pte.get(str(t)))
         u = r.get("unlearning") or {}
-        post = u.get("post_unlearn_perturbed_test_eval", {}).get(t)
+        post_pte = u.get("post_unlearn_perturbed_test_eval", {})
+        post = post_pte.get(t, post_pte.get(str(t)))
         if pre is not None and post is not None:
             pocket_task_ids.append(t)
             pocket_pre.append(pre["balanced_accuracy"])
