@@ -710,13 +710,26 @@ def run_single_agent_attack(env, model, start_index, benign_label, deterministic
 
 
 def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
-                             deterministic=True, max_test=None):
+                             deterministic=True, max_test=None, allowed_start_indices=None):
     """
     Runs the agent over (up to max_test of) the malicious samples. Returns
     (X_pert, evasion_rate, rewards, avg_pert_norm, n_attacked, evaded_mask).
     evaded_mask[i] is True only for samples where the attack succeeded -- this is
     the exact set poisoning (and, downstream, the oracle detector) should draw
     from.
+
+    BUGFIX (C1-correct-only sampling prototype): allowed_start_indices, when
+    given, restricts `indices` to that set -- MUST be the same array passed as
+    `env`'s allowed_start_indices (or a subset of it). Without this, `indices`
+    here defaults to the FULL only_malicious pool, independent of whatever
+    `env.non_benign_indices` was restricted to at construction. run_single_agent_attack
+    calls env.reset(options={"index": i}) for each i; NetworkAttackEnv.reset()
+    silently substitutes a RANDOM row from env.non_benign_indices whenever the
+    requested i isn't in it -- so for any i outside the allowed set, this loop
+    was attacking some other, unrelated row and recording the result under i's
+    slot in X_pert/evaded_mask anyway. That silent substitution path was dead
+    code before allowed_start_indices existed (indices and non_benign_indices
+    were always the same set), which is why it went unnoticed until enabled.
     """
     X_pert = X.copy()
     evaded_mask = np.zeros(X.shape[0], dtype=bool)
@@ -728,6 +741,8 @@ def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
         indices = np.where(y != benign_label)[0]
     else:
         indices = np.arange(X.shape[0])
+    if allowed_start_indices is not None:
+        indices = np.intersect1d(indices, np.asarray(allowed_start_indices))
     if max_test is not None:
         indices = indices[:max_test]
 
@@ -1872,14 +1887,40 @@ def _decision_grid(model, mean, components, extent, device, mal_label, resolutio
     return xx, yy, proba.reshape(xx.shape)
 
 
-def _draw_decision_boundary(ax, xx, yy, proba, Z_train, category_train, Z_test, category_test):
+def compute_pocket_mask(proba_before, proba_after, threshold=0.5):
+    """
+    PROTOTYPE (adaptation-split pocket highlighting): boolean grid-cell mask
+    over the SAME fixed-PCA grid shape as _decision_grid's output, True
+    wherever the predicted class (thresholded at `threshold`, matching the
+    plot's own 0.5 contour line) differs between two checkpoints' probability
+    grids -- i.e. the region the decision surface moved through between them.
+    Both grids must come from the same pca_mean/pca_components/pca_extent/
+    resolution (always true here -- both are always the run-wide fixed basis).
+    """
+    return (proba_before >= threshold) != (proba_after >= threshold)
+
+
+def _draw_decision_boundary(ax, xx, yy, proba, Z_train, category_train, Z_test, category_test,
+                             highlight_mask=None):
     """Draws one panel from PRECOMPUTED grid/scatter data onto `ax`. Shared
     by plot_decision_boundary (computes then draws, saves its own file) and
     plot_decision_boundary_grid (redraws every checkpoint's cached data into
     one summary figure). Returns per-agent perturbed counts (for the
-    caller's legend)."""
+    caller's legend).
+
+    highlight_mask (PROTOTYPE, adaptation-split pocket highlighting): optional
+    boolean grid (same shape as `proba`, see compute_pocket_mask) drawn as a
+    translucent green wash + outline UNDER the scatter points, so a "pocket"
+    -- a grid cell where the predicted class has flipped at ANY checkpoint so
+    far this task -- stays visibly marked even on later checkpoints where the
+    background probability itself has changed again.
+    """
     ax.contourf(xx, yy, proba, levels=np.linspace(0, 1, 21), cmap="RdBu_r", alpha=0.6, vmin=0, vmax=1)
     ax.contour(xx, yy, proba, levels=[0.5], colors="black", linewidths=1.2, linestyles="--")
+
+    if highlight_mask is not None and highlight_mask.any():
+        ax.contourf(xx, yy, highlight_mask.astype(float), levels=[0.5, 1.5], colors=["#39FF14"], alpha=0.35)
+        ax.contour(xx, yy, highlight_mask.astype(float), levels=[0.5], colors="#0a7d0a", linewidths=1.0)
 
     for cat, color in CATEGORY_BG_COLORS.items():
         mask = category_train == cat
@@ -1906,16 +1947,29 @@ def _draw_decision_boundary(ax, xx, yy, proba, Z_train, category_train, Z_test, 
 def plot_decision_boundary(model, device, pca_mean, pca_components, pca_extent, mal_label,
                             X_train_scaled_np, category_train,
                             X_test_scaled_np, category_test,
-                            task_id, out_path, checkpoint_label=""):
+                            task_id, out_path, checkpoint_label="",
+                            highlight_mask=None, precomputed_grid=None):
     """One task/checkpoint's decision-boundary figure. Returns a dict of the
     computed grid/scatter data so main() can cache it and reuse it in
-    plot_decision_boundary_grid's end-of-run summary without recomputing."""
-    xx, yy, proba = _decision_grid(model, pca_mean, pca_components, pca_extent, device, mal_label)
+    plot_decision_boundary_grid's end-of-run summary without recomputing.
+
+    precomputed_grid (PROTOTYPE, adaptation-split pocket highlighting):
+    optional (xx, yy, proba) triple -- when the caller already computed this
+    checkpoint's grid via _decision_grid to diff it against the previous
+    checkpoint (compute_pocket_mask), pass it here so this function doesn't
+    redundantly recompute the same forward pass. highlight_mask is forwarded
+    straight to _draw_decision_boundary -- see its docstring.
+    """
+    if precomputed_grid is not None:
+        xx, yy, proba = precomputed_grid
+    else:
+        xx, yy, proba = _decision_grid(model, pca_mean, pca_components, pca_extent, device, mal_label)
     Z_train = _pca_project(X_train_scaled_np, pca_mean, pca_components)
     Z_test = _pca_project(X_test_scaled_np, pca_mean, pca_components)
 
     fig, ax = plt.subplots(figsize=(7, 6))
-    n_by_agent = _draw_decision_boundary(ax, xx, yy, proba, Z_train, category_train, Z_test, category_test)
+    n_by_agent = _draw_decision_boundary(ax, xx, yy, proba, Z_train, category_train, Z_test, category_test,
+                                          highlight_mask=highlight_mask)
 
     handles = [
         plt.Line2D([0], [0], marker=".", color=c, linestyle="", markersize=8,
@@ -1943,6 +1997,7 @@ def plot_decision_boundary(model, device, pca_mean, pca_components, pca_extent, 
         "Z_train": Z_train, "category_train": category_train,
         "Z_test": Z_test, "category_test": category_test,
         "task_id": task_id, "checkpoint_label": checkpoint_label,
+        "highlight_mask": highlight_mask,
     }
 
 
@@ -1963,7 +2018,7 @@ def plot_decision_boundary_grid(panels, out_path):
     for i, p in enumerate(panels):
         ax = axes[i // ncols][i % ncols]
         _draw_decision_boundary(ax, p["xx"], p["yy"], p["proba"], p["Z_train"], p["category_train"],
-                                 p["Z_test"], p["category_test"])
+                                 p["Z_test"], p["category_test"], highlight_mask=p.get("highlight_mask"))
         label = f"Task {p['task_id']}" + (f" ({p['checkpoint_label']})" if p["checkpoint_label"] else "")
         ax.set_title(label, fontsize=10)
         ax.set_xticks([]); ax.set_yticks([])
@@ -2192,6 +2247,7 @@ def main():
                         evaluate_agent_on_batch(
                             env_train, agent_train, X_train, y_train, benign_label,
                             only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                            allowed_start_indices=mal_idx_train_c1,
                         )
 
                     red_report = {
@@ -2277,6 +2333,7 @@ def main():
                          train_attacked_benign, evaded_mask_benign) = evaluate_agent_on_batch(
                             env_train_benign, agent_train_benign, X_train, y_train, mal_label,
                             only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                            allowed_start_indices=benign_idx_train_c1,
                         )
 
                         red_report["train_benign_evasion_rate"] = train_evasion_rate_benign
@@ -2395,13 +2452,28 @@ def main():
                     p_old_task[n.replace('.', '__')] = p.detach().clone()
 
         else:
+            # PROTOTYPE (adaptation-split pocket visualization): this task's
+            # single combined train_cl_er call is now TWO sequential calls on
+            # the same model/optimizer/W/omega/p_old_task -- a "perturbed"
+            # pass on just this task's poisoned rows, then a "clean" pass on
+            # everything else. Isolates how much EACH data type shifts the
+            # boundary. See module-level notes on the design decisions:
+            #   - iteration split is PROPORTIONAL to row count (not flat
+            #     50/50 or full-budget-each), so a small perturbed pool
+            #     doesn't get force-fed thousands of repeats and overfit.
+            #   - buffer replay + KD run in BOTH passes (each is a complete
+            #     standalone round, same mechanism as today's single pass).
+            #   - teacher_model is the SAME pre-task-t snapshot for both
+            #     passes, so KD comparisons are apples-to-apples between them.
+            #   - SI omega updates ONCE, after BOTH passes (W accumulates
+            #     across both calls uninitialized in between; p_old_task
+            #     stays anchored at task start throughout) -- identical
+            #     semantics to today's single-pass omega update, just now
+            #     covering the combined drift of both passes.
             print(f"  Samples: {len(Xtr)} (+{len(replay_buffer)} replay) | "
-                  f"MADAR ER+KD+SI, {CL_ITERS} iters")
-            drop_last = (len(Xtr) % BATCH_SIZE == 1)
-            loader = data.DataLoader(data.TensorDataset(Xtr, ytr), batch_size=BATCH_SIZE,
-                                     shuffle=True, drop_last=drop_last)
+                  f"MADAR ER+KD+SI, {CL_ITERS} iters (split across perturbed/clean passes)")
             optimizer = optim.SGD(model.parameters(), lr=1e-4, momentum=0.9, weight_decay=1e-6)
-            grad_steps = CL_ITERS
+            grad_steps = 0
 
             # REWORK (pocket-targeted test poisoning): frozen snapshot of the
             # classifier as it stood BEFORE this task's CL training -- captured
@@ -2410,15 +2482,95 @@ def main():
             # compare "did this exact point's predicted class change" between
             # the two. Independent copy of `model` (not just the wrapper), since
             # TorchIDSWrapper holds its model by reference and `model` itself
-            # keeps training.
+            # keeps training. Also this task's C1 for the pocket-highlight
+            # diffing below.
             pre_train_classifier_wrapper = TorchIDSWrapper(copy.deepcopy(model), scaler, DEVICE)
 
-            train_cl_er(model, teacher_model, optimizer, loader, CL_ITERS, W, omega, p_old_task, t, SI_C, DEVICE)
+            # PROTOTYPE (adaptation-split pocket visualization): running
+            # per-task highlight state. task_pocket_mask accumulates (unions)
+            # every checkpoint's grid-cell flips from here through this task's
+            # test/post-unlearn plots -- reset fresh at the start of every
+            # task. prev_proba is C1's grid, this task's first "before".
+            # X_test_current_scaled_np/category_test_clean_so_far are for the
+            # TWO adaptation-phase plots specifically: test-side poisoning
+            # hasn't run yet at this point in the loop, so task_test_splits[t]
+            # is still this task's unpoisoned test split -- shown as-is
+            # (no perturbed markers exist yet, correctly, at this checkpoint).
+            xx0, yy0, proba_c1 = _decision_grid(
+                pre_train_classifier_wrapper.model, pca_mean, pca_components, pca_extent, DEVICE, mal_label
+            )
+            task_pocket_mask = np.zeros_like(proba_c1, dtype=bool)
+            prev_proba = proba_c1
+            X_test_current_scaled_np = to_tensor(task_test_splits[t][0]).numpy()
+            category_test_clean_so_far = np.full(len(y_test), "malicious_clean", dtype=object)
+            category_test_clean_so_far[y_test == benign_label] = "benign"
 
-            # SI omega update happens NOW, right after CL training -- W was only
-            # accumulated during train_cl_er, so the displacement must be
-            # measured at this same point. p_old_task is intentionally NOT
-            # updated yet: the unlearning phase's SI penalty below anchors to
+            perturbed_rows = np.union1d(poison_idx, poison_idx_benign)
+            clean_rows = np.setdiff1d(np.arange(len(Xtr)), perturbed_rows)
+            n_perturbed, n_clean = len(perturbed_rows), len(clean_rows)
+
+            # Proportional to row count -- see the module-level note above for
+            # why NOT a flat 50/50 or full-budget-each split.
+            if n_perturbed > 0:
+                iters_perturbed = max(1, round(CL_ITERS * n_perturbed / (n_perturbed + n_clean)))
+            else:
+                iters_perturbed = 0
+            iters_clean = CL_ITERS - iters_perturbed
+
+            if n_perturbed > 0:
+                drop_last_pert = (n_perturbed % BATCH_SIZE == 1)
+                loader_pert = data.DataLoader(
+                    data.TensorDataset(Xtr[perturbed_rows], ytr[perturbed_rows]), batch_size=BATCH_SIZE,
+                    shuffle=True, drop_last=drop_last_pert,
+                )
+                print(f"    [Adaptation: perturbed] {n_perturbed} samples "
+                      f"(+{len(replay_buffer)} replay) | {iters_perturbed} iters")
+                train_cl_er(model, teacher_model, optimizer, loader_pert, iters_perturbed,
+                            W, omega, p_old_task, t, SI_C, DEVICE)
+                grad_steps += iters_perturbed
+
+                proba_after_pert = _decision_grid(model, pca_mean, pca_components, pca_extent, DEVICE, mal_label)[2]
+                task_pocket_mask |= compute_pocket_mask(prev_proba, proba_after_pert)
+                prev_proba = proba_after_pert
+                boundary_panels.append(plot_decision_boundary(
+                    model, DEVICE, pca_mean, pca_components, pca_extent, mal_label,
+                    Xtr.numpy(), category, X_test_current_scaled_np, category_test_clean_so_far,
+                    t, os.path.join(out_dir, "plots", f"decision_boundary_task{t}_perturbed_adapt.png"),
+                    checkpoint_label="perturbed_adapt", highlight_mask=task_pocket_mask,
+                    precomputed_grid=(xx0, yy0, proba_after_pert),
+                ))
+            else:
+                print(f"    [Adaptation: perturbed] skipped -- no poisoned rows this task.")
+
+            drop_last_clean = (n_clean % BATCH_SIZE == 1)
+            loader_clean = data.DataLoader(
+                data.TensorDataset(Xtr[clean_rows], ytr[clean_rows]), batch_size=BATCH_SIZE,
+                shuffle=True, drop_last=drop_last_clean,
+            )
+            print(f"    [Adaptation: clean] {n_clean} samples "
+                  f"(+{len(replay_buffer)} replay) | {iters_clean} iters")
+            train_cl_er(model, teacher_model, optimizer, loader_clean, iters_clean,
+                        W, omega, p_old_task, t, SI_C, DEVICE)
+            grad_steps += iters_clean
+
+            proba_after_clean = _decision_grid(model, pca_mean, pca_components, pca_extent, DEVICE, mal_label)[2]
+            task_pocket_mask |= compute_pocket_mask(prev_proba, proba_after_clean)
+            prev_proba = proba_after_clean
+            boundary_panels.append(plot_decision_boundary(
+                model, DEVICE, pca_mean, pca_components, pca_extent, mal_label,
+                Xtr.numpy(), category, X_test_current_scaled_np, category_test_clean_so_far,
+                t, os.path.join(out_dir, "plots", f"decision_boundary_task{t}_clean_adapt.png"),
+                checkpoint_label="clean_adapt", highlight_mask=task_pocket_mask,
+                precomputed_grid=(xx0, yy0, proba_after_clean),
+            ))
+
+            # SI omega update happens NOW, once, after BOTH passes -- W has
+            # been accumulating continuously across both train_cl_er calls
+            # (neither call nor anything between them resets it), and
+            # p_old_task is still exactly what it was at task start, so this
+            # measures the SAME combined displacement today's single-pass
+            # version would have. p_old_task is intentionally NOT updated
+            # yet: the unlearning phase's SI penalty below anchors to
             # start-of-task weights, so any drift during unlearning has to be
             # justified by the forget objective specifically. Matches both
             # references' ordering exactly.
@@ -2434,6 +2586,14 @@ def main():
                     omega[n_key] = SI_OMEGA_DECAY * omega[n_key] + \
                         W[n_key] / ((p_post_cl - p_old_task[n_key]) ** 2 + SI_EPS)
                     W[n_key].zero_()
+
+            # PROTOTYPE (adaptation-split pocket visualization): logging SI
+            # omega's L2 norm right after this task's adaptation, alongside
+            # the C1-pool/pocket data already in this diagnostic log.
+            omega_l2_after_adapt = float(torch.sqrt(sum((v ** 2).sum() for v in omega.values())).item())
+            print(f"    [SI omega] after adaptation: L2 norm = {omega_l2_after_adapt:.4f}")
+            with open(pocket_diag_log_path, "a") as f:
+                f.write(f"[SI omega] Task {t}: L2 norm after adaptation = {omega_l2_after_adapt:.4f}\n")
 
         # TEST-SIDE poisoning (REWORK, pocket-targeted test poisoning): runs HERE,
         # after this task's CL training has finished, so red_test_pert_agent/
@@ -2490,6 +2650,7 @@ def main():
                         evaluate_agent_on_batch(
                             env_test, agent_test, X_test, y_test, benign_label,
                             only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                            allowed_start_indices=mal_idx_test_c1,
                         )
                     red_report["test_evasion_rate"] = test_evasion_rate
                     red_report["test_attacked"] = test_attacked
@@ -2554,6 +2715,7 @@ def main():
                      test_attacked_benign, evaded_mask_test_benign) = evaluate_agent_on_batch(
                         env_test_benign, agent_test_benign, X_test, y_test, mal_label,
                         only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                        allowed_start_indices=benign_idx_test_c1,
                     )
                     red_report["test_benign_evasion_rate"] = test_evasion_rate_benign
                     red_report["test_benign_attacked"] = test_attacked_benign
@@ -2605,14 +2767,37 @@ def main():
         # unlearning phase at all, so this is its only snapshot). Whether
         # unlearning actually runs for t>0 is decided further below, so this
         # is captured unconditionally here and labeled "pre_unlearn" for
-        # every t>0 regardless of outcome.
+        # every t>0 regardless of outcome. This is the "testing" checkpoint
+        # (test-side poisoning above already ran, so category_test now has
+        # real perturbed markers, unlike the two adaptation-phase plots).
         X_test_scaled_np = to_tensor(task_test_splits[t][0]).numpy()
-        boundary_panels.append(plot_decision_boundary(
-            model, DEVICE, pca_mean, pca_components, pca_extent, mal_label,
-            Xtr.numpy(), category, X_test_scaled_np, category_test,
-            t, os.path.join(out_dir, "plots", f"decision_boundary_task{t}.png"),
-            checkpoint_label="pre_unlearn" if t > 0 else "",
-        ))
+        if t > 0:
+            # PROTOTYPE (adaptation-split pocket visualization): continue the
+            # SAME running task_pocket_mask/prev_proba from the adaptation
+            # plots above -- diff this checkpoint against the last one
+            # (end of the clean-adaptation pass) before drawing, so any NEW
+            # flips (e.g. from the test-side red agents' own poisoning, which
+            # doesn't touch `model` -- but test-side poisoning is applied to
+            # X_test, not the classifier, so no NEW flips are expected here;
+            # this mainly re-confirms the mask carried over correctly) get
+            # unioned in too.
+            proba_test = _decision_grid(model, pca_mean, pca_components, pca_extent, DEVICE, mal_label)[2]
+            task_pocket_mask |= compute_pocket_mask(prev_proba, proba_test)
+            prev_proba = proba_test
+            boundary_panels.append(plot_decision_boundary(
+                model, DEVICE, pca_mean, pca_components, pca_extent, mal_label,
+                Xtr.numpy(), category, X_test_scaled_np, category_test,
+                t, os.path.join(out_dir, "plots", f"decision_boundary_task{t}.png"),
+                checkpoint_label="pre_unlearn", highlight_mask=task_pocket_mask,
+                precomputed_grid=(xx0, yy0, proba_test),
+            ))
+        else:
+            boundary_panels.append(plot_decision_boundary(
+                model, DEVICE, pca_mean, pca_components, pca_extent, mal_label,
+                Xtr.numpy(), category, X_test_scaled_np, category_test,
+                t, os.path.join(out_dir, "plots", f"decision_boundary_task{t}.png"),
+                checkpoint_label="",
+            ))
 
         # ============================================================
         # 2. TEST on the (poisoned) test split -- REORDERED here, right after
@@ -2787,12 +2972,22 @@ def main():
                     # Decision-boundary snapshot -- model state right after
                     # unlearning, paired with the "pre_unlearn" snapshot taken
                     # above (same task, same fixed PCA basis, same category
-                    # arrays) so the two are directly comparable.
+                    # arrays) so the two are directly comparable. PROTOTYPE
+                    # (adaptation-split pocket visualization): continues the
+                    # same running task_pocket_mask/prev_proba -- this is the
+                    # 4th and last checkpoint of the task, so this final union
+                    # is what carries forward into the montage/summary plot.
+                    proba_post_unlearn = _decision_grid(
+                        model, pca_mean, pca_components, pca_extent, DEVICE, mal_label
+                    )[2]
+                    task_pocket_mask |= compute_pocket_mask(prev_proba, proba_post_unlearn)
+                    prev_proba = proba_post_unlearn
                     boundary_panels.append(plot_decision_boundary(
                         model, DEVICE, pca_mean, pca_components, pca_extent, mal_label,
                         Xtr.numpy(), category, X_test_scaled_np, category_test,
                         t, os.path.join(out_dir, "plots", f"decision_boundary_task{t}_post_unlearn.png"),
-                        checkpoint_label="post_unlearn",
+                        checkpoint_label="post_unlearn", highlight_mask=task_pocket_mask,
+                        precomputed_grid=(xx0, yy0, proba_post_unlearn),
                     ))
 
                     f_m = measure_unlearning_efficacy(model_pre_unlearn, model, forget_loader, DEVICE)
