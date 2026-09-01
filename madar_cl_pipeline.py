@@ -512,7 +512,7 @@ def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
 RED_AGENT_SEED_OFFSETS = {"train": 0, "test": 100_000, "train_benign": 200_000, "test_benign": 300_000}
 
 
-def c1_correct_pool(classifier_c1, X_full, idx_pool, target_label, task_id, agent_label):
+def c1_correct_pool(classifier_c1, X_full, idx_pool, target_label, task_id, agent_label, pocket_diag_log_path=None):
     """
     PROTOTYPE (C1-correct-only sampling): narrows idx_pool (indices into
     X_full, e.g. mal_idx_train/mal_idx_test/benign_idx_train/benign_idx_test)
@@ -522,19 +522,23 @@ def c1_correct_pool(classifier_c1, X_full, idx_pool, target_label, task_id, agen
     allowed_start_indices, so every episode starts from a genuinely "was
     correct under C1" row instead of a uniformly-random one.
 
-    Kept byte-for-byte in step with madar_unlearning_cl_pipeline.py's copy
-    of this function (minus the diagnostic-log write, which only exists over
-    there) -- see the module docstring's note on why poisoning must stay
-    identical between the two pipelines. Logs the raw pool size to the
-    console either way, purely as data for recalibrating the minimum-pool
-    fallback threshold later.
+    Kept in step with madar_unlearning_cl_pipeline.py's identical copy of
+    this function -- see the module docstring's note on why poisoning must
+    stay identical between the two pipelines. Logs the raw pool size to the
+    console (and, now that this pipeline has its own pocket_targeting_
+    diagnostic.txt, that log too when a path is given) either way, purely
+    as data for recalibrating the minimum-pool fallback threshold later.
     """
     if len(idx_pool) == 0:
         return idx_pool
     preds = classifier_c1.predict(X_full[idx_pool])
     correct_pool = idx_pool[preds == target_label]
-    print(f"    [C1-pool] Task {task_id} {agent_label}: {len(correct_pool)}/{len(idx_pool)} "
-          f"candidates are C1-correct.")
+    msg = (f"[C1-pool] Task {task_id} {agent_label}: {len(correct_pool)}/{len(idx_pool)} "
+           f"candidates are C1-correct.")
+    print(f"    {msg}")
+    if pocket_diag_log_path is not None:
+        with open(pocket_diag_log_path, "a") as f:
+            f.write(msg + "\n")
     return correct_pool
 
 
@@ -922,6 +926,88 @@ def evaluate_classifier(classifier, X, y):
 
 
 # ---------------------------------------------------------------------------
+# TEMPORARY DIAGNOSTIC (pocket-targeting investigation) -- MADAR version.
+# Ported from madar_unlearning_cl_pipeline.py so the two pipelines' pocket-
+# targeting behavior can be compared directly (same run, same seed, same
+# poisoning -- see the module docstring's note on why the two stay in sync).
+# Only TWO checkpoints here, not three: MADAR has no unlearning step, so
+# C2 (after this task's CL training) is also this task's FINAL state -- there
+# is no C3 to compare against. Not part of the pipeline's normal metrics.
+# ---------------------------------------------------------------------------
+def write_pocket_targeting_diagnostic(log_path, task_id, entries, benign_label, mal_label):
+    """
+    Appends one human-readable section to `log_path` for this task's
+    test-side perturbed samples (both malicious_perturbed and
+    benign_perturbed). `entries` is a list of dicts, each:
+        {"gid": int, "group": "malicious_perturbed"|"benign_perturbed",
+         "true_label": int, "c1_pred": int, "c2_pred": int}
+    C1 = classifier at the end of the previous task (what the red test
+    agents actually perturbed against). C2 = after this task's CL training
+    -- MADAR's FINAL state for this task, since there's no unlearning step
+    to follow it with (contrast madar_unlearning_cl_pipeline.py's version,
+    which also tracks C3).
+
+    Since REQUIRE_EVASION_SUCCESS guarantees every logged sample already
+    evades C2 by construction, "C1 correct -> C2 WRONG" is the only pattern
+    that means anything ("a genuine pocket -- this task's training flipped a
+    previously-correct sample"); "C1 WRONG -> C2 WRONG" just means the
+    sample was already a pre-existing error, unrelated to this task.
+    """
+    if not entries:
+        with open(log_path, "a") as f:
+            f.write(f"--- Task {task_id} " + "-" * 50 + "\n"
+                    "No test-side perturbed samples this task (no red agents ran, "
+                    "POISON_TEST_DATA off, or nothing evaded) -- nothing to check.\n\n")
+        return
+
+    def _fmt(pred, true_label):
+        correct = (pred == true_label)
+        tag = "correct" if correct else "WRONG  "
+        return tag, correct
+
+    pattern_counts = {}
+    lines_by_group = {"malicious_perturbed": [], "benign_perturbed": []}
+    for e in entries:
+        true_label = e["true_label"]
+        true_name = "malicious" if true_label == mal_label else "benign"
+        c1_tag, c1_ok = _fmt(e["c1_pred"], true_label)
+        c2_tag, c2_ok = _fmt(e["c2_pred"], true_label)
+        pattern = f"{'correct' if c1_ok else 'WRONG'} -> {'correct' if c2_ok else 'WRONG'}"
+        pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
+
+        pred_name = lambda p: "malicious" if p == mal_label else "benign"
+        lines_by_group[e["group"]].append(
+            f"    gid={e['gid']:<8} true={true_name:<9} "
+            f"C1={c1_tag}(pred={pred_name(e['c1_pred'])})  "
+            f"C2={c2_tag}(pred={pred_name(e['c2_pred'])})"
+        )
+
+    n_mal = len(lines_by_group["malicious_perturbed"])
+    n_ben = len(lines_by_group["benign_perturbed"])
+
+    with open(log_path, "a") as f:
+        f.write(f"--- Task {task_id} " + "-" * 20 + "\n")
+        f.write(f"{len(entries)} total perturbed test samples "
+                f"({n_mal} malicious_perturbed, {n_ben} benign_perturbed)\n\n")
+        f.write("Summary by C1 -> C2 correctness pattern:\n")
+        for pattern, count in sorted(pattern_counts.items(), key=lambda kv: -kv[1]):
+            note = ""
+            if pattern == "correct -> WRONG":
+                note = "  <- genuine pocket -- this task's training flipped a previously-correct sample"
+            elif pattern.startswith("WRONG"):
+                note = "  <- C1 was already wrong here (pre-existing error, not this task's doing)"
+            f.write(f"  {pattern:<20}: {count:>4}{note}\n")
+        f.write("\n")
+
+        if lines_by_group["malicious_perturbed"]:
+            f.write(f"  Malicious-perturbed samples ({n_mal}):\n")
+            f.write("\n".join(lines_by_group["malicious_perturbed"]) + "\n\n")
+        if lines_by_group["benign_perturbed"]:
+            f.write(f"  Benign-perturbed samples ({n_ben}):\n")
+            f.write("\n".join(lines_by_group["benign_perturbed"]) + "\n\n")
+
+
+# ---------------------------------------------------------------------------
 # Plots (identical to naive_cl_pipeline.py, titles relabeled MADAR)
 # ---------------------------------------------------------------------------
 def plot_task_metrics(results, out_path):
@@ -1253,6 +1339,32 @@ def main():
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
 
+    # TEMPORARY DIAGNOSTIC (pocket-targeting investigation) -- ported from
+    # madar_unlearning_cl_pipeline.py so the two pipelines' pocket-targeting
+    # behavior can be compared directly. See write_pocket_targeting_
+    # diagnostic()'s docstring for the field definitions -- only C1/C2 here
+    # (no C3/unlearning), unlike that file's version.
+    pocket_diag_log_path = os.path.join(out_dir, "logs", "pocket_targeting_diagnostic.txt")
+    with open(pocket_diag_log_path, "w") as f:
+        f.write(
+            "POCKET-TARGETING DIAGNOSTIC LOG (MADAR)\n"
+            "========================================\n"
+            "Checks whether red_test_pert_agent/red_test_benign_pert_agent are landing\n"
+            "where the decision boundary actually moves. One section per task (tasks > 0\n"
+            "only -- task 0 has no red agents/perturbed test samples).\n\n"
+            "Two classifier snapshots, both scored on the SAME perturbed test sample:\n"
+            "  C1 = classifier at the END of the PREVIOUS task -- this is the exact\n"
+            "       classifier state red_test_pert_agent/red_test_benign_pert_agent\n"
+            "       perturbed this sample against.\n"
+            "  C2 = classifier AFTER this task's CL training (ER+KD+SI). Plain MADAR has\n"
+            "       no unlearning step, so C2 is also this task's FINAL state -- there is\n"
+            "       no C3 here, unlike madar_unlearning_cl_pipeline.py's version of this\n"
+            "       log.\n"
+            "'correct'/'WRONG' always means: does the prediction match the sample's TRUE\n"
+            "(pre-perturbation) label -- malicious for malicious_perturbed rows, benign for\n"
+            "benign_perturbed rows.\n\n"
+        )
+
     print(f"Loading {args.h5_path} and building {NUM_TASKS} pooled chronological tasks...")
     tasks, day_mapping, label_mapping = load_pooled_chronological_tasks(args.h5_path, TASK_FRACTIONS)
     benign_label = label_mapping["Benign"]
@@ -1376,6 +1488,7 @@ def main():
                 # identical between the two pipelines.
                 mal_idx_train_c1 = c1_correct_pool(
                     classifier_wrapper, X_train, mal_idx_train, mal_label, t, "train-side malicious",
+                    pocket_diag_log_path,
                 )
                 if len(mal_idx_train_c1) == 0:
                     warnings_log.append(
@@ -1465,6 +1578,7 @@ def main():
                     # vice versa.
                     benign_idx_train_c1 = c1_correct_pool(
                         classifier_wrapper, X_train, benign_idx_train, benign_label, t, "train-side benign",
+                        pocket_diag_log_path,
                     )
                     if len(benign_idx_train_c1) == 0:
                         warnings_log.append(
@@ -1722,6 +1836,7 @@ def main():
                     # reasoning as the train-side filter above.
                     mal_idx_test_c1 = c1_correct_pool(
                         pre_train_classifier_wrapper, X_test, mal_idx_test, mal_label, t, "test-side malicious",
+                        pocket_diag_log_path,
                     )
                     if len(mal_idx_test_c1) == 0:
                         warnings_log.append(
@@ -1786,6 +1901,7 @@ def main():
                     # other.
                     benign_idx_test_c1 = c1_correct_pool(
                         pre_train_classifier_wrapper, X_test, benign_idx_test, benign_label, t, "test-side benign",
+                        pocket_diag_log_path,
                     )
                     if len(benign_idx_test_c1) == 0:
                         warnings_log.append(
@@ -1924,6 +2040,40 @@ def main():
         print(f"[Task {t} classifier] this-task bal_acc={per_task_eval[t]['balanced_accuracy']:.4f} "
               f"pooled bal_acc={pooled_eval['balanced_accuracy']:.4f} "
               f"mean-per-task bal_acc={mean_per_task_bal_acc:.4f}")
+
+        # TEMPORARY DIAGNOSTIC (pocket-targeting investigation), ported from
+        # madar_unlearning_cl_pipeline.py: `classifier_wrapper` right now IS
+        # C2 (this task's FINAL state -- MADAR has no unlearning step to run
+        # after this). `pre_train_classifier_wrapper` (captured before this
+        # task's CL training, in the t>0 branch of step 1) is C1. Both
+        # checkpoints exist in one shot here, unlike the unlearning
+        # pipeline's version which has to come back for C3 later.
+        if t > 0:
+            pocket_diag_entries = []
+            X_test_diag, _ = task_test_splits[t]
+            if len(poison_idx_test) > 0:
+                X_mal_pert_diag = X_test_diag[poison_idx_test]
+                c1_mal = pre_train_classifier_wrapper.predict(X_mal_pert_diag)
+                c2_mal = classifier_wrapper.predict(X_mal_pert_diag)
+                for local_i, idx in enumerate(poison_idx_test):
+                    pocket_diag_entries.append({
+                        "gid": int(gid_test[idx]), "group": "malicious_perturbed",
+                        "true_label": int(mal_label),
+                        "c1_pred": int(c1_mal[local_i]), "c2_pred": int(c2_mal[local_i]),
+                    })
+            if len(poison_idx_test_benign) > 0:
+                X_ben_pert_diag = X_test_diag[poison_idx_test_benign]
+                c1_ben = pre_train_classifier_wrapper.predict(X_ben_pert_diag)
+                c2_ben = classifier_wrapper.predict(X_ben_pert_diag)
+                for local_i, idx in enumerate(poison_idx_test_benign):
+                    pocket_diag_entries.append({
+                        "gid": int(gid_test[idx]), "group": "benign_perturbed",
+                        "true_label": int(benign_label),
+                        "c1_pred": int(c1_ben[local_i]), "c2_pred": int(c2_ben[local_i]),
+                    })
+            write_pocket_targeting_diagnostic(
+                pocket_diag_log_path, t, pocket_diag_entries, benign_label, mal_label,
+            )
 
         results.append({
             "task_id": t,
