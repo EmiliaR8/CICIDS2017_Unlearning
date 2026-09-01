@@ -690,12 +690,22 @@ class EpisodeTimerCallback(BaseCallback):
 
 def run_single_agent_attack(env, model, start_index, benign_label, deterministic=True):
     """Runs one episode attacking one sample index. Returns
-    (final_obs, total_reward, pred_label, cum_perturbation)."""
+    (final_obs, total_reward, pred_label, cum_perturbation, success).
+
+    REWORK (joint pocket objective / "Option B"): `success` is
+    info["success"] from the env's LAST step -- True only when the episode
+    ended via `terminated` (the env's own joint C1-still-correct AND
+    C2-now-target condition when a reference classifier is configured, or
+    plain C2 evasion otherwise), never when it merely ran out of steps
+    (`truncated`). Callers should use this instead of re-deriving success
+    from pred_label alone, which would silently drop the C1 requirement.
+    """
     obs, _ = env.reset(options={"index": start_index})
     total_reward = 0.0
     cum_pert = np.zeros(env.action_space.shape[0], dtype=np.float32)
 
     done = False
+    info = {}
     while not done:
         a, _ = model.predict(obs, deterministic=deterministic)
         a = np.asarray(a, dtype=np.float32).reshape(env.action_space.shape)
@@ -706,7 +716,7 @@ def run_single_agent_attack(env, model, start_index, benign_label, deterministic
         cum_pert += a
         done = bool(terminated) or bool(truncated)
 
-    return obs, total_reward, info["prediction"], cum_pert
+    return obs, total_reward, info["prediction"], cum_pert, bool(info.get("success", False))
 
 
 def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
@@ -730,6 +740,15 @@ def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
     slot in X_pert/evaded_mask anyway. That silent substitution path was dead
     code before allowed_start_indices existed (indices and non_benign_indices
     were always the same set), which is why it went unnoticed until enabled.
+
+    REWORK (joint pocket objective / "Option B"): evasion/evaded_mask is now
+    keyed to run_single_agent_attack's `success` flag (the env's own
+    terminated condition), not a re-derived pred_label==benign_label check --
+    for envs with a shift_reference_classifier (test/test_benign), that means
+    a sample only counts as evaded when the reference classifier (C1) STILL
+    calls the final perturbed point the sample's true label AND the live
+    classifier (C2) now calls it benign_label. Train-side envs (no reference
+    classifier) are unaffected -- success there is still plain C2 evasion.
     """
     X_pert = X.copy()
     evaded_mask = np.zeros(X.shape[0], dtype=bool)
@@ -747,14 +766,14 @@ def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
         indices = indices[:max_test]
 
     for i in indices:
-        final_obs, total_reward, pred_label, cum_pert = run_single_agent_attack(
+        final_obs, total_reward, pred_label, cum_pert, success = run_single_agent_attack(
             env, model, start_index=i, benign_label=benign_label, deterministic=deterministic
         )
         rewards.append(total_reward)
         pert_norms.append(float(np.linalg.norm(cum_pert, ord=2)))
         attacked += 1
 
-        if pred_label == benign_label and y[i] != benign_label:
+        if success:
             evasion += 1
             X_pert[i] = final_obs
             evaded_mask[i] = True

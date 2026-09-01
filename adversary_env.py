@@ -158,9 +158,20 @@ class NetworkAttackEnv(gym.Env):
         # specifically hunts for "pockets" the boundary has moved through --
         # points a prior classifier state would have called non-benign that
         # the current one now calls benign -- rather than just any generic
-        # evasion direction. See step() for the exact reward term. Both must
-        # be set together for this to activate; either left None (default)
-        # disables it and reward is unchanged from before.
+        # evasion direction. See step() for the exact reward term.
+        # pocket_shift_weight left None/0 just disables the dense shaping
+        # bonus; shift_reference_classifier alone (REWORK, joint pocket
+        # objective / "Option B") is what gates the HARD success condition
+        # below -- when set, an episode only counts as a win (bonus reward +
+        # terminated=True) when the frozen reference classifier STILL calls
+        # this exact perturbed point the sample's original true label AND
+        # the live classifier now calls it the target label. That is: find
+        # delta such that C1(x+delta) = correct and C2(x+delta) = incorrect,
+        # not just C2(x+delta) = incorrect on its own -- so a perturbation
+        # that has already carried the point out of C1's correct region no
+        # longer counts as evasion, even if C2 also misclassifies it. Left
+        # None (default, train-side agents) keeps the original single-
+        # classifier semantics: success is just C2(x+delta) = target.
         self.shift_reference_classifier = shift_reference_classifier
         self.pocket_shift_weight = pocket_shift_weight
         # REWORK (proximity-anchored pocket targeting): proximity_anchor_X, when
@@ -261,17 +272,30 @@ class NetworkAttackEnv(gym.Env):
         else:
             confidence_term = 5 * (confidence - 0.5)
 
+        # REWORK (joint pocket objective / "Option B"): when a reference
+        # classifier is set, compute its prediction on this exact perturbed
+        # point ONCE and reuse it for both the dense pocket_term shaping
+        # bonus below and the hard success/termination condition further
+        # down -- c1_correct is True (old single-classifier semantics) when
+        # no reference classifier is configured (train-side agents).
+        ref_confidence = None
+        c1_correct = True
+        if self.shift_reference_classifier is not None:
+            ref_proba = self.shift_reference_classifier.predict_proba(self.state.reshape(1, -1))[0]
+            ref_confidence = ref_proba[self.benign_label]
+            ref_pred = int(np.argmax(ref_proba))
+            c1_correct = bool(ref_pred == self.true_label)
+
         # REWORK (pocket-targeted test poisoning): bonus for landing where the
         # CURRENT (live) classifier's confidence toward benign_label at this
         # exact point exceeds the FROZEN reference classifier's confidence at
         # the same point -- i.e. this specific point is inside a region the
         # boundary moved through, not just generically evasive. Zero/no-op
         # unless both shift_reference_classifier and pocket_shift_weight are
-        # set (see __init__).
+        # set (see __init__). This is a dense/continuous shaping signal only
+        # -- it does NOT by itself gate success; see `success` below.
         pocket_term = 0.0
-        if self.shift_reference_classifier is not None and self.pocket_shift_weight:
-            ref_proba = self.shift_reference_classifier.predict_proba(self.state.reshape(1, -1))[0]
-            ref_confidence = ref_proba[self.benign_label]
+        if ref_confidence is not None and self.pocket_shift_weight:
             pocket_term = self.pocket_shift_weight * (confidence - ref_confidence)
 
         # REWORK (proximity-anchored pocket targeting): bonus that peaks when
@@ -287,8 +311,18 @@ class NetworkAttackEnv(gym.Env):
 
         reward = confidence_term + pocket_term + proximity_term - 0.3 * np.linalg.norm(action, ord=2)  # L2 penalty
 
-        # Large reward for successful misclassification
-        if predicted_label == self.benign_label:
+        # REWORK (joint pocket objective / "Option B"): `success` -- not just
+        # C2 evasion alone -- is what the large terminal bonus and episode
+        # termination are keyed to below. c1_correct is always True when no
+        # reference classifier is configured, so train-side agents (and any
+        # other caller that never sets shift_reference_classifier) see
+        # exactly the old behavior: success == C2(x+delta) == target.
+        c2_evaded = bool(predicted_label == self.benign_label)
+        success = c2_evaded and c1_correct
+
+        # Large reward for successful misclassification (now gated on the
+        # joint condition -- see success above)
+        if success:
             reward += 10
 
         reward = reward + r_contrast
@@ -310,7 +344,7 @@ class NetworkAttackEnv(gym.Env):
         # return self.state, reward, done, {"prediction":predicted_label}
 
         self.steps += 1
-        terminated = bool(predicted_label == self.benign_label)
+        terminated = success
         truncated = bool(self.steps >= self.max_steps)
 
         if (terminated or truncated) and self.contrastive_bank is not None:
@@ -320,7 +354,12 @@ class NetworkAttackEnv(gym.Env):
 
 
         reward = float(reward)
-        info = {"prediction": int(predicted_label)}
+        # c1_correct/success surfaced so callers (evaluate_agent_on_batch via
+        # run_single_agent_attack) can use the SAME joint condition the agent
+        # was trained/terminated on, instead of re-deriving evasion from
+        # `prediction` alone (which would silently drop the C1-still-correct
+        # requirement again).
+        info = {"prediction": int(predicted_label), "c1_correct": c1_correct, "success": bool(success)}
 
         return self.state, reward, terminated, truncated, info
 
