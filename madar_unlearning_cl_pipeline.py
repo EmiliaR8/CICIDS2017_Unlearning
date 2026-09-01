@@ -1649,8 +1649,14 @@ def plot_task_metrics(results, out_path):
         _post_or_fallback(r, "post_unlearn_mean_per_task_balanced_accuracy", pre)
         for r, pre in zip(results, mean_per_task_bal_acc_pre)
     ]
-    train_evasion = [r["red_agent"]["train_evasion_rate"] if r["red_agent"] else None for r in results]
-    test_evasion = [r["red_agent"]["test_evasion_rate"] if r["red_agent"] else None for r in results]
+    # BUGFIX (C1-correct-only sampling prototype): red_agent can be a non-empty
+    # dict missing train_evasion_rate/test_evasion_rate specifically -- e.g.
+    # the malicious train-side agent was skipped (empty C1-correct pool) but
+    # the benign train-side agent ran and populated its own keys into the
+    # SAME dict, or vice versa. .get() instead of direct indexing so a
+    # partially-populated red_agent doesn't crash the plot.
+    train_evasion = [r["red_agent"].get("train_evasion_rate") if r["red_agent"] else None for r in results]
+    test_evasion = [r["red_agent"].get("test_evasion_rate") if r["red_agent"] else None for r in results]
 
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 11), sharex=True)
 
@@ -1667,11 +1673,18 @@ def plot_task_metrics(results, out_path):
     ax1.legend(fontsize=8)
     ax1.grid(alpha=0.3)
 
-    xs = [t for t, v in zip(task_ids, train_evasion) if v is not None]
+    # BUGFIX (C1-correct-only sampling prototype): train_evasion/test_evasion
+    # can now be None at DIFFERENT task indices from each other (malicious
+    # and benign/train and test agents can each be independently skipped) --
+    # a single xs shared between both series would misalign them, or crash
+    # outright if the two None-patterns differ in count. Filter each series
+    # against its own None pattern.
+    xs_train = [t for t, v in zip(task_ids, train_evasion) if v is not None]
     ys_train = [v for v in train_evasion if v is not None]
+    xs_test = [t for t, v in zip(task_ids, test_evasion) if v is not None]
     ys_test = [v for v in test_evasion if v is not None]
-    ax2.plot(xs, ys_train, marker="o", color="tab:red", label="evasion rate (train samples)")
-    ax2.plot(xs, ys_test, marker="s", color="tab:orange", label="evasion rate (held-out test samples)")
+    ax2.plot(xs_train, ys_train, marker="o", color="tab:red", label="evasion rate (train samples)")
+    ax2.plot(xs_test, ys_test, marker="s", color="tab:orange", label="evasion rate (held-out test samples)")
     ax2.set_ylabel("Evasion rate")
     ax2.set_title("Red agent evasion rate per task boundary (task 0 has no red agent)")
     ax2.set_ylim(-0.05, 1.05)
