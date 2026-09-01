@@ -48,6 +48,11 @@ python compare_cl_runs.py runs/madar_unlearning/madar_active1/madar_active1.json
 
 python3 madar_unlearning_cl_pipeline.py --log_name pocket_targeting_diag_run  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
 
+August 31:
+python3 madar_cl_pipeline.py --log_name pocket_target_0831  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+python3 madar_unlearning_cl_pipeline.py --log_name pocket_target_u_0831  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+
+
 
 Tasks:
 1. Check if there are pertrubed samples in the test batches for naive and joint
