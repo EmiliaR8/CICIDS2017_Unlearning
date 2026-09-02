@@ -1244,7 +1244,14 @@ def write_pocket_targeting_diagnostic(log_path, task_id, entries, unlearning_ran
     test-side perturbed samples (both malicious_perturbed and
     benign_perturbed). `entries` is a list of dicts, each:
         {"gid": int, "group": "malicious_perturbed"|"benign_perturbed",
-         "true_label": int, "c1_pred": int, "c2_pred": int, "c3_pred": int}
+         "true_label": int, "c1_pred": int, "c2_pred": int, "c3_pred": int,
+         "source": str, optional}
+    `source`, when present (e.g. "recycled_from_task_3"), marks a row drawn
+    from an EARLIER task's own test split (recycled into this task's
+    perturbable pool -- see the TEST-SIDE blocks in main()) rather than this
+    task's own test rows; absent/None means "this task's own test row". Its
+    `gid` is still the row's ORIGINAL global id from whichever task it
+    actually came from -- never reassigned.
     C1/C2/C3 are as defined in the log's header (see main()): C1 = classifier
     at the end of the previous task, C2 = after this task's CL training
     (before unlearning), C3 = after this task's unlearning step (or the same
@@ -1289,20 +1296,25 @@ def write_pocket_targeting_diagnostic(log_path, task_id, entries, unlearning_ran
         pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
 
         pred_name = lambda p: "malicious" if p == mal_label else "benign"
+        source = e.get("source")
+        source_tag = f"  [{source}]" if source else ""
         lines_by_group[e["group"]].append(
             f"    gid={e['gid']:<8} true={true_name:<9} "
             f"C1={c1_tag}(pred={pred_name(e['c1_pred'])})  "
             f"C2={c2_tag}(pred={pred_name(e['c2_pred'])})  "
             f"C3={c3_tag}(pred={pred_name(e['c3_pred'])})"
+            f"{source_tag}"
         )
 
     n_mal = len(lines_by_group["malicious_perturbed"])
     n_ben = len(lines_by_group["benign_perturbed"])
+    n_recycled = sum(1 for e in entries if e.get("source"))
 
     with open(log_path, "a") as f:
         f.write(f"--- Task {task_id} (unlearning ran this task: {unlearning_ran}) " + "-" * 20 + "\n")
         f.write(f"{len(entries)} total perturbed test samples "
-                f"({n_mal} malicious_perturbed, {n_ben} benign_perturbed)\n\n")
+                f"({n_mal} malicious_perturbed, {n_ben} benign_perturbed"
+                f"{f', {n_recycled} recycled from an earlier task' if n_recycled else ''})\n\n")
         f.write("Summary by C1 -> C2 -> C3 correctness pattern:\n")
         for pattern, count in sorted(pattern_counts.items(), key=lambda kv: -kv[1]):
             note = ""
@@ -2124,6 +2136,13 @@ def main():
             "'correct'/'WRONG' always means: does the prediction match the sample's TRUE\n"
             "(pre-perturbation) label -- malicious for malicious_perturbed rows, benign for\n"
             "benign_perturbed rows.\n\n"
+            "Each task's perturbable test pool is the UNION of that task's own C1-correct\n"
+            "test rows AND task (t-1)'s own C1-correct test rows, recycled in (train-side\n"
+            "pools are NOT C1-filtered -- they batch straight from the task's own training\n"
+            "data). A recycled row's perturbed value is NEVER written back into task\n"
+            "(t-1)'s own test split -- it is captured and scored only in the recycling\n"
+            "task's own section below, tagged '[recycled_from_task_N]'; entries without\n"
+            "that tag are this task's own test rows.\n\n"
         )
 
     print(f"Loading {args.h5_path} and building {NUM_TASKS} pooled chronological tasks...")
@@ -2228,6 +2247,20 @@ def main():
         n_poisoned_test_benign = 0
         poison_idx_test_benign = np.array([], dtype=int)
         poisoned_test_sample_ids_benign = []
+        # REWORK (recycled-pocket test pool): rows drawn from task (t-1)'s OWN
+        # test split that got poisoned this task -- see the TEST-SIDE blocks
+        # below for how these are selected. Deliberately NEVER written into
+        # task_test_splits[t-1] (that split stays exactly as task (t-1) left
+        # it, so every later task's re-evaluation of task (t-1) is
+        # unaffected) -- their perturbed feature rows/true labels/original
+        # gids are kept ONLY in these task-local variables, used solely for
+        # this task's own C1/C2/C3 pocket-diagnostic capture below, then
+        # discarded. Initialized here so every downstream reference is safe
+        # even when nothing gets recycled this task.
+        recycled_gids_mal = np.array([], dtype=np.int64)
+        recycled_Xpert_mal = np.empty((0, X.shape[1]), dtype=np.float32)
+        recycled_gids_ben = np.array([], dtype=np.int64)
+        recycled_Xpert_ben = np.empty((0, X.shape[1]), dtype=np.float32)
 
         if t == 0:
             print(f"\n===== Task 0 (warm start, no red agent): "
@@ -2252,68 +2285,50 @@ def main():
                 # only ever perturbs test data. See train_red_agent_for_task's
                 # docstring for why this also fixes a latent env/data mismatch
                 # bug in the old single-agent design.
-                # PROTOTYPE (C1-correct-only sampling): classifier_wrapper right
-                # here IS C1 -- nothing has trained this task yet. Restrict the
-                # train-side malicious agent's starting pool to rows C1 already
-                # gets right, so this task's poisoning has to move the boundary
-                # through a genuinely correct point instead of just reinforcing
-                # an already-wrong one. See c1_correct_pool()'s docstring.
-                mal_idx_train_c1 = c1_correct_pool(
+                # REWORK (train-side no longer C1-filtered): train-side agents
+                # now batch directly from this task's own malicious/benign
+                # training rows, unfiltered -- no C1-correctness requirement.
+                # c1_correct_pool() is still called and logged below purely as
+                # an FYI diagnostic (so a collapse like task 6's 0/162 stays
+                # visible), but its return value no longer gates or restricts
+                # anything; allowed_start_indices is the full mal_idx_train.
+                _ = c1_correct_pool(
                     classifier_wrapper, X_train, mal_idx_train, mal_label,
-                    t, "train-side malicious", pocket_diag_log_path,
+                    t, "train-side malicious (FYI only, not filtered)", pocket_diag_log_path,
                 )
-                if len(mal_idx_train_c1) == 0:
-                    warnings_log.append(
-                        f"Task {t}: no C1-correct malicious training candidates, "
-                        f"skipping red_train_pert_agent."
+                env_train, agent_train = train_red_agent_for_task(
+                    t, "train", classifier_wrapper, X_train, y_train, benign_label, bank, args.seed, out_dir,
+                    target_margin_confidence=RED_TARGET_MARGIN_CONFIDENCE,
+                    allowed_start_indices=mal_idx_train,
+                )
+                X_train_pert, train_evasion_rate, train_rewards, train_avg_norm, train_attacked, evaded_mask = \
+                    evaluate_agent_on_batch(
+                        env_train, agent_train, X_train, y_train, benign_label,
+                        only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                        allowed_start_indices=mal_idx_train,
                     )
-                    # Placeholder so the test-side proximity-anchor lookup below
-                    # (X_train_pert[poison_idx]) stays safe -- poison_idx is still
-                    # the empty array initialized at the top of the loop.
-                    X_train_pert = X_train.copy()
-                    # red_report defaults to None (see top of loop) and is only
-                    # ever built as a dict inside the "agent ran" branch above --
-                    # the benign block below now runs independently of whether
-                    # THIS branch ran, and writes into red_report unconditionally,
-                    # so it must already be a dict by the time we get there.
-                    red_report = {}
-                else:
-                    env_train, agent_train = train_red_agent_for_task(
-                        t, "train", classifier_wrapper, X_train, y_train, benign_label, bank, args.seed, out_dir,
-                        target_margin_confidence=RED_TARGET_MARGIN_CONFIDENCE,
-                        allowed_start_indices=mal_idx_train_c1,
-                    )
-                    X_train_pert, train_evasion_rate, train_rewards, train_avg_norm, train_attacked, evaded_mask = \
-                        evaluate_agent_on_batch(
-                            env_train, agent_train, X_train, y_train, benign_label,
-                            only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
-                            allowed_start_indices=mal_idx_train_c1,
-                        )
 
-                    red_report = {
-                        "train_evasion_rate": train_evasion_rate, "train_attacked": train_attacked,
-                        "train_avg_reward": float(np.mean(train_rewards)) if train_rewards else 0.0,
-                        "train_avg_pert_l2": train_avg_norm,
-                    }
-                    print(f"[Task {t} red_train_pert_agent] train_evasion={train_evasion_rate:.3f} "
-                          f"avg_pert_L2={train_avg_norm:.3f}")
+                red_report = {
+                    "train_evasion_rate": train_evasion_rate, "train_attacked": train_attacked,
+                    "train_avg_reward": float(np.mean(train_rewards)) if train_rewards else 0.0,
+                    "train_avg_pert_l2": train_avg_norm,
+                }
+                print(f"[Task {t} red_train_pert_agent] train_evasion={train_evasion_rate:.3f} "
+                      f"avg_pert_L2={train_avg_norm:.3f}")
 
-                    poison_fraction_train = poison_fraction_for_task(
-                        t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
-                    )
-                    poison_pool = np.where(evaded_mask)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_train_c1
-                    n_to_poison = min(int(round(poison_fraction_train * len(mal_idx_train))), len(poison_pool))
-                    rng = np.random.RandomState(args.seed + t)
-                    poison_idx = rng.choice(poison_pool, size=n_to_poison, replace=False) if n_to_poison > 0 else \
-                        np.array([], dtype=int)
-                    n_poisoned = len(poison_idx)
+                poison_fraction_train = poison_fraction_for_task(
+                    t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
+                )
+                poison_pool = np.where(evaded_mask)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_train
+                n_to_poison = min(int(round(poison_fraction_train * len(mal_idx_train))), len(poison_pool))
+                rng = np.random.RandomState(args.seed + t)
+                poison_idx = rng.choice(poison_pool, size=n_to_poison, replace=False) if n_to_poison > 0 else \
+                    np.array([], dtype=int)
+                n_poisoned = len(poison_idx)
 
-                    print(f"[Task {t}] poisoned {n_poisoned}/{len(mal_idx_train)} malicious train samples "
-                          f"(poison_fraction_train={poison_fraction_train:.3f})")
+                print(f"[Task {t}] poisoned {n_poisoned}/{len(mal_idx_train)} malicious train samples "
+                      f"(poison_fraction_train={poison_fraction_train:.3f})")
 
-                # Applies uniformly whether or not the agent above ran -- poison_idx
-                # is the empty array from the top of the loop in the skip case, so
-                # this is a no-op then.
                 X_train_for_classifier = X_train.copy()
                 X_train_for_classifier[poison_idx] = X_train_pert[poison_idx]
 
@@ -2350,56 +2365,47 @@ def main():
                     warnings_log.append(f"Task {t}: no benign training samples, skipping benign red agents.")
                     X_train_pert_benign = X_train.copy()  # placeholder, mirrors the malicious side
                 else:
-                    # PROTOTYPE (C1-correct-only sampling): same reasoning as the
-                    # malicious side above, checked independently -- an empty
-                    # malicious pool should not also skip the benign agent, and
-                    # vice versa.
-                    benign_idx_train_c1 = c1_correct_pool(
+                    # REWORK (train-side no longer C1-filtered): mirror of the
+                    # malicious side above -- c1_correct_pool() is FYI-only here
+                    # too, allowed_start_indices is the full benign_idx_train.
+                    _ = c1_correct_pool(
                         classifier_wrapper, X_train, benign_idx_train, benign_label,
-                        t, "train-side benign", pocket_diag_log_path,
+                        t, "train-side benign (FYI only, not filtered)", pocket_diag_log_path,
                     )
-                    if len(benign_idx_train_c1) == 0:
-                        warnings_log.append(
-                            f"Task {t}: no C1-correct benign training candidates, "
-                            f"skipping red_train_benign_pert_agent."
-                        )
-                        X_train_pert_benign = X_train.copy()
-                    else:
-                        env_train_benign, agent_train_benign = train_red_agent_for_task(
-                            t, "train_benign", classifier_wrapper, X_train, y_train, mal_label, bank, args.seed, out_dir,
-                            allowed_start_indices=benign_idx_train_c1,
-                        )
-                        (X_train_pert_benign, train_evasion_rate_benign, train_rewards_benign, train_avg_norm_benign,
-                         train_attacked_benign, evaded_mask_benign) = evaluate_agent_on_batch(
-                            env_train_benign, agent_train_benign, X_train, y_train, mal_label,
-                            only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
-                            allowed_start_indices=benign_idx_train_c1,
-                        )
+                    env_train_benign, agent_train_benign = train_red_agent_for_task(
+                        t, "train_benign", classifier_wrapper, X_train, y_train, mal_label, bank, args.seed, out_dir,
+                        allowed_start_indices=benign_idx_train,
+                    )
+                    (X_train_pert_benign, train_evasion_rate_benign, train_rewards_benign, train_avg_norm_benign,
+                     train_attacked_benign, evaded_mask_benign) = evaluate_agent_on_batch(
+                        env_train_benign, agent_train_benign, X_train, y_train, mal_label,
+                        only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                        allowed_start_indices=benign_idx_train,
+                    )
 
-                        red_report["train_benign_evasion_rate"] = train_evasion_rate_benign
-                        red_report["train_benign_attacked"] = train_attacked_benign
-                        red_report["train_benign_avg_reward"] = float(np.mean(train_rewards_benign)) if train_rewards_benign else 0.0
-                        red_report["train_benign_avg_pert_l2"] = train_avg_norm_benign
-                        print(f"[Task {t} red_train_benign_pert_agent] train_evasion={train_evasion_rate_benign:.3f} "
-                              f"avg_pert_L2={train_avg_norm_benign:.3f}")
+                    red_report["train_benign_evasion_rate"] = train_evasion_rate_benign
+                    red_report["train_benign_attacked"] = train_attacked_benign
+                    red_report["train_benign_avg_reward"] = float(np.mean(train_rewards_benign)) if train_rewards_benign else 0.0
+                    red_report["train_benign_avg_pert_l2"] = train_avg_norm_benign
+                    print(f"[Task {t} red_train_benign_pert_agent] train_evasion={train_evasion_rate_benign:.3f} "
+                          f"avg_pert_L2={train_avg_norm_benign:.3f}")
 
-                        poison_fraction_train_benign = poison_fraction_for_task(
-                            t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
-                        )
-                        poison_pool_benign = np.where(evaded_mask_benign)[0] if REQUIRE_EVASION_SUCCESS \
-                            else benign_idx_train_c1
-                        n_to_poison_benign = min(
-                            int(round(poison_fraction_train_benign * len(benign_idx_train))), len(poison_pool_benign)
-                        )
-                        rng_benign = np.random.RandomState(args.seed + t + 20_000)  # distinct stream from mal train/test rngs
-                        poison_idx_benign = rng_benign.choice(poison_pool_benign, size=n_to_poison_benign, replace=False) \
-                            if n_to_poison_benign > 0 else np.array([], dtype=int)
-                        n_poisoned_benign = len(poison_idx_benign)
+                    poison_fraction_train_benign = poison_fraction_for_task(
+                        t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
+                    )
+                    poison_pool_benign = np.where(evaded_mask_benign)[0] if REQUIRE_EVASION_SUCCESS \
+                        else benign_idx_train
+                    n_to_poison_benign = min(
+                        int(round(poison_fraction_train_benign * len(benign_idx_train))), len(poison_pool_benign)
+                    )
+                    rng_benign = np.random.RandomState(args.seed + t + 20_000)  # distinct stream from mal train/test rngs
+                    poison_idx_benign = rng_benign.choice(poison_pool_benign, size=n_to_poison_benign, replace=False) \
+                        if n_to_poison_benign > 0 else np.array([], dtype=int)
+                    n_poisoned_benign = len(poison_idx_benign)
 
-                        print(f"[Task {t}] poisoned {n_poisoned_benign}/{len(benign_idx_train)} benign train samples "
-                              f"(poison_fraction_train_benign={poison_fraction_train_benign:.3f})")
+                    print(f"[Task {t}] poisoned {n_poisoned_benign}/{len(benign_idx_train)} benign train samples "
+                          f"(poison_fraction_train_benign={poison_fraction_train_benign:.3f})")
 
-                    # Applies uniformly whether or not the agent above ran.
                     X_train_for_classifier[poison_idx_benign] = X_train_pert_benign[poison_idx_benign]
 
                     # TEST-SIDE (REWORK, pocket-targeted test poisoning): moved to
@@ -2649,19 +2655,37 @@ def main():
         # had train-side agents/poisoning above (mirrors the nesting this code
         # used to live inside, before the reorder).
         if t > 0 and len(mal_idx_train) > 0:
+            # REWORK (recycled-pocket test pool): the perturbable test pool for
+            # BOTH classes below is no longer just this task's own C1-correct test
+            # rows -- it's the UNION of those with task (t-1)'s own test-split rows
+            # that C1 (the classifier at the end of task (t-1), i.e.
+            # pre_train_classifier_wrapper -- exactly what these episodes perturb
+            # against either way) also classifies correctly. Fetched once here
+            # (not inside the malicious/benign sub-blocks) so both classes see it
+            # regardless of which sub-block runs.
+            X_prev_test, y_prev_test = task_test_splits[t - 1]
+            gid_prev_test = task_test_gids[t - 1]
+
             if POISON_TEST_DATA and len(mal_idx_test) > 0:
-                # PROTOTYPE (C1-correct-only sampling): pre_train_classifier_wrapper
-                # is C1 here -- the exact "before" reference this agent's pockets
-                # are meant to be judged against. Restrict red_test_pert_agent's
-                # starting pool to test rows C1 already gets right, same reasoning
-                # as the train-side filter above.
+                # X_test_ext/y_test_ext concatenate [this task's X_test, task
+                # (t-1)'s X_test]; indices >= n_own_test refer to the RECYCLED
+                # half. A single c1_correct_pool call over the combined array
+                # naturally produces the union filtered by C1, since C1 is the
+                # same classifier instance either way.
+                mal_idx_prev_test = np.where(y_prev_test == mal_label)[0]
+
+                n_own_test = len(X_test)
+                X_test_ext = np.concatenate([X_test, X_prev_test], axis=0)
+                y_test_ext = np.concatenate([y_test, y_prev_test], axis=0)
+                mal_idx_test_ext = np.concatenate([mal_idx_test, mal_idx_prev_test + n_own_test])
+
                 mal_idx_test_c1 = c1_correct_pool(
-                    pre_train_classifier_wrapper, X_test, mal_idx_test, mal_label,
-                    t, "test-side malicious", pocket_diag_log_path,
+                    pre_train_classifier_wrapper, X_test_ext, mal_idx_test_ext, mal_label,
+                    t, f"test-side malicious (this task + recycled task {t - 1})", pocket_diag_log_path,
                 )
                 if len(mal_idx_test_c1) == 0:
                     warnings_log.append(
-                        f"Task {t}: no C1-correct malicious test candidates, "
+                        f"Task {t}: no C1-correct malicious test candidates (own or recycled), "
                         f"skipping red_test_pert_agent."
                     )
                 else:
@@ -2677,7 +2701,7 @@ def main():
                         mal_anchor_X = mal_anchor_X[anchor_sel]
 
                     env_test, agent_test = train_red_agent_for_task(
-                        t, "test", classifier_wrapper, X_test, y_test, benign_label, bank, args.seed, out_dir,
+                        t, "test", classifier_wrapper, X_test_ext, y_test_ext, benign_label, bank, args.seed, out_dir,
                         target_margin_confidence=RED_TARGET_MARGIN_CONFIDENCE,
                         shift_reference_classifier=pre_train_classifier_wrapper,
                         pocket_shift_weight=POCKET_SHIFT_WEIGHT,
@@ -2686,9 +2710,9 @@ def main():
                         proximity_length_scale=PROXIMITY_LENGTH_SCALE,
                         allowed_start_indices=mal_idx_test_c1,
                     )
-                    X_test_pert, test_evasion_rate, test_rewards, test_avg_norm, test_attacked, evaded_mask_test = \
+                    X_test_ext_pert, test_evasion_rate, test_rewards, test_avg_norm, test_attacked, evaded_mask_test = \
                         evaluate_agent_on_batch(
-                            env_test, agent_test, X_test, y_test, benign_label,
+                            env_test, agent_test, X_test_ext, y_test_ext, benign_label,
                             only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
                             allowed_start_indices=mal_idx_test_c1,
                         )
@@ -2699,36 +2723,65 @@ def main():
                     print(f"[Task {t} red_test_pert_agent] test_evasion={test_evasion_rate:.3f} "
                           f"avg_pert_L2={test_avg_norm:.3f}")
 
+                    # Poison quota is still sized off THIS task's own malicious test
+                    # count (len(mal_idx_test), unchanged from before) -- recycling
+                    # only enlarges the CANDIDATE pool the quota draws from, it does
+                    # not inflate how many samples end up poisoned.
                     poison_fraction_test = poison_fraction_for_task(
                         t, POISON_FRACTION_TEST_START, POISON_FRACTION_TEST_END
                     )
                     poison_pool_test = np.where(evaded_mask_test)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_test_c1
                     n_to_poison_test = min(int(round(poison_fraction_test * len(mal_idx_test))), len(poison_pool_test))
                     rng_test = np.random.RandomState(args.seed + t + 10_000)  # distinct stream from train's rng
-                    poison_idx_test = rng_test.choice(poison_pool_test, size=n_to_poison_test, replace=False) \
+                    poison_idx_test_ext = rng_test.choice(poison_pool_test, size=n_to_poison_test, replace=False) \
                         if n_to_poison_test > 0 else np.array([], dtype=int)
+
+                    # Split the ext-array draw back into "this task's own test rows"
+                    # (positions < n_own_test -- handled exactly as before) vs.
+                    # "recycled from task (t-1)" (positions >= n_own_test). The
+                    # recycled half is NEVER written into task_test_splits[t-1] or
+                    # anywhere persistent -- see the recycled_* variables' docstring
+                    # at the top of the loop. Their perturbed values/gids are kept
+                    # only long enough for THIS task's own C1/C2/C3 pocket-diagnostic
+                    # capture, below.
+                    own_mask_test = poison_idx_test_ext < n_own_test
+                    poison_idx_test = poison_idx_test_ext[own_mask_test]
+                    recycled_ext_idx_mal = poison_idx_test_ext[~own_mask_test]
+                    recycled_local_idx_mal = recycled_ext_idx_mal - n_own_test
                     n_poisoned_test = len(poison_idx_test)
 
                     X_test = X_test.copy()
-                    X_test[poison_idx_test] = X_test_pert[poison_idx_test]
+                    X_test[poison_idx_test] = X_test_ext_pert[poison_idx_test]
                     task_test_splits[t] = (X_test, y_test)
                     poisoned_test_sample_ids = gid_test[poison_idx_test].tolist() if n_poisoned_test > 0 else []
+
+                    recycled_gids_mal = gid_prev_test[recycled_local_idx_mal]
+                    recycled_Xpert_mal = X_test_ext_pert[recycled_ext_idx_mal]
+
                     print(f"[Task {t}] poisoned {n_poisoned_test}/{len(mal_idx_test)} malicious TEST samples "
+                          f"(+ {len(recycled_local_idx_mal)} recycled from task {t - 1}'s test split) "
                           f"(poison_fraction_test={poison_fraction_test:.3f}) -- "
                           f"test_evasion_rate was {test_evasion_rate:.3f}")
 
             if len(benign_idx_train) > 0 and POISON_TEST_DATA and len(benign_idx_test) > 0:
-                # PROTOTYPE (C1-correct-only sampling): mirror of mal_idx_test_c1
-                # above, on the benign side. Checked independently of the
-                # malicious test-side pool -- an empty one shouldn't skip the
-                # other.
+                # REWORK (recycled-pocket test pool): exact mirror of the malicious
+                # block above, on the benign side. X_prev_test/y_prev_test/
+                # gid_prev_test are already computed above (same task (t-1) split
+                # for both classes).
+                benign_idx_prev_test = np.where(y_prev_test == benign_label)[0]
+
+                n_own_test_benign = len(X_test)
+                X_test_ext_benign = np.concatenate([X_test, X_prev_test], axis=0)
+                y_test_ext_benign = np.concatenate([y_test, y_prev_test], axis=0)
+                benign_idx_test_ext = np.concatenate([benign_idx_test, benign_idx_prev_test + n_own_test_benign])
+
                 benign_idx_test_c1 = c1_correct_pool(
-                    pre_train_classifier_wrapper, X_test, benign_idx_test, benign_label,
-                    t, "test-side benign", pocket_diag_log_path,
+                    pre_train_classifier_wrapper, X_test_ext_benign, benign_idx_test_ext, benign_label,
+                    t, f"test-side benign (this task + recycled task {t - 1})", pocket_diag_log_path,
                 )
                 if len(benign_idx_test_c1) == 0:
                     warnings_log.append(
-                        f"Task {t}: no C1-correct benign test candidates, "
+                        f"Task {t}: no C1-correct benign test candidates (own or recycled), "
                         f"skipping red_test_benign_pert_agent."
                     )
                 else:
@@ -2743,7 +2796,8 @@ def main():
                         benign_anchor_X = benign_anchor_X[anchor_sel_benign]
 
                     env_test_benign, agent_test_benign = train_red_agent_for_task(
-                        t, "test_benign", classifier_wrapper, X_test, y_test, mal_label, bank, args.seed, out_dir,
+                        t, "test_benign", classifier_wrapper, X_test_ext_benign, y_test_ext_benign, mal_label,
+                        bank, args.seed, out_dir,
                         shift_reference_classifier=pre_train_classifier_wrapper,
                         pocket_shift_weight=POCKET_SHIFT_WEIGHT,
                         proximity_anchor_X=benign_anchor_X,
@@ -2751,9 +2805,9 @@ def main():
                         proximity_length_scale=PROXIMITY_LENGTH_SCALE,
                         allowed_start_indices=benign_idx_test_c1,
                     )
-                    (X_test_pert_benign, test_evasion_rate_benign, test_rewards_benign, test_avg_norm_benign,
+                    (X_test_ext_pert_benign, test_evasion_rate_benign, test_rewards_benign, test_avg_norm_benign,
                      test_attacked_benign, evaded_mask_test_benign) = evaluate_agent_on_batch(
-                        env_test_benign, agent_test_benign, X_test, y_test, mal_label,
+                        env_test_benign, agent_test_benign, X_test_ext_benign, y_test_ext_benign, mal_label,
                         only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
                         allowed_start_indices=benign_idx_test_c1,
                     )
@@ -2777,17 +2831,27 @@ def main():
                                                                                       # (+10_000), rng_benign
                                                                                       # (+20_000), and pc_rng
                                                                                       # (+30_000, below)
-                    poison_idx_test_benign = rng_test_benign.choice(
+                    poison_idx_test_ext_benign = rng_test_benign.choice(
                         poison_pool_test_benign, size=n_to_poison_test_benign, replace=False
                     ) if n_to_poison_test_benign > 0 else np.array([], dtype=int)
+
+                    own_mask_test_benign = poison_idx_test_ext_benign < n_own_test_benign
+                    poison_idx_test_benign = poison_idx_test_ext_benign[own_mask_test_benign]
+                    recycled_ext_idx_ben = poison_idx_test_ext_benign[~own_mask_test_benign]
+                    recycled_local_idx_ben = recycled_ext_idx_ben - n_own_test_benign
                     n_poisoned_test_benign = len(poison_idx_test_benign)
 
                     X_test = X_test.copy()
-                    X_test[poison_idx_test_benign] = X_test_pert_benign[poison_idx_test_benign]
+                    X_test[poison_idx_test_benign] = X_test_ext_pert_benign[poison_idx_test_benign]
                     task_test_splits[t] = (X_test, y_test)
                     poisoned_test_sample_ids_benign = gid_test[poison_idx_test_benign].tolist() \
                         if n_poisoned_test_benign > 0 else []
+
+                    recycled_gids_ben = gid_prev_test[recycled_local_idx_ben]
+                    recycled_Xpert_ben = X_test_ext_pert_benign[recycled_ext_idx_ben]
+
                     print(f"[Task {t}] poisoned {n_poisoned_test_benign}/{len(benign_idx_test)} benign TEST samples "
+                          f"(+ {len(recycled_local_idx_ben)} recycled from task {t - 1}'s test split) "
                           f"(poison_fraction_test_benign={poison_fraction_test_benign:.3f}) -- "
                           f"test_evasion_rate was {test_evasion_rate_benign:.3f}")
 
@@ -2919,6 +2983,33 @@ def main():
                         "true_label": int(benign_label),
                         "c1_pred": int(c1_ben[local_i]), "c2_pred": int(c2_ben[local_i]),
                         "c3_pred": None,
+                    })
+
+            # REWORK (recycled-pocket test pool): C1/C2 capture for rows recycled
+            # from task (t-1)'s test split -- their perturbed feature values live
+            # ONLY in recycled_Xpert_mal/recycled_Xpert_ben (never written into
+            # task_test_splits[t-1]), tagged with their ORIGINAL task-(t-1) gid and
+            # a "source" marker so the diagnostic log/results can tell them apart
+            # from this task's own perturbed rows.
+            if len(recycled_gids_mal) > 0:
+                c1_mal_rec = pre_train_classifier_wrapper.predict(recycled_Xpert_mal)
+                c2_mal_rec = classifier_wrapper.predict(recycled_Xpert_mal)
+                for local_i in range(len(recycled_gids_mal)):
+                    pocket_diag_entries.append({
+                        "gid": int(recycled_gids_mal[local_i]), "group": "malicious_perturbed",
+                        "true_label": int(mal_label),
+                        "c1_pred": int(c1_mal_rec[local_i]), "c2_pred": int(c2_mal_rec[local_i]),
+                        "c3_pred": None, "source": f"recycled_from_task_{t - 1}",
+                    })
+            if len(recycled_gids_ben) > 0:
+                c1_ben_rec = pre_train_classifier_wrapper.predict(recycled_Xpert_ben)
+                c2_ben_rec = classifier_wrapper.predict(recycled_Xpert_ben)
+                for local_i in range(len(recycled_gids_ben)):
+                    pocket_diag_entries.append({
+                        "gid": int(recycled_gids_ben[local_i]), "group": "benign_perturbed",
+                        "true_label": int(benign_label),
+                        "c1_pred": int(c1_ben_rec[local_i]), "c2_pred": int(c2_ben_rec[local_i]),
+                        "c3_pred": None, "source": f"recycled_from_task_{t - 1}",
                     })
 
         # ============================================================
@@ -3300,12 +3391,25 @@ def main():
             c3_mal = classifier_wrapper.predict(X_test_diag[poison_idx_test]) if len(poison_idx_test) > 0 else None
             c3_ben = classifier_wrapper.predict(X_test_diag[poison_idx_test_benign]) \
                 if len(poison_idx_test_benign) > 0 else None
-            mal_i = ben_i = 0
+            # REWORK (recycled-pocket test pool): recycled entries' perturbed
+            # values live in recycled_Xpert_mal/recycled_Xpert_ben (never in
+            # task_test_splits[t]), predicted directly here instead of via
+            # positional lookup into task_test_splits[t].
+            c3_mal_rec = classifier_wrapper.predict(recycled_Xpert_mal) if len(recycled_gids_mal) > 0 else None
+            c3_ben_rec = classifier_wrapper.predict(recycled_Xpert_ben) if len(recycled_gids_ben) > 0 else None
+            mal_i = ben_i = mal_rec_i = ben_rec_i = 0
             for e in pocket_diag_entries:
+                is_recycled = e.get("source") is not None
                 if e["group"] == "malicious_perturbed":
-                    e["c3_pred"] = int(c3_mal[mal_i]); mal_i += 1
+                    if is_recycled:
+                        e["c3_pred"] = int(c3_mal_rec[mal_rec_i]); mal_rec_i += 1
+                    else:
+                        e["c3_pred"] = int(c3_mal[mal_i]); mal_i += 1
                 else:
-                    e["c3_pred"] = int(c3_ben[ben_i]); ben_i += 1
+                    if is_recycled:
+                        e["c3_pred"] = int(c3_ben_rec[ben_rec_i]); ben_rec_i += 1
+                    else:
+                        e["c3_pred"] = int(c3_ben[ben_i]); ben_i += 1
 
         write_pocket_targeting_diagnostic(
             pocket_diag_log_path, t, pocket_diag_entries, unlearning_ran_this_task,
@@ -3334,6 +3438,16 @@ def main():
             "poisoned_sample_ids_benign": poisoned_sample_ids_benign,
             "n_poisoned_test_benign": n_poisoned_test_benign,
             "poisoned_test_sample_ids_benign": poisoned_test_sample_ids_benign,
+            # REWORK (recycled-pocket test pool): rows recycled from task (t-1)'s
+            # own test split and poisoned THIS task -- gids are ORIGINAL task-(t-1)
+            # global ids, never written into task_test_splits[t-1] (see the
+            # recycled_* variables' docstring at the top of the loop). Evaluated
+            # only via pocket_diag_entries (this task's diagnostic log section),
+            # not via perturbed_test_eval's cross-task gid machinery.
+            "n_poisoned_test_recycled_prev": int(len(recycled_gids_mal)),
+            "poisoned_test_sample_ids_recycled_prev": recycled_gids_mal.tolist(),
+            "n_poisoned_test_recycled_prev_benign": int(len(recycled_gids_ben)),
+            "poisoned_test_sample_ids_recycled_prev_benign": recycled_gids_ben.tolist(),
             "red_agent": red_report,
             "per_task_eval": per_task_eval,
             "perturbed_test_eval": perturbed_test_eval,
