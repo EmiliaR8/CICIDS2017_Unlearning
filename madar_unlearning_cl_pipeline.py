@@ -591,17 +591,25 @@ PERTURBATION_CLASSIFIER_N = 50  # target sample count PER CLASS (benign / clean_
                                  # Shrinks uniformly across all three classes (same N for all)
                                  # if any one pool has fewer than this many available this task
                                  # -- see build_perturbation_classifier_forget_set().
-CLEAN_REPLAY_BUFFER_OF_PERTURBED = True  # toggle: after IsolationForest/buffer fill (which now
+FORGET_SET_TOP_FRACTION = 0.50  # REWORK (uncertainty-margin pipeline): forget-set selection is
+                                 # now probability-ranked -- the TOP 50% of each class's own eval
+                                 # rows (malicious/benign, by TRUE binary label) this task, ranked
+                                 # by perturbation_classifier's predicted probability of that
+                                 # class's "perturbed" label (predict_proba, not a hard .predict()
+                                 # threshold). Replaces the old "every row hard-classified as
+                                 # perturbed" rule. POTENTIALLY REVISIT: ranks over this task's
+                                 # held-out EVAL rows only (see build_perturbation_classifier_
+                                 # forget_set's eval_idx -- never the classifier's own oracle-
+                                 # seeded training rows), not literally every train row of that
+                                 # class this task; also POTENTIALLY REVISIT whether 50% should be
+                                 # a per-class quota (current) vs. a combined one.
+CLEAN_REPLAY_BUFFER_OF_PERTURBED = True  # toggle: after IsolationForest/buffer fill (which
                                           # draws from the FULL task batch, unfiltered -- see
                                           # module docstring), remove any buffer entries that
-                                          # match potentially_perturbed_pool's global sample ids,
-                                          # then refill the malicious slot back up to budget with
-                                          # this task's own clean-malicious (not in
-                                          # potentially_perturbed_pool) samples, ranked via the
-                                          # same IsolationForest anomaly+inlier selection as
-                                          # everywhere else. Stays under-filled only if too few
-                                          # clean-malicious candidates exist this task to cover
-                                          # the deficit.
+                                          # match this task's forget-pool gids. REWORK
+                                          # (uncertainty-margin pipeline): no refill anymore --
+                                          # POTENTIALLY REVISIT -- the buffer is left under
+                                          # budget until a later task's own fill tops it back up.
 
 
 # ---------------------------------------------------------------------------
@@ -1400,12 +1408,15 @@ def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, poison_idx_be
     2. Classifier trains on those 4*N samples only, then predicts on every
        OTHER Xtr sample this task (never its own training rows -- avoids
        leaking their trivially-known labels into the eval metrics below).
-    3. potentially_perturbed_pool = predicted malicious_perturbed AND whose
-       actual ytr label is mal_label (the ordinary binary label the rest of
-       the pipeline sees -- a benign sample the classifier mislabels
-       "perturbed" is excluded, since it isn't malicious at all).
-       potentially_perturbed_benign_pool = the mirror: predicted
-       benign_perturbed AND whose actual ytr label is benign_label.
+    3. REWORK (uncertainty-margin pipeline): forget-set selection is now
+       probability-ranked rather than hard-classified. Among eval rows whose
+       TRUE binary label is mal_label, rank by predict_proba's
+       LABEL_PERTURBED probability (descending) and take the top
+       FORGET_SET_TOP_FRACTION (50%) as forget_idx_malicious. Mirror on the
+       benign side (LABEL_BENIGN_PERTURBED probability) for
+       forget_idx_benign. Both are per-class quotas, so the actual size is
+       always ~50% of that class's own eval-row count this task, not
+       whatever the classifier happens to hard-classify as perturbed.
 
     forget_idx = potentially_perturbed_pool UNION
     potentially_perturbed_benign_pool -- fed to a single
@@ -1484,11 +1495,36 @@ def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, poison_idx_be
         "balanced_accuracy": float(balanced_accuracy_score(true_binary, pred_binary)),
     }
 
-    potentially_perturbed_pool = eval_idx[(eval_pred == LABEL_PERTURBED) & (true_binary == mal_label)]
-    potentially_perturbed_benign_pool = eval_idx[(eval_pred == LABEL_BENIGN_PERTURBED) & (true_binary == benign_label)]
+    # REWORK (uncertainty-margin pipeline): probability-ranked top
+    # FORGET_SET_TOP_FRACTION selection, per class, over eval rows only --
+    # see FORGET_SET_TOP_FRACTION's definition and this function's docstring
+    # step 3 for the full rationale. eval_proba's column order follows
+    # clf.classes_ (alphabetical for string labels), so look the columns up
+    # by name rather than assuming a fixed position.
+    eval_proba = clf.predict_proba(X_np[eval_idx])
+    class_col = {c: i for i, c in enumerate(clf.classes_)}
 
-    forget_idx_malicious = np.asarray(sorted(int(i) for i in potentially_perturbed_pool), dtype=np.int64)
-    forget_idx_benign = np.asarray(sorted(int(i) for i in potentially_perturbed_benign_pool), dtype=np.int64)
+    mal_eval_local = np.where(true_binary == mal_label)[0]
+    ben_eval_local = np.where(true_binary == benign_label)[0]
+
+    if len(mal_eval_local) > 0:
+        mal_perturbed_proba = eval_proba[mal_eval_local, class_col[LABEL_PERTURBED]]
+        n_forget_mal = max(1, round(FORGET_SET_TOP_FRACTION * len(mal_eval_local)))
+        mal_order = np.argsort(-mal_perturbed_proba)  # descending: most-likely-perturbed first
+        forget_local_mal = mal_eval_local[mal_order[:n_forget_mal]]
+    else:
+        forget_local_mal = np.array([], dtype=np.int64)
+
+    if len(ben_eval_local) > 0:
+        ben_perturbed_proba = eval_proba[ben_eval_local, class_col[LABEL_BENIGN_PERTURBED]]
+        n_forget_ben = max(1, round(FORGET_SET_TOP_FRACTION * len(ben_eval_local)))
+        ben_order = np.argsort(-ben_perturbed_proba)
+        forget_local_ben = ben_eval_local[ben_order[:n_forget_ben]]
+    else:
+        forget_local_ben = np.array([], dtype=np.int64)
+
+    forget_idx_malicious = np.asarray(sorted(int(eval_idx[i]) for i in forget_local_mal), dtype=np.int64)
+    forget_idx_benign = np.asarray(sorted(int(eval_idx[i]) for i in forget_local_ben), dtype=np.int64)
     forget_idx = np.union1d(forget_idx_malicious, forget_idx_benign)
     retain_idx = np.setdiff1d(np.arange(n_samples, dtype=np.int64), forget_idx)
 
@@ -1510,11 +1546,17 @@ def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, poison_idx_be
 def unlearn_teacher_guided(model, teacher_model, forget_loader, retain_loader, omega, p_old_task,
                            si_c, epochs, lr, alpha, device):
     """
-    Pushes the forget set's predictions toward uniform over BOTH classes
-    (CICIDS is a fixed 2-class problem -- unlike the EMBER lineage this is
-    adapted from, there's no prev_active_count:active_count "newly introduced
-    class range" to target specifically, so the full 2-class distribution is
-    the target instead), anchored by ground-truth CE + KD on the retain set +
+    REWORK (uncertainty-margin pipeline): this becomes a corrective/targeted
+    cross-entropy toward ground truth rather than an entropy-maximizing
+    forget loss -- forget-set samples are pushed to be CONFIDENTLY
+    classified as their TRUE (pre-perturbation) label, i.e. the class
+    OPPOSITE whatever the poisoned model currently predicts for them,
+    instead of toward uniform/maximum uncertainty. ytr (and so f_l in the
+    training loop below) is always the true label even for perturbed rows --
+    only X changes on substitution, never y -- so this needs no new label
+    source, just a different loss against the SAME f_l the old KL-to-uniform
+    version received but never used. Anchored by ground-truth CE + KD on the
+    retain set +
     replay buffer against `teacher_model` (a snapshot taken right after this
     task's own CL training finished -- model_pre_unlearn in main() -- NOT the
     CL phase's replay teacher from the previous task), under an SI penalty
@@ -1562,11 +1604,13 @@ def unlearn_teacher_guided(model, teacher_model, forget_loader, retain_loader, o
             f_v, f_l = f_v.to(device), f_l.to(device)
             optimizer.zero_grad()
 
-            # --- 1. TARGETED ENTROPY (Forget) -- uniform over both classes ---
+            # --- 1. CORRECTIVE CROSS-ENTROPY (Forget) -- this becomes a
+            # corrective/targeted cross-entropy toward ground truth rather
+            # than an entropy-maximizing forget loss. f_l is the sample's
+            # TRUE (pre-perturbation) label -- pushing logits toward it
+            # directly targets confident correction, not uncertainty. ---
             logits = model(f_v)
-            log_probs = F.log_softmax(logits, dim=1)
-            uniform_probs = torch.full_like(log_probs, 1.0 / logits.shape[1])
-            forget_loss = F.kl_div(log_probs, uniform_probs, reduction='batchmean')
+            forget_loss = F.cross_entropy(logits, f_l)
 
             # --- 2. GROUND TRUTH + DISTILLATION (Retain + Replay) ---
             r_v, r_l = next(retain_iter)
@@ -2246,6 +2290,15 @@ def main():
                                         # used to refill the benign buffer slot the same way.
 
     for t, task in enumerate(tasks):
+        # REWORK (uncertainty-margin pipeline): buffer composition logged at
+        # every stage of this task's processing -- "start_of_task" here
+        # captures whatever the PREVIOUS task's cleaning step left behind
+        # (empty for task 0), i.e. exactly the replay signal this task's own
+        # train_cl_er call is about to use. See the other two checkpoints
+        # ("after_fill", "after_cleaning") further down, and where this dict
+        # gets attached to the task's results entry.
+        buffer_snapshots = {"start_of_task": buffer_composition_summary()}
+
         X = np.clip(task["features"].astype(np.float32), 0.0, 1.0)  # data is documented [0,1]-scaled already
         y = task["labels"].astype(np.int64)
         gid = task_offsets[t] + np.arange(len(y), dtype=np.int64)  # this task's pool-local id -> global id
@@ -3059,6 +3112,7 @@ def main():
         if t == 0:
             teacher_model = copy.deepcopy(model); teacher_model.eval()
             update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
+            buffer_snapshots["after_fill"] = buffer_composition_summary()
 
         else:
             pc_rng = np.random.RandomState(args.seed + t + 30_000)  # distinct stream from train/test poison rngs
@@ -3248,6 +3302,7 @@ def main():
             # see module docstring) -- matches plain MADAR's/task-0's call
             # pattern exactly.
             update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
+            buffer_snapshots["after_fill"] = buffer_composition_summary()
 
             # Step 5: post-hoc buffer cleaning (toggleable). Only meaningful
             # when the classifier actually ran and found something. Mirrored
@@ -3260,104 +3315,34 @@ def main():
             # pool + FIFO-cap mechanics either way.
             buffer_refill_diag = {}
             if CLEAN_REPLAY_BUFFER_OF_PERTURBED and pc_result is not None:
-                budget_per_label = MEM_SIZE // 2
 
-                def _clean_and_refill(label, forget_idx_for_label, historical_pool, category_tag):
-                    """REFILL (REWORK, uncertainty sampling): top `label`'s buffer
-                    slot back up to budget with clean samples of that label -- i.e.
-                    that label AND NOT in this task's forget pool for it (the
-                    classifier's judgment, not oracle ground truth -- staying
-                    consistent with the rest of this pipeline never peeking at
-                    poison_idx/poison_idx_benign beyond seeding the classifier's
-                    training labels). Candidates come from THIS task's own
-                    leftovers AND every past task's clean samples of that label
-                    (historical_pool), combined into one pool. Selection is
-                    uncertainty sampling: the CURRENT model (post this task's CL
-                    training + unlearning) scores every candidate's confidence
-                    (_predict_confidence, max class probability), and refill takes
-                    the LEAST confident first. Still only fills the deficit left
-                    by cleaning -- not a full replace of whatever survived
-                    cleaning."""
+                def _clean_buffer(label, forget_idx_for_label, category_tag):
+                    """REWORK (uncertainty-margin pipeline): removes buffer entries
+                    matching this task's forget-pool gids for `label`. NO refill --
+                    POTENTIALLY REVISIT: refill (uncertainty-sampled from this
+                    task's own leftovers + the historical_clean_*_pool cross-task
+                    pools) was removed pending a possible future reimplementation.
+                    The buffer is intentionally left under budget for the rest of
+                    this run until a LATER task's own update_buffer_madar() call
+                    naturally tops it back up from that task's own full batch."""
                     forget_gids = set(int(g) for g in gid_train[forget_idx_for_label])
                     before = len(label_buffers.get(label, []))
                     label_buffers[label] = [
                         e for e in label_buffers.get(label, []) if e[3] not in forget_gids
                     ]
                     n_removed = before - len(label_buffers[label])
-
-                    deficit = budget_per_label - len(label_buffers[label])
-                    n_refilled = 0
-                    refill_confidence_diag = None
-                    if deficit > 0:
-                        already_buffered = set(int(e[3]) for e in label_buffers[label])
-                        ytr_np = ytr.numpy()
-                        forgotten_set = set(int(i) for i in forget_idx_for_label)
-                        this_task_entries = [
-                            (Xtr[i].clone(), ytr[i].clone(), category[i], int(gid_train[i]))
-                            for i in range(len(Xtr))
-                            if ytr_np[i] == label and i not in forgotten_set
-                            and int(gid_train[i]) not in already_buffered
-                        ]
-                        historical_entries = [
-                            e for e in historical_pool if e[3] not in already_buffered
-                        ]
-                        combined_entries = this_task_entries + historical_entries
-
-                        if combined_entries:
-                            n_refill = min(deficit, len(combined_entries))
-                            cand_X = torch.stack([e[0] for e in combined_entries])
-                            confidence = _predict_confidence(model, cand_X, DEVICE)
-                            ranked_idx = np.argsort(confidence)  # ascending: least confident first
-                            local_idx = ranked_idx[:n_refill]
-
-                            for li in local_idx:
-                                label_buffers[label].append(combined_entries[li])
-                            n_refilled = len(local_idx)
-
-                            # Diagnostic (task 8/9 collapse investigation): confidence
-                            # distribution of the SELECTED refill samples vs. the full
-                            # candidate pool, so a future run can directly check whether
-                            # refill is pulling from a narrow band of near-boundary
-                            # samples and whether that band shifts/widens across tasks.
-                            selected_conf = confidence[local_idx]
-                            refill_confidence_diag = {
-                                "n_candidates": int(len(combined_entries)),
-                                "n_this_task_candidates": int(len(this_task_entries)),
-                                "n_historical_candidates": int(len(historical_entries)),
-                                "pool_confidence_mean": float(np.mean(confidence)),
-                                "pool_confidence_min": float(np.min(confidence)),
-                                "pool_confidence_max": float(np.max(confidence)),
-                                "selected_confidence_mean": float(np.mean(selected_conf)),
-                                "selected_confidence_min": float(np.min(selected_conf)),
-                                "selected_confidence_max": float(np.max(selected_conf)),
-                            }
-
                     print(f"    [Buffer clean] label={category_tag}: removed {n_removed} forget-pool "
-                          f"matches, refilled {n_refilled}/{deficit} with least-confident clean "
-                          f"{category_tag} samples (this task + {len(historical_pool)} historical "
-                          f"candidates).")
-                    if refill_confidence_diag is not None:
-                        print(f"    [Buffer refill confidence] label={category_tag} selected "
-                              f"mean/min/max={refill_confidence_diag['selected_confidence_mean']:.3f}/"
-                              f"{refill_confidence_diag['selected_confidence_min']:.3f}/"
-                              f"{refill_confidence_diag['selected_confidence_max']:.3f} vs. pool "
-                              f"mean={refill_confidence_diag['pool_confidence_mean']:.3f}")
-
-                    return {
-                        "n_removed": int(n_removed),
-                        "deficit": int(deficit),
-                        "n_refilled": int(n_refilled),
-                        "historical_pool_size_before_refill": int(len(historical_pool)),
-                        "refill_confidence": refill_confidence_diag,
-                    }
+                          f"matches (no refill -- POTENTIALLY REVISIT). Buffer size now "
+                          f"{len(label_buffers[label])}/{MEM_SIZE // 2}.")
+                    return {"n_removed": int(n_removed), "buffer_size_after": int(len(label_buffers[label]))}
 
                 if len(pc_result["forget_idx_malicious"]) > 0:
-                    buffer_refill_diag["malicious"] = _clean_and_refill(
-                        mal_label, pc_result["forget_idx_malicious"], historical_clean_mal_pool, "malicious"
+                    buffer_refill_diag["malicious"] = _clean_buffer(
+                        mal_label, pc_result["forget_idx_malicious"], "malicious"
                     )
                 if len(pc_result["forget_idx_benign"]) > 0:
-                    buffer_refill_diag["benign"] = _clean_and_refill(
-                        benign_label, pc_result["forget_idx_benign"], historical_clean_benign_pool, "benign"
+                    buffer_refill_diag["benign"] = _clean_buffer(
+                        benign_label, pc_result["forget_idx_benign"], "benign"
                     )
 
                 replay_buffer.clear()
@@ -3366,6 +3351,13 @@ def main():
 
                 if buffer_refill_diag:
                     unlearning_metrics["buffer_refill"] = buffer_refill_diag
+
+            # REWORK (uncertainty-margin pipeline): buffer composition logged
+            # here too -- AFTER this task's cleaning step -- so buffer_snapshots
+            # (see its other two checkpoints: start-of-task and after-fill)
+            # captures the buffer's FINAL state for this task, i.e. exactly what
+            # task (t+1)'s own train_cl_er call will inherit as its replay signal.
+            buffer_snapshots["after_cleaning"] = buffer_composition_summary()
 
             # Grow the cross-task historical pools with THIS task's own clean
             # samples, AFTER this task's own refill above (so a task's own
@@ -3483,6 +3475,7 @@ def main():
             "grad_steps": grad_steps,
             "replay_buffer_composition": buffer_summary,
             "unlearning": unlearning_metrics,
+            "buffer_snapshots": buffer_snapshots,
         })
 
         # TEMPORARY DIAGNOSTIC (pocket-targeting investigation): pause at the
