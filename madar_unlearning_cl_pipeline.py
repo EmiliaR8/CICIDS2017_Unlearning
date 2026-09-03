@@ -610,18 +610,16 @@ PERTURBATION_CLASSIFIER_N = 50  # target sample count PER CLASS (benign / clean_
                                  # Shrinks uniformly across all three classes (same N for all)
                                  # if any one pool has fewer than this many available this task
                                  # -- see build_perturbation_classifier_forget_set().
-FORGET_SET_TOP_FRACTION = 0.50  # REWORK (uncertainty-margin pipeline): forget-set selection is
-                                 # now probability-ranked -- the TOP 50% of each class's own eval
-                                 # rows (malicious/benign, by TRUE binary label) this task, ranked
-                                 # by perturbation_classifier's predicted probability of that
-                                 # class's "perturbed" label (predict_proba, not a hard .predict()
-                                 # threshold). Replaces the old "every row hard-classified as
-                                 # perturbed" rule. POTENTIALLY REVISIT: ranks over this task's
-                                 # held-out EVAL rows only (see build_perturbation_classifier_
-                                 # forget_set's eval_idx -- never the classifier's own oracle-
-                                 # seeded training rows), not literally every train row of that
-                                 # class this task; also POTENTIALLY REVISIT whether 50% should be
-                                 # a per-class quota (current) vs. a combined one.
+# REWORK (revisited Q11 answer): forget-set selection is back to hard
+# classification -- every held-out eval row (see build_perturbation_classifier_
+# forget_set's eval_idx) whose predicted label is LABEL_PERTURBED (malicious
+# side) or LABEL_BENIGN_PERTURBED (benign side) goes into the forget set, 100%
+# of them, no probability ranking and no FORGET_SET_TOP_FRACTION quota. This
+# replaces the earlier top-50%-by-probability-per-class rule (which itself had
+# replaced an identical hard-classify rule) -- forget-set size now tracks
+# perturbation_classifier's actual positive rate on each class directly,
+# whatever that happens to be a given task, rather than being pinned to a
+# fixed fraction of that class's eval-row count.
 CLEAN_REPLAY_BUFFER_OF_PERTURBED = True  # toggle: after IsolationForest/buffer fill (which
                                           # draws from the FULL task batch, unfiltered -- see
                                           # module docstring), remove any buffer entries that
@@ -1427,15 +1425,19 @@ def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, poison_idx_be
     2. Classifier trains on those 4*N samples only, then predicts on every
        OTHER Xtr sample this task (never its own training rows -- avoids
        leaking their trivially-known labels into the eval metrics below).
-    3. REWORK (uncertainty-margin pipeline): forget-set selection is now
-       probability-ranked rather than hard-classified. Among eval rows whose
-       TRUE binary label is mal_label, rank by predict_proba's
-       LABEL_PERTURBED probability (descending) and take the top
-       FORGET_SET_TOP_FRACTION (50%) as forget_idx_malicious. Mirror on the
-       benign side (LABEL_BENIGN_PERTURBED probability) for
-       forget_idx_benign. Both are per-class quotas, so the actual size is
-       always ~50% of that class's own eval-row count this task, not
-       whatever the classifier happens to hard-classify as perturbed.
+    3. REWORK (revisited Q11 answer): forget-set selection is hard-classified
+       again, at 100% -- every eval row (see eval_idx below) whose HARD
+       .predict() output is LABEL_PERTURBED becomes forget_idx_malicious,
+       and every eval row predicted LABEL_BENIGN_PERTURBED becomes
+       forget_idx_benign. No probability ranking, no per-class quota --
+       forget-set size is whatever the classifier's raw positive rate on
+       each class happens to be this task, which can be smaller OR larger
+       than the old fixed-50%-per-class rule depending on how confidently
+       (and how often) it fires. perturbed_class_metrics (see return value)
+       reports precision/recall for LABEL_PERTURBED/LABEL_BENIGN_PERTURBED
+       against oracle ground truth on these same eval rows, so a task where
+       the forget set stays empty or misses the true pockets shows up
+       directly as low recall there, rather than being invisible.
 
     forget_idx = potentially_perturbed_pool UNION
     potentially_perturbed_benign_pool -- fed to a single
@@ -1460,8 +1462,12 @@ def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, poison_idx_be
     two_class_metric (predicted benign OR benign_perturbed -> compare to
     true benign; predicted malicious_clean OR malicious_perturbed ->
     compare to true malicious; accuracy + balanced_accuracy over the SAME
-    held-out eval rows), and n_eval (how many rows the classifier was
-    scored against).
+    held-out eval rows), n_eval (how many rows the classifier was scored
+    against), and perturbed_class_metrics (precision/recall/tp/fp/fn for
+    LABEL_PERTURBED and LABEL_BENIGN_PERTURBED specifically, derived from
+    confusion_matrix -- logging aid for seeing whether a task's forget set
+    is small because there was nothing to catch or because the classifier
+    missed it).
     """
     poison_idx = np.asarray(poison_idx, dtype=np.int64)
     poison_idx_benign = np.asarray(poison_idx_benign, dtype=np.int64)
@@ -1514,38 +1520,41 @@ def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, poison_idx_be
         "balanced_accuracy": float(balanced_accuracy_score(true_binary, pred_binary)),
     }
 
-    # REWORK (uncertainty-margin pipeline): probability-ranked top
-    # FORGET_SET_TOP_FRACTION selection, per class, over eval rows only --
-    # see FORGET_SET_TOP_FRACTION's definition and this function's docstring
-    # step 3 for the full rationale. eval_proba's column order follows
-    # clf.classes_ (alphabetical for string labels), so look the columns up
-    # by name rather than assuming a fixed position.
-    eval_proba = clf.predict_proba(X_np[eval_idx])
-    class_col = {c: i for i, c in enumerate(clf.classes_)}
-
+    # REWORK (revisited Q11 answer): hard-classification selection, 100% --
+    # see this function's docstring step 3. A malicious eval row enters the
+    # forget set iff the classifier's own .predict() called it
+    # LABEL_PERTURBED (no ranking, no quota); mirror for LABEL_BENIGN_PERTURBED
+    # on the benign side.
     mal_eval_local = np.where(true_binary == mal_label)[0]
     ben_eval_local = np.where(true_binary == benign_label)[0]
 
-    if len(mal_eval_local) > 0:
-        mal_perturbed_proba = eval_proba[mal_eval_local, class_col[LABEL_PERTURBED]]
-        n_forget_mal = max(1, round(FORGET_SET_TOP_FRACTION * len(mal_eval_local)))
-        mal_order = np.argsort(-mal_perturbed_proba)  # descending: most-likely-perturbed first
-        forget_local_mal = mal_eval_local[mal_order[:n_forget_mal]]
-    else:
-        forget_local_mal = np.array([], dtype=np.int64)
-
-    if len(ben_eval_local) > 0:
-        ben_perturbed_proba = eval_proba[ben_eval_local, class_col[LABEL_BENIGN_PERTURBED]]
-        n_forget_ben = max(1, round(FORGET_SET_TOP_FRACTION * len(ben_eval_local)))
-        ben_order = np.argsort(-ben_perturbed_proba)
-        forget_local_ben = ben_eval_local[ben_order[:n_forget_ben]]
-    else:
-        forget_local_ben = np.array([], dtype=np.int64)
+    forget_local_mal = mal_eval_local[eval_pred[mal_eval_local] == LABEL_PERTURBED]
+    forget_local_ben = ben_eval_local[eval_pred[ben_eval_local] == LABEL_BENIGN_PERTURBED]
 
     forget_idx_malicious = np.asarray(sorted(int(eval_idx[i]) for i in forget_local_mal), dtype=np.int64)
     forget_idx_benign = np.asarray(sorted(int(eval_idx[i]) for i in forget_local_ben), dtype=np.int64)
     forget_idx = np.union1d(forget_idx_malicious, forget_idx_benign)
     retain_idx = np.setdiff1d(np.arange(n_samples, dtype=np.int64), forget_idx)
+
+    # LOGGING (added to diagnose the forget set's actual behavior against
+    # ground truth, now that its size is no longer pinned to a fixed
+    # fraction): precision/recall for the two "perturbed" classes specifically,
+    # read off cm -- a task where recall is low means the true pockets are
+    # being missed (never entering the forget set at all, regardless of this
+    # selection rule), not just that the forget set looks small.
+    def _class_precision_recall(class_label):
+        ci = PERTURBATION_CLASSIFIER_CLASSES.index(class_label)
+        tp = int(cm[ci, ci])
+        fn = int(cm[ci, :].sum()) - tp
+        fp = int(cm[:, ci].sum()) - tp
+        precision = tp / (tp + fp) if (tp + fp) > 0 else None
+        recall = tp / (tp + fn) if (tp + fn) > 0 else None
+        return {"tp": tp, "fp": fp, "fn": fn, "precision": precision, "recall": recall}
+
+    perturbed_class_metrics = {
+        "malicious": _class_precision_recall(LABEL_PERTURBED),
+        "benign": _class_precision_recall(LABEL_BENIGN_PERTURBED),
+    }
 
     return {
         "forget_idx": forget_idx,
@@ -1558,6 +1567,7 @@ def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, poison_idx_be
             "matrix": cm.tolist(),
         },
         "two_class_metric": two_class_metric,
+        "perturbed_class_metrics": perturbed_class_metrics,
         "n_eval": int(len(eval_idx)),
     }
 
@@ -3151,14 +3161,24 @@ def main():
             else:
                 forget_idx, retain_idx = pc_result["forget_idx"], pc_result["retain_idx"]
                 cm, tcm = pc_result["confusion_matrix"], pc_result["two_class_metric"]
+                pcm = pc_result["perturbed_class_metrics"]
                 print(f"    [Perturbation classifier] n_used={pc_result['n_used']}/class, "
                       f"n_eval={pc_result['n_eval']}, 2-class acc={tcm['accuracy']:.3f} "
                       f"bal_acc={tcm['balanced_accuracy']:.3f}")
                 print(f"    [Perturbation classifier confusion] classes={cm['classes']}, matrix={cm['matrix']}")
+
+                def _fmt_pr(m):
+                    p = f"{m['precision']:.3f}" if m['precision'] is not None else "n/a"
+                    r = f"{m['recall']:.3f}" if m['recall'] is not None else "n/a"
+                    return f"precision={p} recall={r} (tp={m['tp']} fp={m['fp']} fn={m['fn']})"
+
+                print(f"    [Perturbation classifier perturbed-class metrics] "
+                      f"malicious_perturbed: {_fmt_pr(pcm['malicious'])} | "
+                      f"benign_perturbed: {_fmt_pr(pcm['benign'])}")
                 print(f"    [Forget set] potentially_perturbed_pool (malicious) = "
                       f"{len(pc_result['forget_idx_malicious'])}, potentially_perturbed_benign_pool = "
                       f"{len(pc_result['forget_idx_benign'])}, combined forget_idx = {len(forget_idx)} samples "
-                      f"(retain = {len(retain_idx)})")
+                      f"(retain = {len(retain_idx)}) -- 100% hard-classified selection")
 
                 if len(forget_idx) == 0:
                     print("    [Unlearning] forget set empty -- "
@@ -3170,6 +3190,7 @@ def main():
                         "perturbation_classifier": {
                             "n_used": pc_result["n_used"], "n_eval": pc_result["n_eval"],
                             "confusion_matrix": cm, "two_class_metric": tcm,
+                            "perturbed_class_metrics": pc_result["perturbed_class_metrics"],
                         },
                     }
                 else:
@@ -3305,6 +3326,7 @@ def main():
                         "perturbation_classifier": {
                             "n_used": pc_result["n_used"], "n_eval": pc_result["n_eval"],
                             "confusion_matrix": cm, "two_class_metric": tcm,
+                            "perturbed_class_metrics": pc_result["perturbed_class_metrics"],
                         },
                         "unlearn_diagnostics": unlearn_diag,
                         "forget_set": f_m, "retain_set": r_m,
