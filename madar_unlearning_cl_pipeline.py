@@ -377,7 +377,19 @@ TEST_AGGREGATE_FRACTION = 0.40  # per class: fraction of this task's own row cou
 
 RED_EPSILON = 0.25
 RED_MAX_STEPS = 25
-RED_TIMESTEPS_PER_TASK = 2500
+RED_TIMESTEPS_PER_TASK = 5000  # REWORK (uncertainty-margin pipeline): doubled from 2500 --
+                                # POTENTIALLY REVISIT, tune from real run data. Proposed
+                                # because the test-side joint C1-correct/C2-wrong success
+                                # condition (kept from the previous branch) was already a
+                                # sparse target under 2500 steps -- real runs showed test
+                                # evasion/success rates collapsing toward 0 once that
+                                # condition became mandatory, which reads as SAC not getting
+                                # enough training signal to reliably find the narrow
+                                # "still-C1-correct" window rather than the objective being
+                                # unreachable. Doubling is a first, conservative step (not
+                                # tuned against this specific pipeline's real numbers yet) --
+                                # revisit upward or downward once a run's actual success
+                                # rates are in.
 ALPHA_CONTRAST = 0.5
 CONTRASTIVE_EMA = 0.95
 CONTRASTIVE_RECENCY_DECAY = 0.5  # weight of task (k-1) vs (k-2) vs ... in the diversity reward
@@ -568,7 +580,14 @@ UNLEARN_LR = 1e-4
 UNLEARN_ALPHA = 0.2      # weight of the forget loss; 0.0 = extra-training control
                           # ablation (identical steps/optimizer/data flow, no forget
                           # objective -- isolates "more training" from "actually
-                          # targeting forgetting")
+                          # targeting forgetting"). REWORK (uncertainty-margin
+                          # pipeline): left UNCHANGED even though the forget loss
+                          # itself changed (KL-to-uniform -> corrective cross-entropy,
+                          # see unlearn_teacher_guided) -- POTENTIALLY REVISIT. The new
+                          # loss is a much more directly targeted signal than the old
+                          # entropy-maximizing one, so this alpha/UNLEARN_SI_C balance
+                          # (tuned against the OLD loss) may need retuning once real
+                          # runs show how it behaves against the new one.
 UNLEARN_SI_C = 0.1  # SI penalty weight during UNLEARNING ONLY -- deliberately
                      # decoupled from SI_C (still 1.0 for ordinary CL training,
                      # unchanged). First smoke test (madar_u1.json) showed forget-set
@@ -2712,7 +2731,11 @@ def main():
             # pre_train_classifier_wrapper -- exactly what these episodes perturb
             # against either way) also classifies correctly. Fetched once here
             # (not inside the malicious/benign sub-blocks) so both classes see it
-            # regardless of which sub-block runs.
+            # regardless of which sub-block runs. Deliberately re-derived from
+            # task (t-1) ALONE, fresh every task -- POTENTIALLY REVISIT: a
+            # longer-range pool that carries forward unused C1-correct samples
+            # across more than one task back was considered and explicitly
+            # deferred, not ruled out.
             X_prev_test, y_prev_test = task_test_splits[t - 1]
             gid_prev_test = task_test_gids[t - 1]
 

@@ -223,7 +223,12 @@ TEST_AGGREGATE_FRACTION = 0.40  # per class: fraction of this task's own row cou
 
 RED_EPSILON = 0.25
 RED_MAX_STEPS = 25
-RED_TIMESTEPS_PER_TASK = 2500
+RED_TIMESTEPS_PER_TASK = 5000  # REWORK (uncertainty-margin pipeline): doubled from 2500 --
+                                # POTENTIALLY REVISIT, tune from real run data. See
+                                # madar_unlearning_cl_pipeline.py's identical constant for the
+                                # full rationale (test-side joint success condition was a
+                                # sparse target under the old budget). Identical value here so
+                                # both pipelines' red agents get the same training budget.
 ALPHA_CONTRAST = 0.5
 CONTRASTIVE_EMA = 0.95
 CONTRASTIVE_RECENCY_DECAY = 0.5  # weight of task (k-1) vs (k-2) vs ... in the diversity reward
@@ -1837,9 +1842,12 @@ def main():
             if len(mal_idx_train) > 0:
                 # REWORK (recycled-pocket test pool): fetched once here (not
                 # inside the malicious/benign sub-blocks) so both classes see it
-                # regardless of which sub-block runs. Mirror of
-                # madar_unlearning_cl_pipeline.py's identical addition -- see its
-                # docstring at the same point for the full rationale.
+                # regardless of which sub-block runs. Deliberately re-derived
+                # from task (t-1) ALONE, fresh every task. POTENTIALLY REVISIT:
+                # a longer-range pool was considered and explicitly deferred,
+                # not ruled out. Mirror of madar_unlearning_cl_pipeline.py's
+                # identical addition -- see its docstring at the same point
+                # for the full rationale.
                 X_prev_test, y_prev_test = task_test_splits[t - 1]
                 gid_prev_test = task_test_gids[t - 1]
 
