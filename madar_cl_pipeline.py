@@ -91,17 +91,18 @@ each agent's reward is pushed away from every previously-registered agent
 mechanism -- train_t vs train_{t-1}, test_t vs test_{t-1}, and (since test
 trains second, same task) test_t vs train_t, though that last one is
 necessarily one-directional: train_t finishes training before test_t exists,
-so train_t's reward never references test_t. Evasion success stays a hard
-requirement independent of this diversity pressure: the +10 reward bonus for
-successful misclassification dominates the reward magnitude, and
-REQUIRE_EVASION_SUCCESS (unchanged) still means only genuinely-evasive
-perturbations (evaded_mask=True) ever become poison candidates for either
-pool. red_test_pert_agent only trains when POISON_TEST_DATA is on AND this
-task actually has malicious test samples, to avoid training a whole second
-SAC agent for nothing. Also: POISON_SCHEDULE_ENABLED flipped to False (flat
-POISON_FRACTION_FLAT=0.30 for both train and test, every task) -- moving
-away from the per-task schedule per explicit request; the schedule code
-itself is untouched and can be re-enabled by flipping the toggle back.
+so train_t's reward never references test_t. Evasion success stays a hard,
+unconditional requirement independent of this diversity pressure: the +10
+reward bonus for successful misclassification dominates the reward
+magnitude, and only genuinely-evasive perturbations (evaded_mask=True) ever
+become poison candidates -- there is no toggle to relax this. red_test_pert_
+agent only trains when POISON_TEST_DATA is on AND this task actually has
+malicious test samples, to avoid training a whole second SAC agent for
+nothing. REWORK (uncertainty-margin pipeline): the old per-task poison
+schedule (ramping fractions across tasks) is gone -- both train and test now
+use fixed, always-active per-class fractions (TRAIN_UNCERTAIN_FRACTION=0.30,
+TEST_AGGREGATE_FRACTION=0.40), and WHICH samples get attacked is chosen by
+uncertainty (proximity to C1's decision boundary) rather than randomly.
 
 UPDATE (REWORK, quad red agents): two MORE agents added per task --
 red_train_benign_pert_agent and red_test_benign_pert_agent -- mirroring the
@@ -115,10 +116,9 @@ train_benign, test_benign) register in the SAME contrastive bank under
 "{task_id}_{agent_type}", so each is pushed away from every agent
 registered before it (this task and all earlier ones) via the existing
 recency-weighted mechanism -- no new diversity logic needed. Poisoning of
-benign data mirrors the malicious mechanic exactly (same flat
-POISON_FRACTION_FLAT rate via poison_fraction_for_task, same
-REQUIRE_EVASION_SUCCESS gate, same evaded-mask-restricted substitution) and
-is applied on TOP of the existing malicious substitution in
+benign data mirrors the malicious mechanic exactly (same TRAIN_UNCERTAIN_
+FRACTION quota and uncertainty-ranked selection, same unconditional success
+requirement) and is applied on TOP of the existing malicious substitution in
 X_train_for_classifier/X_test (disjoint index sets, so no collision).
 Ground truth y is left unchanged (still benign) on substitution, matching
 how malicious_perturbed keeps its true malicious label -- only X changes.
@@ -190,7 +190,6 @@ NUM_TASKS = 10
 TASK_FRACTIONS = [0.3000, 0.0918, 0.0883, 0.0848, 0.0813, 0.0778, 0.0743, 0.0708, 0.0673, 0.0638]
 TASK_TEST_FRAC = 0.20
 
-REQUIRE_EVASION_SUCCESS = True  # only successfully-evasive perturbations poison training data
 POISON_TEST_DATA = True  # REWORK: matches madar_unlearning_cl_pipeline.py's POISON_TEST_DATA
                           # (previously False/absent here -- test was never poisoned). Needed
                           # so per_task_eval/pooled_eval are computed on the SAME kind of data
@@ -200,47 +199,27 @@ POISON_TEST_DATA = True  # REWORK: matches madar_unlearning_cl_pipeline.py's POI
                           # on). Same evaded-mask-restricted substitution as train (schedule
                           # below), applied to each task's test split.
 
-# Per-task poison injection schedule (REWORK, replaces the old flat
-# POISON_FRACTION=0.3). Linear interpolation from task 1 to task NUM_TASKS-1
-# (task 0 has no red agent, so no poisoning either way). TRAIN and TEST are
-# deliberate mirror images of each other -- train front-loads poison (heavy
-# early, tapering later), test back-loads it (light early, heavy later).
-# REWORK 2: endpoints pushed to a much more drastic 0.99/0.01 split (was
-# 0.50/0.10) -- crossing point is now ~0.50 around the midpoint task, no
-# longer ~0.30. POISON_FRACTION_FLAT (below) was NOT changed to match --
-# it's an independently-set fallback for the schedule-off case, not derived
-# from the schedule's endpoints, so it no longer coincides with the
-# schedule's midpoint the way it used to. Plain global variables (not
-# derived/computed) specifically so they're easy to change later -- see
-# poison_fraction_for_task() below.
-POISON_SCHEDULE_ENABLED = False  # REWORK 3: off by default now -- moving away from the
-                                 # per-task schedule in favor of a flat rate, per explicit
-                                 # request, alongside the dual train/test red-agent rework
-                                 # below. toggle: True = the linear train/test schedule
-                                 # below. False = flat POISON_FRACTION_FLAT for BOTH train
-                                 # and test, every task (current setting).
-POISON_FRACTION_FLAT = 0.30  # fallback fraction (both train and test) when
-                              # POISON_SCHEDULE_ENABLED is False -- i.e. the ACTIVE rate
-                              # right now. Originally matched the schedule's own
-                              # midpoint/crossing value; no longer does since REWORK 2
-                              # moved the schedule's endpoints (see above).
-POISON_FRACTION_TRAIN_START = 0.99  # task 1
-POISON_FRACTION_TRAIN_END = 0.01    # task NUM_TASKS-1
-POISON_FRACTION_TEST_START = 0.01   # task 1
-POISON_FRACTION_TEST_END = 0.99     # task NUM_TASKS-1
-
-
-def poison_fraction_for_task(t, start, end, num_tasks=NUM_TASKS):
-    """Linear interpolation from `start` (task 1) to `end` (task num_tasks-1).
-    t=0 is never called (task 0 has no red agent / no poisoning). Returns
-    POISON_FRACTION_FLAT instead, ignoring start/end, whenever
-    POISON_SCHEDULE_ENABLED is False."""
-    if not POISON_SCHEDULE_ENABLED:
-        return POISON_FRACTION_FLAT
-    if num_tasks <= 2:
-        return start
-    frac = (t - 1) / (num_tasks - 2)
-    return start + frac * (end - start)
+# REWORK (uncertainty-margin pipeline): replaces the old per-task ramp
+# schedule (POISON_SCHEDULE_ENABLED/POISON_FRACTION_TRAIN/TEST_START/END) and
+# its flat fallback (POISON_FRACTION_FLAT) with two fixed, always-active
+# fractions -- no schedule, no toggle. Both are PER-CLASS quotas (malicious
+# and benign each get their own independent budget of this size), not a
+# combined/shared budget. Identical values to madar_unlearning_cl_pipeline.py's.
+TRAIN_UNCERTAIN_FRACTION = 0.30  # per class: fraction of this task's own row count for
+                                  # that class selected (most-uncertain-under-C1 first) as
+                                  # the attack pool for that class's train-side agent. Every
+                                  # episode that successfully flips (see NetworkAttackEnv's
+                                  # bare class-flip termination) replaces its clean row --
+                                  # so the ACTUAL poisoned count can land under 30% if not
+                                  # every attempt succeeds within RED_MAX_STEPS. There is no
+                                  # REQUIRE_EVASION_SUCCESS toggle anymore -- success is
+                                  # unconditionally required to poison, always.
+TEST_AGGREGATE_FRACTION = 0.40  # per class: fraction of this task's own row count for that
+                                 # class selected, tiered (C1-correct-by-uncertainty first,
+                                 # then C1-incorrect padding), from the aggregated (this
+                                 # task's own test split + task (t-1)'s own test split) pool.
+                                 # Same "actual count can land under quota" caveat as train
+                                 # above -- see the TEST-SIDE blocks for the tiering logic.
 
 RED_EPSILON = 0.25
 RED_MAX_STEPS = 25
@@ -249,13 +228,16 @@ ALPHA_CONTRAST = 0.5
 CONTRASTIVE_EMA = 0.95
 CONTRASTIVE_RECENCY_DECAY = 0.5  # weight of task (k-1) vs (k-2) vs ... in the diversity reward
 
-RED_TARGET_MARGIN_CONFIDENCE = 0.55  # REWORK (margin-minimizing evasion): passed to every
-                                      # NetworkAttackEnv (both train_pert_agent and
-                                      # test_pert_agent) so their reward peaks at just-barely-
-                                      # evasive confidence instead of rewarding maximal
-                                      # confidence deep into the target class. See
-                                      # NetworkAttackEnv.step()'s confidence_term for the exact
-                                      # shape. Rationale: plain MADAR's buffer selection
+RED_TARGET_MARGIN_CONFIDENCE = 0.55  # REWORK (margin-minimizing evasion): passed to the
+                                      # test_pert_agent/test_benign_pert_agent NetworkAttackEnv
+                                      # as a DENSE shaping term only -- test-side success/
+                                      # termination is fully governed by the joint C1-correct/
+                                      # C2-wrong condition (see NetworkAttackEnv's
+                                      # shift_reference_classifier), independent of this value.
+                                      # Reward peaks at just-barely-evasive confidence instead of
+                                      # rewarding maximal confidence deep into the target class.
+                                      # See NetworkAttackEnv.step()'s confidence_term for the
+                                      # exact shape. Rationale: plain MADAR's buffer selection
                                       # (IsolationForest anomaly/inlier over the latent
                                       # embedding) has no notion of margin/decision-boundary
                                       # distance, so margin-hugging poison is a blind spot for
@@ -263,6 +245,24 @@ RED_TARGET_MARGIN_CONFIDENCE = 0.55  # REWORK (margin-minimizing evasion): passe
                                       # perturbation_classifier (an explicitly boundary-adjacent
                                       # detector). Set to None to restore the original
                                       # confidence-maximizing reward for both agents.
+
+RED_TRAIN_TARGET_MARGIN_CONFIDENCE = 0.65  # REWORK (uncertainty-margin pipeline): passed to
+                                      # BOTH train_pert_agent and train_benign_pert_agent
+                                      # (train-side only -- test-side keeps using
+                                      # RED_TARGET_MARGIN_CONFIDENCE=0.55 above, unchanged).
+                                      # confidence_term (NetworkAttackEnv.step()) peaks at this
+                                      # value: 0.5 + 0.15, i.e. 0.15 past uncertain toward the
+                                      # target class -- slightly further than the OLD 0.55
+                                      # target, favoring confidence closer to 0.65 over landing
+                                      # right at 0.55, while still penalizing overshoot deep past
+                                      # 0.65 (same symmetric peaked shape as
+                                      # RED_TARGET_MARGIN_CONFIDENCE, just re-centered). Episode
+                                      # TERMINATION for train-side agents is unaffected by this
+                                      # value -- it still fires on the bare class flip (or
+                                      # max_steps), same as always; only the reward that shapes
+                                      # WHERE within the evasive region the agent prefers to land
+                                      # changes. Identical constant/value to
+                                      # madar_unlearning_cl_pipeline.py's.
 
 POCKET_SHIFT_WEIGHT = 5.0  # REWORK (pocket-targeted test poisoning): weight on
                             # NetworkAttackEnv's pocket_term (see its docstring) for
@@ -279,6 +279,14 @@ POCKET_SHIFT_WEIGHT = 5.0  # REWORK (pocket-targeted test poisoning): weight on
                             # None/0 to disable (falls back to whatever
                             # target_margin_confidence alone produces).
 
+PROXIMITY_SHAPING_ENABLED = False  # REWORK (uncertainty-margin pipeline): master toggle for
+                         # the proximity-anchored reward term below -- OFF by default. The new
+                         # test-side objective (C1-correct/C2-wrong joint condition over the
+                         # uncertainty-tiered aggregated pool) doesn't depend on this at all;
+                         # it's kept only as an OPTIONAL, opt-in extra shaping term for future
+                         # experiments, never applied automatically. When False, PROXIMITY_WEIGHT
+                         # is forced to None at every call site below regardless of its own value,
+                         # so flipping this one flag is enough to fully disable it.
 PROXIMITY_WEIGHT = 3.0  # REWORK (proximity-anchored pocket targeting): weight on
                          # NetworkAttackEnv's proximity_term (see its docstring) for
                          # red_test_pert_agent/red_test_benign_pert_agent ONLY.
@@ -561,6 +569,22 @@ def c1_correct_pool(classifier_c1, X_full, idx_pool, target_label, task_id, agen
         with open(pocket_diag_log_path, "a") as f:
             f.write(msg + "\n")
     return correct_pool
+
+
+def _uncertainty_rank(classifier, X_full, idx_pool):
+    """REWORK (uncertainty-margin pipeline): reorders idx_pool (indices into
+    X_full) by ASCENDING confidence under `classifier` -- i.e. most uncertain
+    (predict_proba's max-class-probability closest to 0.5, so closest to the
+    decision boundary) first. Kept in step with
+    madar_unlearning_cl_pipeline.py's identical copy of this function.
+    Returns the SAME set of indices, just reordered -- does not filter
+    anything out."""
+    if len(idx_pool) == 0:
+        return idx_pool
+    proba = classifier.predict_proba(X_full[idx_pool])
+    confidence = proba.max(axis=1)
+    order = np.argsort(confidence)  # ascending: most uncertain (lowest max-proba) first
+    return idx_pool[order]
 
 
 def train_red_agent_for_task(task_id, agent_type, classifier, X_data, y_data, benign_label, bank, seed, out_dir,
@@ -975,8 +999,8 @@ def write_pocket_targeting_diagnostic(log_path, task_id, entries, benign_label, 
     to follow it with (contrast madar_unlearning_cl_pipeline.py's version,
     which also tracks C3).
 
-    Since REQUIRE_EVASION_SUCCESS guarantees every logged sample already
-    evades C2 by construction, "C1 correct -> C2 WRONG" is the only pattern
+    Since success (evading C2) is unconditionally required to be logged as
+    poisoned, "C1 correct -> C2 WRONG" is the only pattern
     that means anything ("a genuine pocket -- this task's training flipped a
     previously-correct sample"); "C1 WRONG -> C2 WRONG" just means the
     sample was already a pre-existing error, unrelated to this task.
@@ -1524,28 +1548,35 @@ def main():
                 # only ever perturbs test data. See train_red_agent_for_task's
                 # docstring for why this also fixes a latent env/data mismatch
                 # bug in the old single-agent design.
-                # REWORK (train-side no longer C1-filtered): train-side agents
-                # now batch directly from this task's own malicious/benign
-                # training rows, unfiltered -- no C1-correctness requirement.
-                # c1_correct_pool() is still called and logged below purely as
-                # an FYI diagnostic, but its return value no longer gates or
-                # restricts anything; allowed_start_indices is the full
-                # mal_idx_train. Kept in step with
+                # REWORK (uncertainty-margin pipeline): the attack pool is no
+                # longer "everything" or "C1-correct only" -- it's the top
+                # TRAIN_UNCERTAIN_FRACTION (30%) of this class's own rows,
+                # ranked by ascending confidence under C1 (most uncertain --
+                # closest to C1's decision boundary -- first). c1_correct_pool()
+                # is still called and logged purely as an FYI diagnostic,
+                # separate from this selection. Kept in step with
                 # madar_unlearning_cl_pipeline.py's identical change.
                 _ = c1_correct_pool(
                     classifier_wrapper, X_train, mal_idx_train, mal_label,
                     t, "train-side malicious (FYI only, not filtered)", pocket_diag_log_path,
                 )
+                mal_train_ranked = _uncertainty_rank(classifier_wrapper, X_train, mal_idx_train)
+                n_attack_mal_train = max(1, round(TRAIN_UNCERTAIN_FRACTION * len(mal_idx_train)))
+                attack_pool_mal_train = mal_train_ranked[:n_attack_mal_train]
+                print(f"    [Uncertainty selection] Task {t} train-side malicious: attacking "
+                      f"{len(attack_pool_mal_train)}/{len(mal_idx_train)} "
+                      f"({TRAIN_UNCERTAIN_FRACTION:.0%}, most-uncertain-under-C1 first).")
+
                 env_train, agent_train = train_red_agent_for_task(
                     t, "train", classifier_wrapper, X_train, y_train, benign_label, bank, args.seed, out_dir,
-                    target_margin_confidence=RED_TARGET_MARGIN_CONFIDENCE,
-                    allowed_start_indices=mal_idx_train,
+                    target_margin_confidence=RED_TRAIN_TARGET_MARGIN_CONFIDENCE,
+                    allowed_start_indices=attack_pool_mal_train,
                 )
                 X_train_pert, train_evasion_rate, train_rewards, train_avg_norm, train_attacked, evaded_mask = \
                     evaluate_agent_on_batch(
                         env_train, agent_train, X_train, y_train, benign_label,
                         only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
-                        allowed_start_indices=mal_idx_train,
+                        allowed_start_indices=attack_pool_mal_train,
                     )
 
                 red_report = {
@@ -1556,18 +1587,18 @@ def main():
                 print(f"[Task {t} red_train_pert_agent] train_evasion={train_evasion_rate:.3f} "
                       f"avg_pert_L2={train_avg_norm:.3f}")
 
-                poison_fraction_train = poison_fraction_for_task(
-                    t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
-                )
-                poison_pool = np.where(evaded_mask)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_train
-                n_to_poison = min(int(round(poison_fraction_train * len(mal_idx_train))), len(poison_pool))
-                rng = np.random.RandomState(args.seed + t)
-                poison_idx = rng.choice(poison_pool, size=n_to_poison, replace=False) if n_to_poison > 0 else \
-                    np.array([], dtype=int)
+                # REWORK: no separate quota/subsample step anymore -- the attack
+                # pool above IS the quota (already capped at 30%), and success is
+                # unconditionally required (no REQUIRE_EVASION_SUCCESS toggle), so
+                # every episode that successfully flips (evaded_mask=True) simply
+                # becomes the poisoned set. Actual n_poisoned can land under 30%
+                # of len(mal_idx_train) if not every attempt succeeds.
+                poison_idx = np.where(evaded_mask)[0]
                 n_poisoned = len(poison_idx)
 
-                print(f"[Task {t}] poisoned {n_poisoned}/{len(mal_idx_train)} malicious train samples "
-                      f"(poison_fraction_train={poison_fraction_train:.3f})")
+                print(f"[Task {t}] poisoned {n_poisoned}/{len(attack_pool_mal_train)} attacked "
+                      f"({n_poisoned}/{len(mal_idx_train)} of all malicious train samples) "
+                      f"malicious train samples (attack quota was {TRAIN_UNCERTAIN_FRACTION:.0%})")
 
                 X_train_for_classifier = X_train.copy()
                 X_train_for_classifier[poison_idx] = X_train_pert[poison_idx]
@@ -1592,29 +1623,38 @@ def main():
                 # mechanism -- no new diversity logic needed. Ground truth
                 # label is left as benign_label on substitution, matching how
                 # malicious_perturbed keeps its true malicious label -- only
-                # X changes, not y. No target_margin_confidence bias here
-                # (see train_red_agent_for_task's docstring) -- plain
-                # confidence-maximizing evasion.
+                # X changes, not y. Uses the SAME RED_TRAIN_TARGET_MARGIN_
+                # CONFIDENCE margin bias as the malicious side (see
+                # train_red_agent_for_task's docstring).
                 if len(benign_idx_train) == 0:
                     warnings_log.append(f"Task {t}: no benign training samples, skipping benign red agents.")
                     X_train_pert_benign = X_train.copy()  # placeholder, mirrors the malicious side
                 else:
-                    # REWORK (train-side no longer C1-filtered): mirror of the
-                    # malicious side above -- c1_correct_pool() is FYI-only here
-                    # too, allowed_start_indices is the full benign_idx_train.
+                    # REWORK (uncertainty-margin pipeline): mirror of the
+                    # malicious side above -- top TRAIN_UNCERTAIN_FRACTION (30%)
+                    # of benign_idx_train, most-uncertain-under-C1 first.
+                    # c1_correct_pool() stays FYI-only.
                     _ = c1_correct_pool(
                         classifier_wrapper, X_train, benign_idx_train, benign_label,
                         t, "train-side benign (FYI only, not filtered)", pocket_diag_log_path,
                     )
+                    benign_train_ranked = _uncertainty_rank(classifier_wrapper, X_train, benign_idx_train)
+                    n_attack_benign_train = max(1, round(TRAIN_UNCERTAIN_FRACTION * len(benign_idx_train)))
+                    attack_pool_benign_train = benign_train_ranked[:n_attack_benign_train]
+                    print(f"    [Uncertainty selection] Task {t} train-side benign: attacking "
+                          f"{len(attack_pool_benign_train)}/{len(benign_idx_train)} "
+                          f"({TRAIN_UNCERTAIN_FRACTION:.0%}, most-uncertain-under-C1 first).")
+
                     env_train_benign, agent_train_benign = train_red_agent_for_task(
                         t, "train_benign", classifier_wrapper, X_train, y_train, mal_label, bank, args.seed, out_dir,
-                        allowed_start_indices=benign_idx_train,
+                        target_margin_confidence=RED_TRAIN_TARGET_MARGIN_CONFIDENCE,
+                        allowed_start_indices=attack_pool_benign_train,
                     )
                     (X_train_pert_benign, train_evasion_rate_benign, train_rewards_benign, train_avg_norm_benign,
                      train_attacked_benign, evaded_mask_benign) = evaluate_agent_on_batch(
                         env_train_benign, agent_train_benign, X_train, y_train, mal_label,
                         only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
-                        allowed_start_indices=benign_idx_train,
+                        allowed_start_indices=attack_pool_benign_train,
                     )
 
                     red_report["train_benign_evasion_rate"] = train_evasion_rate_benign
@@ -1624,21 +1664,14 @@ def main():
                     print(f"[Task {t} red_train_benign_pert_agent] train_evasion={train_evasion_rate_benign:.3f} "
                           f"avg_pert_L2={train_avg_norm_benign:.3f}")
 
-                    poison_fraction_train_benign = poison_fraction_for_task(
-                        t, POISON_FRACTION_TRAIN_START, POISON_FRACTION_TRAIN_END
-                    )
-                    poison_pool_benign = np.where(evaded_mask_benign)[0] if REQUIRE_EVASION_SUCCESS \
-                        else benign_idx_train
-                    n_to_poison_benign = min(
-                        int(round(poison_fraction_train_benign * len(benign_idx_train))), len(poison_pool_benign)
-                    )
-                    rng_benign = np.random.RandomState(args.seed + t + 20_000)  # distinct stream from mal train/test rngs
-                    poison_idx_benign = rng_benign.choice(poison_pool_benign, size=n_to_poison_benign, replace=False) \
-                        if n_to_poison_benign > 0 else np.array([], dtype=int)
+                    # REWORK: no separate quota/subsample step -- see the malicious
+                    # side's identical note above.
+                    poison_idx_benign = np.where(evaded_mask_benign)[0]
                     n_poisoned_benign = len(poison_idx_benign)
 
-                    print(f"[Task {t}] poisoned {n_poisoned_benign}/{len(benign_idx_train)} benign train samples "
-                          f"(poison_fraction_train_benign={poison_fraction_train_benign:.3f})")
+                    print(f"[Task {t}] poisoned {n_poisoned_benign}/{len(attack_pool_benign_train)} attacked "
+                          f"({n_poisoned_benign}/{len(benign_idx_train)} of all benign train samples) "
+                          f"benign train samples (attack quota was {TRAIN_UNCERTAIN_FRACTION:.0%})")
 
                     X_train_for_classifier[poison_idx_benign] = X_train_pert_benign[poison_idx_benign]
 
@@ -1727,18 +1760,8 @@ def main():
             update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
 
         else:
-            # PROTOTYPE (adaptation-split pocket visualization): this task's
-            # single combined train_cl_er call is now TWO sequential calls on
-            # the same model/optimizer/W/omega/p_old_task -- a "perturbed"
-            # pass on just this task's poisoned rows, then a "clean" pass on
-            # everything else. Isolates how much EACH data type shifts the
-            # boundary. Kept in step with madar_unlearning_cl_pipeline.py's
-            # identical split -- see that file's module-level notes on the
-            # design decisions (proportional iteration split, buffer+KD in
-            # both passes, single teacher_model snapshot, single SI omega
-            # update after both passes).
             print(f"  Samples: {len(Xtr)} (+{len(replay_buffer)} replay) | "
-                  f"MADAR ER+KD+SI, {CL_ITERS} iters (split across perturbed/clean passes)")
+                  f"MADAR ER+KD+SI, {CL_ITERS} iters (single pass)")
             optimizer = optim.SGD(model.parameters(), lr=1e-4, momentum=0.9, weight_decay=1e-6)
             grad_steps = 0
 
@@ -1761,61 +1784,27 @@ def main():
             category_test_clean_so_far = np.full(len(y_test), "malicious_clean", dtype=object)
             category_test_clean_so_far[y_test == benign_label] = "benign"
 
-            perturbed_rows = np.union1d(poison_idx, poison_idx_benign)
-            clean_rows = np.setdiff1d(np.arange(len(Xtr)), perturbed_rows)
-            n_perturbed, n_clean = len(perturbed_rows), len(clean_rows)
-
-            if n_perturbed > 0:
-                iters_perturbed = max(1, round(CL_ITERS * n_perturbed / (n_perturbed + n_clean)))
-            else:
-                iters_perturbed = 0
-            iters_clean = CL_ITERS - iters_perturbed
-
-            if n_perturbed > 0:
-                drop_last_pert = (n_perturbed % BATCH_SIZE == 1)
-                loader_pert = data.DataLoader(
-                    data.TensorDataset(Xtr[perturbed_rows], ytr[perturbed_rows]), batch_size=BATCH_SIZE,
-                    shuffle=True, drop_last=drop_last_pert,
-                )
-                print(f"    [Adaptation: perturbed] {n_perturbed} samples "
-                      f"(+{len(replay_buffer)} replay) | {iters_perturbed} iters")
-                train_cl_er(model, teacher_model, optimizer, loader_pert, iters_perturbed,
-                            W, omega, p_old_task, t, SI_C, DEVICE)
-                grad_steps += iters_perturbed
-
-                proba_after_pert = _decision_grid(model, pca_mean, pca_components, pca_extent, DEVICE, mal_label)[2]
-                task_pocket_mask |= compute_pocket_mask(prev_proba, proba_after_pert)
-                prev_proba = proba_after_pert
-                boundary_panels.append(plot_decision_boundary(
-                    model, DEVICE, pca_mean, pca_components, pca_extent, mal_label,
-                    Xtr.numpy(), category, X_test_current_scaled_np, category_test_clean_so_far,
-                    t, os.path.join(out_dir, "plots", f"decision_boundary_task{t}_perturbed_adapt.png"),
-                    checkpoint_label="perturbed_adapt", highlight_mask=task_pocket_mask,
-                    precomputed_grid=(xx0, yy0, proba_after_pert),
-                ))
-            else:
-                print(f"    [Adaptation: perturbed] skipped -- no poisoned rows this task.")
-
-            drop_last_clean = (n_clean % BATCH_SIZE == 1)
-            loader_clean = data.DataLoader(
-                data.TensorDataset(Xtr[clean_rows], ytr[clean_rows]), batch_size=BATCH_SIZE,
-                shuffle=True, drop_last=drop_last_clean,
+            # REWORK (uncertainty-margin pipeline): reverted to a SINGLE
+            # training pass over the full (partially poisoned) train set --
+            # the two-phase perturbed/clean split is gone. Perturbed rows are
+            # already swapped in place in Xtr/ytr by this point (both classes).
+            drop_last = (len(Xtr) % BATCH_SIZE == 1)
+            loader = data.DataLoader(
+                data.TensorDataset(Xtr, ytr), batch_size=BATCH_SIZE, shuffle=True, drop_last=drop_last,
             )
-            print(f"    [Adaptation: clean] {n_clean} samples "
-                  f"(+{len(replay_buffer)} replay) | {iters_clean} iters")
-            train_cl_er(model, teacher_model, optimizer, loader_clean, iters_clean,
+            train_cl_er(model, teacher_model, optimizer, loader, CL_ITERS,
                         W, omega, p_old_task, t, SI_C, DEVICE)
-            grad_steps += iters_clean
+            grad_steps += CL_ITERS
 
-            proba_after_clean = _decision_grid(model, pca_mean, pca_components, pca_extent, DEVICE, mal_label)[2]
-            task_pocket_mask |= compute_pocket_mask(prev_proba, proba_after_clean)
-            prev_proba = proba_after_clean
+            proba_after_adapt = _decision_grid(model, pca_mean, pca_components, pca_extent, DEVICE, mal_label)[2]
+            task_pocket_mask |= compute_pocket_mask(prev_proba, proba_after_adapt)
+            prev_proba = proba_after_adapt
             boundary_panels.append(plot_decision_boundary(
                 model, DEVICE, pca_mean, pca_components, pca_extent, mal_label,
                 Xtr.numpy(), category, X_test_current_scaled_np, category_test_clean_so_far,
-                t, os.path.join(out_dir, "plots", f"decision_boundary_task{t}_clean_adapt.png"),
-                checkpoint_label="clean_adapt", highlight_mask=task_pocket_mask,
-                precomputed_grid=(xx0, yy0, proba_after_clean),
+                t, os.path.join(out_dir, "plots", f"decision_boundary_task{t}_adapt.png"),
+                checkpoint_label="adapt", highlight_mask=task_pocket_mask,
+                precomputed_grid=(xx0, yy0, proba_after_adapt),
             ))
 
             for n, p in model.named_parameters():
@@ -1866,7 +1855,31 @@ def main():
                         pre_train_classifier_wrapper, X_test_ext, mal_idx_test_ext, mal_label,
                         t, f"test-side malicious (this task + recycled task {t - 1})", pocket_diag_log_path,
                     )
-                    if len(mal_idx_test_c1) == 0:
+                    # REWORK (uncertainty-margin pipeline): tiered selection --
+                    # tier 1 = C1-correct candidates (ranked most-uncertain-
+                    # under-C1 first), tier 2 = C1-incorrect candidates padded in
+                    # once tier 1 runs out, up to TEST_AGGREGATE_FRACTION (40%)
+                    # of THIS TASK's own malicious test row count. Tier-2
+                    # episodes can essentially never satisfy the joint C1-
+                    # correct/C2-wrong success condition below, so padding trades
+                    # a lower per-attempt success rate for more total attempts --
+                    # an accepted, deliberate tradeoff.
+                    n_target_mal_test = max(1, round(TEST_AGGREGATE_FRACTION * len(mal_idx_test)))
+                    mal_tier1 = _uncertainty_rank(pre_train_classifier_wrapper, X_test_ext, mal_idx_test_c1)
+                    mal_tier2_pool = np.setdiff1d(mal_idx_test_ext, mal_idx_test_c1)
+                    mal_tier2 = _uncertainty_rank(pre_train_classifier_wrapper, X_test_ext, mal_tier2_pool)
+                    n_tier1_used_mal = min(len(mal_tier1), n_target_mal_test)
+                    attack_pool_mal_test = mal_tier1[:n_target_mal_test]
+                    if len(attack_pool_mal_test) < n_target_mal_test:
+                        attack_pool_mal_test = np.concatenate([
+                            attack_pool_mal_test, mal_tier2[:n_target_mal_test - len(attack_pool_mal_test)]
+                        ])
+                    n_tier2_used_mal = len(attack_pool_mal_test) - n_tier1_used_mal
+                    print(f"    [Uncertainty selection] Task {t} test-side malicious: attacking "
+                          f"{len(attack_pool_mal_test)}/{n_target_mal_test} target "
+                          f"({n_tier1_used_mal} C1-correct, {n_tier2_used_mal} padded C1-incorrect).")
+
+                    if len(attack_pool_mal_test) == 0:
                         warnings_log.append(
                             f"Task {t}: no C1-correct malicious test candidates (own or recycled), "
                             f"skipping red_test_pert_agent."
@@ -1887,31 +1900,32 @@ def main():
                             shift_reference_classifier=pre_train_classifier_wrapper,
                             pocket_shift_weight=POCKET_SHIFT_WEIGHT,
                             proximity_anchor_X=mal_anchor_X,
-                            proximity_weight=PROXIMITY_WEIGHT,
+                            proximity_weight=PROXIMITY_WEIGHT if PROXIMITY_SHAPING_ENABLED else None,
                             proximity_length_scale=PROXIMITY_LENGTH_SCALE,
-                            allowed_start_indices=mal_idx_test_c1,
+                            allowed_start_indices=attack_pool_mal_test,
                         )
                         X_test_ext_pert, test_evasion_rate, test_rewards, test_avg_norm, test_attacked, evaded_mask_test = \
                             evaluate_agent_on_batch(
                                 env_test, agent_test, X_test_ext, y_test_ext, benign_label,
                                 only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
-                                allowed_start_indices=mal_idx_test_c1,
+                                allowed_start_indices=attack_pool_mal_test,
                             )
                         red_report["test_evasion_rate"] = test_evasion_rate
                         red_report["test_attacked"] = test_attacked
                         red_report["test_avg_reward"] = float(np.mean(test_rewards)) if test_rewards else 0.0
                         red_report["test_avg_pert_l2"] = test_avg_norm
+                        red_report["test_n_tier1_c1_correct"] = int(n_tier1_used_mal)
+                        red_report["test_n_tier2_padded"] = int(n_tier2_used_mal)
                         print(f"[Task {t} red_test_pert_agent] test_evasion={test_evasion_rate:.3f} "
                               f"avg_pert_L2={test_avg_norm:.3f}")
 
-                        poison_fraction_test = poison_fraction_for_task(
-                            t, POISON_FRACTION_TEST_START, POISON_FRACTION_TEST_END
-                        )
-                        poison_pool_test = np.where(evaded_mask_test)[0] if REQUIRE_EVASION_SUCCESS else mal_idx_test_c1
-                        n_to_poison_test = min(int(round(poison_fraction_test * len(mal_idx_test))), len(poison_pool_test))
-                        rng_test = np.random.RandomState(args.seed + t + 10_000)  # distinct stream from train's rng
-                        poison_idx_test_ext = rng_test.choice(poison_pool_test, size=n_to_poison_test, replace=False) \
-                            if n_to_poison_test > 0 else np.array([], dtype=int)
+                        # REWORK: no separate quota/subsample step anymore -- the
+                        # attack pool above IS the quota (already capped at 40% of
+                        # this task's own malicious test count), and evaded_mask_
+                        # test's "success" already IS the joint C1-correct/C2-wrong
+                        # condition, so every episode that satisfies it becomes the
+                        # poisoned set directly.
+                        poison_idx_test_ext = np.where(evaded_mask_test)[0]
 
                         own_mask_test = poison_idx_test_ext < n_own_test
                         poison_idx_test = poison_idx_test_ext[own_mask_test]
@@ -1927,10 +1941,11 @@ def main():
                         recycled_gids_mal = gid_prev_test[recycled_local_idx_mal]
                         recycled_Xpert_mal = X_test_ext_pert[recycled_ext_idx_mal]
 
-                        print(f"[Task {t}] poisoned {n_poisoned_test}/{len(mal_idx_test)} malicious TEST samples "
-                              f"(+ {len(recycled_local_idx_mal)} recycled from task {t - 1}'s test split) "
-                              f"(poison_fraction_test={poison_fraction_test:.3f}) -- "
-                              f"test_evasion_rate was {test_evasion_rate:.3f}")
+                        print(f"[Task {t}] poisoned {n_poisoned_test}/{len(attack_pool_mal_test)} attacked "
+                              f"({n_tier1_used_mal} C1-correct, {n_tier2_used_mal} padded) malicious TEST samples "
+                              f"(+ {len(recycled_local_idx_mal)} recycled from task {t - 1}'s test split) -- "
+                              f"success rate on C1-correct starts was "
+                              f"{(n_poisoned_test / n_tier1_used_mal) if n_tier1_used_mal > 0 else float('nan'):.3f}")
 
                 if len(benign_idx_train) > 0 and POISON_TEST_DATA and len(benign_idx_test) > 0:
                     # REWORK (recycled-pocket test pool): exact mirror of the
@@ -1947,7 +1962,24 @@ def main():
                         pre_train_classifier_wrapper, X_test_ext_benign, benign_idx_test_ext, benign_label,
                         t, f"test-side benign (this task + recycled task {t - 1})", pocket_diag_log_path,
                     )
-                    if len(benign_idx_test_c1) == 0:
+                    # REWORK (uncertainty-margin pipeline): mirror of the
+                    # malicious tiered selection above.
+                    n_target_ben_test = max(1, round(TEST_AGGREGATE_FRACTION * len(benign_idx_test)))
+                    ben_tier1 = _uncertainty_rank(pre_train_classifier_wrapper, X_test_ext_benign, benign_idx_test_c1)
+                    ben_tier2_pool = np.setdiff1d(benign_idx_test_ext, benign_idx_test_c1)
+                    ben_tier2 = _uncertainty_rank(pre_train_classifier_wrapper, X_test_ext_benign, ben_tier2_pool)
+                    n_tier1_used_ben = min(len(ben_tier1), n_target_ben_test)
+                    attack_pool_ben_test = ben_tier1[:n_target_ben_test]
+                    if len(attack_pool_ben_test) < n_target_ben_test:
+                        attack_pool_ben_test = np.concatenate([
+                            attack_pool_ben_test, ben_tier2[:n_target_ben_test - len(attack_pool_ben_test)]
+                        ])
+                    n_tier2_used_ben = len(attack_pool_ben_test) - n_tier1_used_ben
+                    print(f"    [Uncertainty selection] Task {t} test-side benign: attacking "
+                          f"{len(attack_pool_ben_test)}/{n_target_ben_test} target "
+                          f"({n_tier1_used_ben} C1-correct, {n_tier2_used_ben} padded C1-incorrect).")
+
+                    if len(attack_pool_ben_test) == 0:
                         warnings_log.append(
                             f"Task {t}: no C1-correct benign test candidates (own or recycled), "
                             f"skipping red_test_benign_pert_agent."
@@ -1969,38 +2001,28 @@ def main():
                             shift_reference_classifier=pre_train_classifier_wrapper,
                             pocket_shift_weight=POCKET_SHIFT_WEIGHT,
                             proximity_anchor_X=benign_anchor_X,
-                            proximity_weight=PROXIMITY_WEIGHT,
+                            proximity_weight=PROXIMITY_WEIGHT if PROXIMITY_SHAPING_ENABLED else None,
                             proximity_length_scale=PROXIMITY_LENGTH_SCALE,
-                            allowed_start_indices=benign_idx_test_c1,
+                            allowed_start_indices=attack_pool_ben_test,
                         )
                         (X_test_ext_pert_benign, test_evasion_rate_benign, test_rewards_benign, test_avg_norm_benign,
                          test_attacked_benign, evaded_mask_test_benign) = evaluate_agent_on_batch(
                             env_test_benign, agent_test_benign, X_test_ext_benign, y_test_ext_benign, mal_label,
                             only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
-                            allowed_start_indices=benign_idx_test_c1,
+                            allowed_start_indices=attack_pool_ben_test,
                         )
                         red_report["test_benign_evasion_rate"] = test_evasion_rate_benign
                         red_report["test_benign_attacked"] = test_attacked_benign
                         red_report["test_benign_avg_reward"] = float(np.mean(test_rewards_benign)) if test_rewards_benign else 0.0
                         red_report["test_benign_avg_pert_l2"] = test_avg_norm_benign
+                        red_report["test_benign_n_tier1_c1_correct"] = int(n_tier1_used_ben)
+                        red_report["test_benign_n_tier2_padded"] = int(n_tier2_used_ben)
                         print(f"[Task {t} red_test_benign_pert_agent] test_evasion={test_evasion_rate_benign:.3f} "
                               f"avg_pert_L2={test_avg_norm_benign:.3f}")
 
-                        poison_fraction_test_benign = poison_fraction_for_task(
-                            t, POISON_FRACTION_TEST_START, POISON_FRACTION_TEST_END
-                        )
-                        poison_pool_test_benign = np.where(evaded_mask_test_benign)[0] if REQUIRE_EVASION_SUCCESS \
-                            else benign_idx_test_c1
-                        n_to_poison_test_benign = min(
-                            int(round(poison_fraction_test_benign * len(benign_idx_test))), len(poison_pool_test_benign)
-                        )
-                        rng_test_benign = np.random.RandomState(args.seed + t + 40_000)  # distinct stream, avoids
-                                                                                          # colliding with rng_test
-                                                                                          # (+10_000) and rng_benign
-                                                                                          # (+20_000) above
-                        poison_idx_test_ext_benign = rng_test_benign.choice(
-                            poison_pool_test_benign, size=n_to_poison_test_benign, replace=False
-                        ) if n_to_poison_test_benign > 0 else np.array([], dtype=int)
+                        # REWORK: no separate quota/subsample step -- see the
+                        # malicious side's identical note above.
+                        poison_idx_test_ext_benign = np.where(evaded_mask_test_benign)[0]
 
                         own_mask_test_benign = poison_idx_test_ext_benign < n_own_test_benign
                         poison_idx_test_benign = poison_idx_test_ext_benign[own_mask_test_benign]
@@ -2017,10 +2039,11 @@ def main():
                         recycled_gids_ben = gid_prev_test[recycled_local_idx_ben]
                         recycled_Xpert_ben = X_test_ext_pert_benign[recycled_ext_idx_ben]
 
-                        print(f"[Task {t}] poisoned {n_poisoned_test_benign}/{len(benign_idx_test)} benign TEST samples "
-                              f"(+ {len(recycled_local_idx_ben)} recycled from task {t - 1}'s test split) "
-                              f"(poison_fraction_test_benign={poison_fraction_test_benign:.3f}) -- "
-                              f"test_evasion_rate was {test_evasion_rate_benign:.3f}")
+                        print(f"[Task {t}] poisoned {n_poisoned_test_benign}/{len(attack_pool_ben_test)} attacked "
+                              f"({n_tier1_used_ben} C1-correct, {n_tier2_used_ben} padded) benign TEST samples "
+                              f"(+ {len(recycled_local_idx_ben)} recycled from task {t - 1}'s test split) -- "
+                              f"success rate on C1-correct starts was "
+                              f"{(n_poisoned_test_benign / n_tier1_used_ben) if n_tier1_used_ben > 0 else float('nan'):.3f}")
 
             teacher_model = copy.deepcopy(model); teacher_model.eval()
             update_buffer_madar(Xtr, ytr, category, gid_train, benign_label, mal_label, model, DEVICE)
@@ -2191,13 +2214,11 @@ def main():
         "strategy": "madar_er_kd_si",
         "h5_path": args.h5_path, "seed": args.seed, "num_tasks": NUM_TASKS,
         "task_fractions": TASK_FRACTIONS, "task_test_frac": TASK_TEST_FRAC,
-        "poison_schedule_enabled": POISON_SCHEDULE_ENABLED, "poison_fraction_flat": POISON_FRACTION_FLAT,
-        "poison_fraction_train_start": POISON_FRACTION_TRAIN_START,
-        "poison_fraction_train_end": POISON_FRACTION_TRAIN_END,
-        "poison_fraction_test_start": POISON_FRACTION_TEST_START,
-        "poison_fraction_test_end": POISON_FRACTION_TEST_END,
+        "train_uncertain_fraction": TRAIN_UNCERTAIN_FRACTION,
+        "test_aggregate_fraction": TEST_AGGREGATE_FRACTION,
+        "red_train_target_margin_confidence": RED_TRAIN_TARGET_MARGIN_CONFIDENCE,
+        "proximity_shaping_enabled": PROXIMITY_SHAPING_ENABLED,
         "poison_test_data": POISON_TEST_DATA,
-        "require_evasion_success": REQUIRE_EVASION_SUCCESS,
         "red_epsilon": RED_EPSILON, "red_max_steps": RED_MAX_STEPS,
         "red_timesteps_per_task": RED_TIMESTEPS_PER_TASK, "alpha_contrast": ALPHA_CONTRAST,
         "contrastive_ema": CONTRASTIVE_EMA, "contrastive_recency_decay": CONTRASTIVE_RECENCY_DECAY,
