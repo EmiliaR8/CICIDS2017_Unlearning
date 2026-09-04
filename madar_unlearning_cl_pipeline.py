@@ -373,6 +373,30 @@ TEST_AGGREGATE_FRACTION = 0.40  # per class: fraction of this task's own row cou
                                  # task's own test split + task (t-1)'s own test split) pool.
                                  # Same "actual count can land under quota" caveat as train
                                  # above -- see the TEST-SIDE blocks for the tiering logic.
+
+# NEW (variant-augmentation branch): train-side variant generation. For every
+# row that successfully evades C2 (poison_idx/poison_idx_benign), the SAME
+# trained agent keeps perturbing that exact point for up to
+# MAX_VARIANTS_PER_SAMPLE more "levels," VARIANT_STEPS_PER_LEVEL actions each,
+# CHAINED (level 2 continues from level 1's landing point, not from the
+# original evasion point). A level only becomes a real variant if the point is
+# STILL evading C2 after its steps; the first level that fails to still evade
+# stops generation for that sample (see generate_train_variants). Goal (not
+# enforced as a hard constraint -- see that function's docstring): bring the
+# perturbed row count up to roughly match the (1 - TRAIN_UNCERTAIN_FRACTION)
+# clean row count for that class; if MAX_VARIANTS_PER_SAMPLE isn't enough to
+# close that gap, the shortfall is left as-is.
+VARIANT_STEPS_PER_LEVEL = 3
+MAX_VARIANTS_PER_SAMPLE = 5
+# Variant rows get a real, unique gid stored in gid_train (so every existing
+# int(gid_train[...]) cast -- buffer sample_id, forget-set gid matching --
+# keeps working on them unchanged): VARIANT_GID_OFFSET + original_gid*10 +
+# level. Translated back to the requested "<original>.<level>" display string
+# only where a human actually reads it (poisoned_sample_ids, logs) via
+# _variant_gid_display -- see its docstring. 10**9 is far beyond any real gid
+# in this dataset (pooled row counts are in the tens of thousands), so this
+# can never collide with a genuine sample's gid.
+VARIANT_GID_OFFSET = 10**9
 RECYCLE_TEST_POCKETS = True  # toggle: True (current/default behavior) unions this task's own
                               # test split with task (t-1)'s own test split before selection,
                               # and persists any recycled successes as new rows into this
@@ -823,6 +847,104 @@ def evaluate_agent_on_batch(env, model, X, y, benign_label, only_malicious=True,
     evasion_rate = evasion / max(attacked, 1)
     avg_pert_norm = float(np.mean(pert_norms)) if pert_norms else 0.0
     return X_pert, evasion_rate, rewards, avg_pert_norm, attacked, evaded_mask
+
+
+def _variant_gid_display(internal_gid):
+    """Translates an internal variant gid (VARIANT_GID_OFFSET +
+    original_gid*10 + level) back to the requested "<original>.<level>"
+    string; an ordinary (non-variant) gid is returned unchanged as a plain
+    int. Used only at output points a human reads (poisoned_sample_ids,
+    logs) -- gid_train itself always stores the raw internal integer, so
+    every existing int(gid_train[...]) cast elsewhere is unaffected."""
+    internal_gid = int(internal_gid)
+    if internal_gid < VARIANT_GID_OFFSET:
+        return internal_gid
+    remainder = internal_gid - VARIANT_GID_OFFSET
+    original_gid, level = divmod(remainder, 10)
+    return f"{original_gid}.{level}"
+
+
+def generate_train_variants(env, red_agent, X_pert, evaded_mask, gid_array, true_label,
+                             steps_per_level=VARIANT_STEPS_PER_LEVEL, max_variants=MAX_VARIANTS_PER_SAMPLE,
+                             deterministic=True):
+    """
+    NEW (variant-augmentation branch): for every row where evaded_mask[i] is
+    True (already successfully evaded C2 -- see evaluate_agent_on_batch),
+    keeps `red_agent` perturbing that EXACT landing point for up to
+    max_variants more "levels," steps_per_level raw env.step() actions each,
+    CHAINED -- level 2 continues from level 1's landing point, not from the
+    original evasion point, so each level drifts further. A level is kept
+    as a genuine variant only if the point is STILL classified as this
+    agent's target class (env.step()'s info["success"], the same joint
+    condition run_single_agent_attack/evaluate_agent_on_batch already use --
+    for train-side envs this is unconditionally just C2 evasion, no
+    shift_reference_classifier) after its steps_per_level actions; the
+    FIRST level that fails to still evade stops generation for that sample
+    entirely (no further levels attempted, and the failed level itself is
+    discarded, per explicit confirmation).
+
+    Bypasses env.reset() -- resuming a specific mid-episode state isn't
+    something NetworkAttackEnv supports natively, so this sets env.state/
+    env.true_label/env.cum_action/env.steps directly before each level's
+    steps, then calls env.step() exactly steps_per_level times. `env` and
+    `red_agent` should be the SAME (env, agent) pair evaluate_agent_on_batch
+    was just run with, so the agent's learned policy (not a fresh/reset one)
+    is what continues the perturbation.
+
+    Known side effect: if env has a contrastive_bank, its per-episode
+    update/log_episode/log_cosine_snapshot calls (normally fired once at
+    natural episode termination) will fire again on every one of these
+    extra steps too, since success re-evaluates True on each still-evading
+    step -- harmless (it's still logging this agent's real behavior), just
+    more frequent than a normal episode boundary during variant generation.
+
+    Returns a dict: X (stacked variant feature rows, shape (n_variants,
+    feat_dim), empty (0, feat_dim) array if none), internal_gids (int array,
+    same order, see VARIANT_GID_OFFSET), display_gids (list of "N.L"
+    strings, same order), n_variants_by_original (dict original_gid -> how
+    many variants it produced, for logging/parity-tracking).
+    """
+    feat_dim = X_pert.shape[1]
+    variant_rows, internal_gids, display_gids = [], [], []
+    n_variants_by_original = {}
+
+    for i in np.where(evaded_mask)[0]:
+        current_state = X_pert[i].copy()
+        original_gid = int(gid_array[i])
+        n_this = 0
+        for level in range(1, max_variants + 1):
+            env.state = current_state.copy()
+            env.true_label = true_label
+            env.cum_action = np.zeros_like(current_state, dtype=np.float32)
+            env.steps = 0
+
+            still_evading = False
+            for _ in range(steps_per_level):
+                a, _ = red_agent.predict(env.state, deterministic=deterministic)
+                a = np.asarray(a, dtype=np.float32).reshape(env.action_space.shape)
+                a = np.clip(a, env.action_space.low, env.action_space.high)
+                _, _, _, _, info = env.step(a)
+                still_evading = bool(info["success"])
+
+            if not still_evading:
+                break
+
+            n_this += 1
+            current_state = env.state.copy()
+            variant_rows.append(current_state)
+            internal_gids.append(VARIANT_GID_OFFSET + original_gid * 10 + level)
+            display_gids.append(f"{original_gid}.{level}")
+
+        if n_this > 0:
+            n_variants_by_original[original_gid] = n_this
+
+    X = np.stack(variant_rows).astype(np.float32) if variant_rows else np.empty((0, feat_dim), dtype=np.float32)
+    return {
+        "X": X,
+        "internal_gids": np.asarray(internal_gids, dtype=np.int64),
+        "display_gids": display_gids,
+        "n_variants_by_original": n_variants_by_original,
+    }
 
 
 RED_AGENT_SEED_OFFSETS = {"train": 0, "test": 100_000, "train_benign": 200_000, "test_benign": 300_000}
@@ -2520,6 +2642,14 @@ def main():
         poisoned_test_sample_ids = []
         n_poisoned_benign = 0
         poison_idx_benign = np.array([], dtype=int)
+        # NEW (variant-augmentation branch): safe empty defaults so the
+        # append step near `category = np.full(...)` below can always
+        # reference these, even for t==0 or a task with no benign_idx_train.
+        _empty_variants = {"X": np.empty((0, X.shape[1]), dtype=np.float32),
+                            "internal_gids": np.array([], dtype=np.int64),
+                            "display_gids": [], "n_variants_by_original": {}}
+        mal_variants = dict(_empty_variants)
+        ben_variants = dict(_empty_variants)
         n_poisoned_test_benign = 0
         poison_idx_test_benign = np.array([], dtype=int)
         poisoned_test_sample_ids_benign = []
@@ -2618,6 +2748,19 @@ def main():
                       f"({n_poisoned}/{len(mal_idx_train)} of all malicious train samples) "
                       f"malicious train samples (attack quota was {TRAIN_UNCERTAIN_FRACTION:.0%})")
 
+                # NEW (variant-augmentation branch): see generate_train_variants's
+                # docstring. env_train/agent_train are the SAME pair evaluate_agent_
+                # on_batch just ran -- variants continue perturbing from each
+                # already-evaded landing point using the identical trained policy.
+                mal_variants = generate_train_variants(
+                    env_train, agent_train, X_train_pert, evaded_mask, gid_train, true_label=mal_label,
+                )
+                n_mal_variants = len(mal_variants["internal_gids"])
+                print(f"    [Train variants] Task {t} malicious: {len(mal_variants['n_variants_by_original'])}/"
+                      f"{n_poisoned} evaded originals produced {n_mal_variants} variant(s) "
+                      f"(perturbed so far: {n_poisoned + n_mal_variants}, clean target: "
+                      f"{len(mal_idx_train) - n_poisoned})")
+
                 X_train_for_classifier = X_train.copy()
                 X_train_for_classifier[poison_idx] = X_train_pert[poison_idx]
 
@@ -2697,11 +2840,54 @@ def main():
                           f"({n_poisoned_benign}/{len(benign_idx_train)} of all benign train samples) "
                           f"benign train samples (attack quota was {TRAIN_UNCERTAIN_FRACTION:.0%})")
 
+                    # NEW (variant-augmentation branch): mirror of the malicious
+                    # side's identical addition above.
+                    ben_variants = generate_train_variants(
+                        env_train_benign, agent_train_benign, X_train_pert_benign, evaded_mask_benign, gid_train,
+                        true_label=benign_label,
+                    )
+                    n_ben_variants = len(ben_variants["internal_gids"])
+                    print(f"    [Train variants] Task {t} benign: {len(ben_variants['n_variants_by_original'])}/"
+                          f"{n_poisoned_benign} evaded originals produced {n_ben_variants} variant(s) "
+                          f"(perturbed so far: {n_poisoned_benign + n_ben_variants}, clean target: "
+                          f"{len(benign_idx_train) - n_poisoned_benign})")
+
                     X_train_for_classifier[poison_idx_benign] = X_train_pert_benign[poison_idx_benign]
 
                     # TEST-SIDE (REWORK, pocket-targeted test poisoning): moved to
                     # after CL training, mirroring the malicious side -- see the
                     # TEST-SIDE block right after train_cl_er, below.
+
+        # NEW (variant-augmentation branch): append this task's malicious +
+        # benign variant rows as NEW trailing rows into X_train_for_classifier/
+        # y_train/gid_train (they have no "slot" to overwrite -- unlike an
+        # original evasion, they're not replacing any existing row), and
+        # extend poison_idx/poison_idx_benign to include their new positions,
+        # so category/build_perturbation_classifier_forget_set/buffer fill/
+        # poisoned_sample_ids below all pick them up automatically -- same
+        # append pattern used for recycled test-pocket successes.
+        _variant_blocks = []
+        if len(mal_variants["internal_gids"]) > 0:
+            _variant_blocks.append(("mal", mal_variants))
+        if len(ben_variants["internal_gids"]) > 0:
+            _variant_blocks.append(("ben", ben_variants))
+        for _tag, _v in _variant_blocks:
+            _new_idx = np.arange(len(X_train_for_classifier), len(X_train_for_classifier) + len(_v["X"]))
+            if _tag == "mal":
+                poison_idx = np.concatenate([poison_idx, _new_idx])
+                _v_label = mal_label
+            else:
+                poison_idx_benign = np.concatenate([poison_idx_benign, _new_idx])
+                _v_label = benign_label
+            X_train_for_classifier = np.concatenate([X_train_for_classifier, _v["X"]], axis=0)
+            y_train = np.concatenate([y_train, np.full(len(_v["X"]), _v_label, dtype=y_train.dtype)], axis=0)
+            gid_train = np.concatenate([gid_train, _v["internal_gids"]], axis=0)
+        if _variant_blocks:
+            n_poisoned = len(poison_idx)
+            n_poisoned_benign = len(poison_idx_benign)
+            print(f"    [Train variants] Task {t} total: {sum(len(v['X']) for _, v in _variant_blocks)} variant "
+                  f"row(s) appended -- train set now {len(y_train)} rows "
+                  f"({n_poisoned} malicious_perturbed + {n_poisoned_benign} benign_perturbed).")
 
         # Category tracking (identical to madar_cl_pipeline.py) -- feeds the
         # buffer composition diagnostic; build_perturbation_classifier_forget_set()
@@ -2713,8 +2899,12 @@ def main():
             category[poison_idx] = "malicious_perturbed"
         if len(poison_idx_benign) > 0:
             category[poison_idx_benign] = "benign_perturbed"
-        poisoned_sample_ids = gid_train[poison_idx].tolist() if len(poison_idx) > 0 else []
-        poisoned_sample_ids_benign = gid_train[poison_idx_benign].tolist() if len(poison_idx_benign) > 0 else []
+        # NEW (variant-augmentation branch): _variant_gid_display translates a
+        # variant's internal gid to "<original>.<level>"; an ordinary gid
+        # passes through unchanged as a plain int.
+        poisoned_sample_ids = [_variant_gid_display(g) for g in gid_train[poison_idx]] if len(poison_idx) > 0 else []
+        poisoned_sample_ids_benign = [_variant_gid_display(g) for g in gid_train[poison_idx_benign]] \
+            if len(poison_idx_benign) > 0 else []
 
         # TEST-side category array (mirrors the one above) is built further
         # below, AFTER the TEST-SIDE agent block that now runs post-CL-
@@ -3793,6 +3983,8 @@ def main():
         "train_uncertain_fraction": TRAIN_UNCERTAIN_FRACTION,
         "test_aggregate_fraction": TEST_AGGREGATE_FRACTION,
         "recycle_test_pockets": RECYCLE_TEST_POCKETS,
+        "variant_steps_per_level": VARIANT_STEPS_PER_LEVEL,
+        "max_variants_per_sample": MAX_VARIANTS_PER_SAMPLE,
         "red_train_target_margin_confidence": RED_TRAIN_TARGET_MARGIN_CONFIDENCE,
         "proximity_shaping_enabled": PROXIMITY_SHAPING_ENABLED,
         "poison_test_data": POISON_TEST_DATA,
