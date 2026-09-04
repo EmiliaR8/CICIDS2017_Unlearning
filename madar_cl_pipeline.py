@@ -242,6 +242,14 @@ RECYCLE_TEST_POCKETS = True  # toggle: True (current/default behavior) unions th
 
 RED_EPSILON = 0.25
 RED_MAX_STEPS = 25
+RED_C1_MISMATCH_PATIENCE = 3  # FINETUNE (test-side patience investigation): see
+                               # madar_unlearning_cl_pipeline.py's identical constant for the
+                               # full rationale (a diagnostic run showed 99.5% of malicious
+                               # test attacks hard-aborting on a C1 disagreement within ~2
+                               # steps, using only ~8-12% of the epsilon budget). Tolerates up
+                               # to this many CONSECUTIVE C1-mismatch steps (streak resets the
+                               # moment C1 agrees again) before pgd_boundary_search_batch gives
+                               # up on a sample.
 RED_TIMESTEPS_PER_TASK = 5000  # REWORK (uncertainty-margin pipeline): doubled from 2500 --
                                 # POTENTIALLY REVISIT, tune from real run data. See
                                 # madar_unlearning_cl_pipeline.py's identical constant for the
@@ -605,10 +613,12 @@ def generate_train_variants(env, red_agent, X_pert, evaded_mask, gid_array, true
 # NEW (gradient-attack branch): PGD nearest-boundary search, replacing the
 # SAC/NetworkAttackEnv rollout for TEST-SIDE agents only. See
 # madar_unlearning_cl_pipeline.py's identical function for the full
-# docstring/rationale -- ported unchanged.
+# docstring/rationale (including the FINETUNE c1_patience addition below)
+# -- ported unchanged.
 def _log_pgd_break_diagnostics(diag_log_path, diag_label, break_reasons, steps_survived,
                                 c1_mismatch_steps, initial_confidences, pert_norms,
-                                epsilon, max_steps, attacked):
+                                epsilon, max_steps, attacked, c1_patience=None,
+                                recovered_after_mismatch=None):
     """
     DIAGNOSTIC (why-so-few-test-pockets investigation): summarizes, for one
     pgd_boundary_search_batch() call, how many attacked samples ended up
@@ -622,6 +632,12 @@ def _log_pgd_break_diagnostics(diag_log_path, diag_label, break_reasons, steps_s
     Prints unconditionally; also appended to diag_log_path (the
     pocket_targeting_diagnostic log) when one is given, matching
     c1_correct_pool's dual console+log convention.
+
+    c1_patience/recovered_after_mismatch (FINETUNE, optional): when given,
+    also reports how many CONSECUTIVE C1-mismatch steps were tolerated
+    before a hard abort, and how many evaded samples had at least one
+    tolerated mismatch along the way -- i.e. how much the patience knob
+    itself is actually buying.
     """
     if attacked == 0:
         return
@@ -635,9 +651,14 @@ def _log_pgd_break_diagnostics(diag_log_path, diag_label, break_reasons, steps_s
              f"vanishing_grad={counts['vanishing_grad']}, "
              f"max_steps_exhausted={counts['max_steps_exhausted']}"]
 
+    if c1_patience is not None:
+        lines.append(f"      c1_patience={c1_patience} consecutive steps tolerated, "
+                     f"recovered_after_mismatch={recovered_after_mismatch or 0}/{counts['evaded']} "
+                     f"of the evaded samples had a tolerated mismatch along the way")
+
     if c1_mismatch_steps:
         frac_step1 = sum(1 for s in c1_mismatch_steps if s == 1) / len(c1_mismatch_steps)
-        lines.append(f"      c1_mismatch broke at step (median)="
+        lines.append(f"      c1_mismatch (hard abort) at step (median)="
                      f"{float(np.median(c1_mismatch_steps)):.1f}/{max_steps}, "
                      f"{frac_step1:.0%} of those broke on step 1")
 
@@ -666,9 +687,10 @@ def _log_pgd_break_diagnostics(diag_log_path, diag_label, break_reasons, steps_s
 def pgd_boundary_search_batch(classifier_wrapper, X, y, benign_label, allowed_start_indices,
                                shift_reference_classifier=None, epsilon=None, max_steps=None,
                                margin_low=0.55, margin_high=0.65, device=None, max_test=None,
-                               diag_log_path=None, diag_label=None):
+                               diag_log_path=None, diag_label=None, c1_patience=None):
     epsilon = RED_EPSILON if epsilon is None else epsilon
     max_steps = RED_MAX_STEPS if max_steps is None else max_steps
+    c1_patience = RED_C1_MISMATCH_PATIENCE if c1_patience is None else c1_patience
     device = DEVICE if device is None else device
     margin_mid = (margin_low + margin_high) / 2.0
 
@@ -704,6 +726,9 @@ def pgd_boundary_search_batch(classifier_wrapper, X, y, benign_label, allowed_st
     steps_survived = []
     c1_mismatch_steps = []
     initial_confidences = []
+    recovered_after_mismatch = 0  # FINETUNE: evaded samples that had at least
+                                   # one tolerated C1 mismatch along the way --
+                                   # the direct payoff metric for c1_patience.
 
     model.eval()
     for i in indices:
@@ -717,6 +742,8 @@ def pgd_boundary_search_batch(classifier_wrapper, X, y, benign_label, allowed_st
 
         steps_taken = 0
         c1_mismatch_at = None
+        c1_mismatch_streak = 0
+        c1_ever_mismatched = False
         vanishing_grad_hit = False
 
         for step_num in range(1, max_steps + 1):
@@ -749,9 +776,20 @@ def pgd_boundary_search_batch(classifier_wrapper, X, y, benign_label, allowed_st
             if shift_reference_classifier is not None:
                 ref_pred = shift_reference_classifier.predict(x_cur.reshape(1, -1))[0]
                 c1_correct = bool(ref_pred == true_label)
+                # FINETUNE (test-side patience investigation): tolerate up to
+                # c1_patience CONSECUTIVE mismatched steps (streak resets the
+                # moment C1 agrees again) instead of hard-aborting on the
+                # first one. A step where C1 disagrees still can't count as
+                # success below (c1_correct is False this iteration either
+                # way), it just no longer necessarily ends the episode.
                 if not c1_correct:
-                    c1_mismatch_at = step_num
-                    break
+                    c1_ever_mismatched = True
+                    c1_mismatch_streak += 1
+                    if c1_mismatch_streak > c1_patience:
+                        c1_mismatch_at = step_num
+                        break
+                else:
+                    c1_mismatch_streak = 0
 
             c2_evaded = bool(predicted_label == benign_label)
             if c2_evaded and c1_correct:
@@ -767,6 +805,8 @@ def pgd_boundary_search_batch(classifier_wrapper, X, y, benign_label, allowed_st
             X_pert[i] = x_cur
             evaded_mask[i] = True
             break_reasons.append("evaded")
+            if c1_ever_mismatched:
+                recovered_after_mismatch += 1
         else:
             steps_survived.append(steps_taken)
             if c1_mismatch_at is not None:
@@ -782,7 +822,7 @@ def pgd_boundary_search_batch(classifier_wrapper, X, y, benign_label, allowed_st
 
     _log_pgd_break_diagnostics(diag_log_path, diag_label, break_reasons, steps_survived,
                                 c1_mismatch_steps, initial_confidences, pert_norms,
-                                epsilon, max_steps, attacked)
+                                epsilon, max_steps, attacked, c1_patience, recovered_after_mismatch)
 
     return X_pert, evasion_rate, rewards, avg_pert_norm, attacked, evaded_mask
 
@@ -2285,18 +2325,26 @@ def main():
                         t, f"test-side malicious (this task + recycled task {t - 1})", pocket_diag_log_path,
                     )
                     # REWORK (uncertainty-margin pipeline): tiered selection --
-                    # tier 1 = C1-correct candidates (ranked most-uncertain-
-                    # under-C1 first), tier 2 = C1-incorrect candidates padded in
-                    # once tier 1 runs out, up to TEST_AGGREGATE_FRACTION (40%)
-                    # of THIS TASK's own malicious test row count. Tier-2
-                    # episodes can essentially never satisfy the joint C1-
-                    # correct/C2-wrong success condition below, so padding trades
-                    # a lower per-attempt success rate for more total attempts --
-                    # an accepted, deliberate tradeoff.
+                    # tier 1 = C1-correct candidates, tier 2 = C1-incorrect
+                    # candidates padded in once tier 1 runs out, up to
+                    # TEST_AGGREGATE_FRACTION (40%) of THIS TASK's own malicious
+                    # test row count. Tier-2 episodes can essentially never
+                    # satisfy the joint C1-correct/C2-wrong success condition
+                    # below, so padding trades a lower per-attempt success rate
+                    # for more total attempts -- an accepted, deliberate tradeoff.
+                    #
+                    # FINETUNE (test-side selection/patience investigation):
+                    # both tiers now ranked by most-uncertain-under-C2
+                    # (classifier_wrapper) instead of under-C1 -- see
+                    # madar_unlearning_cl_pipeline.py's identical block for the
+                    # full rationale (ranking by C1-uncertainty was picking
+                    # points that self-sabotaged against the C1-correctness
+                    # requirement). C1-correctness is still required to ENTER
+                    # tier 1 (c1_correct_pool above, unchanged).
                     n_target_mal_test = max(1, round(TEST_AGGREGATE_FRACTION * len(mal_idx_test)))
-                    mal_tier1 = _uncertainty_rank(pre_train_classifier_wrapper, X_test_ext, mal_idx_test_c1)
+                    mal_tier1 = _uncertainty_rank(classifier_wrapper, X_test_ext, mal_idx_test_c1)
                     mal_tier2_pool = np.setdiff1d(mal_idx_test_ext, mal_idx_test_c1)
-                    mal_tier2 = _uncertainty_rank(pre_train_classifier_wrapper, X_test_ext, mal_tier2_pool)
+                    mal_tier2 = _uncertainty_rank(classifier_wrapper, X_test_ext, mal_tier2_pool)
                     n_tier1_used_mal = min(len(mal_tier1), n_target_mal_test)
                     attack_pool_mal_test = mal_tier1[:n_target_mal_test]
                     if len(attack_pool_mal_test) < n_target_mal_test:
@@ -2325,7 +2373,7 @@ def main():
                                 shift_reference_classifier=pre_train_classifier_wrapper,
                                 epsilon=RED_EPSILON, max_steps=RED_MAX_STEPS,
                                 margin_low=RED_TARGET_MARGIN_CONFIDENCE, margin_high=RED_TARGET_MARGIN_HIGH,
-                                max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                                max_test=MAX_EVAL_SAMPLES_PER_TASK, c1_patience=RED_C1_MISMATCH_PATIENCE,
                                 diag_log_path=pocket_diag_log_path, diag_label=f"Task {t} test-side malicious",
                             )
                         red_report["test_evasion_rate"] = test_evasion_rate
@@ -2407,11 +2455,13 @@ def main():
                         t, f"test-side benign (this task + recycled task {t - 1})", pocket_diag_log_path,
                     )
                     # REWORK (uncertainty-margin pipeline): mirror of the
-                    # malicious tiered selection above.
+                    # malicious tiered selection above -- ranked by C2
+                    # (classifier_wrapper), not C1, per the same FINETUNE
+                    # rationale noted there.
                     n_target_ben_test = max(1, round(TEST_AGGREGATE_FRACTION * len(benign_idx_test)))
-                    ben_tier1 = _uncertainty_rank(pre_train_classifier_wrapper, X_test_ext_benign, benign_idx_test_c1)
+                    ben_tier1 = _uncertainty_rank(classifier_wrapper, X_test_ext_benign, benign_idx_test_c1)
                     ben_tier2_pool = np.setdiff1d(benign_idx_test_ext, benign_idx_test_c1)
-                    ben_tier2 = _uncertainty_rank(pre_train_classifier_wrapper, X_test_ext_benign, ben_tier2_pool)
+                    ben_tier2 = _uncertainty_rank(classifier_wrapper, X_test_ext_benign, ben_tier2_pool)
                     n_tier1_used_ben = min(len(ben_tier1), n_target_ben_test)
                     attack_pool_ben_test = ben_tier1[:n_target_ben_test]
                     if len(attack_pool_ben_test) < n_target_ben_test:
@@ -2438,7 +2488,7 @@ def main():
                             shift_reference_classifier=pre_train_classifier_wrapper,
                             epsilon=RED_EPSILON, max_steps=RED_MAX_STEPS,
                             margin_low=RED_TARGET_MARGIN_CONFIDENCE, margin_high=RED_TARGET_MARGIN_HIGH,
-                            max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                            max_test=MAX_EVAL_SAMPLES_PER_TASK, c1_patience=RED_C1_MISMATCH_PATIENCE,
                             diag_log_path=pocket_diag_log_path, diag_label=f"Task {t} test-side benign",
                         )
                         red_report["test_benign_evasion_rate"] = test_evasion_rate_benign
