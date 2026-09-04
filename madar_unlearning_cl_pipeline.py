@@ -602,6 +602,20 @@ UNLEARN_SI_C = 0.1  # SI penalty weight during UNLEARNING ONLY -- deliberately
                      # is a first-pass guess at a softer value, NOT yet tuned; see the
                      # loss-component diagnostics logged in unlearn_teacher_guided's
                      # return value for the data to tune it against.
+
+FULL_RETRAIN_DIAGNOSTIC_TASKS = {8, 9}  # DIAGNOSTIC (retrain-vs-unlearn comparison): at
+                                          # exactly these task ids, skip unlearn_teacher_
+                                          # guided entirely and instead fully retrain a
+                                          # fresh classifier on ONLY the retain set (see
+                                          # retrain_classifier_from_scratch) -- the "exact
+                                          # unlearning" gold standard, for comparison
+                                          # against the approximate SI/KD-anchored method
+                                          # used every other task.
+RETRAIN_FULL_EPOCHS = TASK0_EPOCHS  # same budget as the very first from-scratch training
+                                     # at task 0, since this is the same kind of
+                                     # from-scratch supervised fit, just on the retain
+                                     # set instead of task 0's full training split.
+RETRAIN_FULL_LR = 1e-3  # matches task 0's pretraining optimizer's lr.
 POISON_DETECTOR = "perturbation_classifier"  # logged into config/results for provenance --
                                               # REWORK, see module docstring: replaces the old
                                               # oracle-fraction forget set entirely.
@@ -2096,6 +2110,76 @@ def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, poison_idx_be
     }
 
 
+def retrain_classifier_from_scratch(feature_dim, retain_idx, forget_idx, Xtr, ytr, omega, device,
+                                     epochs=None, lr=None, batch_size=None):
+    """
+    DIAGNOSTIC (retrain-vs-unlearn comparison, FULL_RETRAIN_DIAGNOSTIC_TASKS
+    only): the "exact unlearning" gold standard -- a freshly-initialized
+    classifier (fresh weights, fresh optimizer) trained ONLY on the retain
+    set, so it has structurally never seen the forget set at all, unlike
+    unlearn_teacher_guided's approximate SI/KD-anchored corrective approach.
+    Swapped in for specific tasks only; CL training (and the SI omega/
+    p_old_task trackers) for every other task is unaffected -- this function
+    doesn't touch omega/p_old_task itself, it only produces a new model's
+    weights for the caller to load into the existing model in place.
+
+    Returns (new_model, diag) where diag deliberately mirrors unlearn_
+    teacher_guided's return keys (omega_l2_norm/n_steps/raw_forget_loss_mean/
+    raw_retain_loss_mean/raw_si_loss_mean) so the existing "[Unlearn diag]"
+    print line and unlearning_metrics plumbing need no special-casing:
+    omega_l2_norm reports the CURRENT omega (unchanged by this path -- CL
+    continues normally next task), raw_si_loss_mean is always 0.0 (no SI
+    term is used here), and raw_forget_loss_mean is the NEW model's
+    resulting forget-set CE loss (informative even though never optimized
+    against, unlike the other two which are true training-loss averages).
+    """
+    epochs = RETRAIN_FULL_EPOCHS if epochs is None else epochs
+    lr = RETRAIN_FULL_LR if lr is None else lr
+    batch_size = BATCH_SIZE if batch_size is None else batch_size
+
+    new_model = ClassifierNN(feature_dim, 2).to(device)
+    optimizer = optim.Adam(new_model.parameters(), lr=lr)
+    retain_idx_t = torch.tensor(retain_idx, dtype=torch.long)
+    drop_last = (len(retain_idx) % batch_size == 1)
+    loader = data.DataLoader(
+        data.TensorDataset(Xtr[retain_idx_t], ytr[retain_idx_t]), batch_size=batch_size,
+        shuffle=True, drop_last=drop_last,
+    )
+
+    new_model.train()
+    raw_retain_losses = []
+    for _ in range(epochs):
+        for v, l in loader:
+            v, l = v.to(device), l.to(device)
+            optimizer.zero_grad()
+            loss = F.cross_entropy(new_model(v), l)
+            if not torch.isfinite(loss):
+                raise RuntimeError("Non-finite loss during diagnostic full retrain - training diverged")
+            loss.backward()
+            optimizer.step()
+            raw_retain_losses.append(loss.item())
+
+    new_model.eval()
+    raw_forget_loss_mean = None
+    if len(forget_idx) > 0:
+        forget_idx_t = torch.tensor(forget_idx, dtype=torch.long)
+        with torch.no_grad():
+            f_v, f_l = Xtr[forget_idx_t].to(device), ytr[forget_idx_t].to(device)
+            raw_forget_loss_mean = float(F.cross_entropy(new_model(f_v), f_l).item())
+
+    omega_l2_norm = float(torch.sqrt(sum((v ** 2).sum() for v in omega.values())).item())
+
+    diag = {
+        "method": "full_retrain_on_retain_set",
+        "omega_l2_norm": omega_l2_norm,
+        "n_steps": len(raw_retain_losses),
+        "raw_forget_loss_mean": raw_forget_loss_mean,
+        "raw_retain_loss_mean": float(np.mean(raw_retain_losses)) if raw_retain_losses else None,
+        "raw_si_loss_mean": 0.0,
+    }
+    return new_model, diag
+
+
 def unlearn_teacher_guided(model, teacher_model, forget_loader, retain_loader, omega, p_old_task,
                            si_c, epochs, lr, alpha, device):
     """
@@ -2724,6 +2808,11 @@ def main():
     out_dir = os.path.join(RUNS_BASE_DIR, "madar_unlearning", args.log_name)
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
+
+    # NEW: single classifier checkpoint, stored alongside the logs and
+    # OVERWRITTEN at the end of every task -- always holds only the most
+    # recently completed task's classifier, not one file per task.
+    classifier_checkpoint_path = os.path.join(out_dir, "logs", "classifier_checkpoint.pt")
 
     # TEMPORARY DIAGNOSTIC (pocket-targeting investigation): separate,
     # human-readable log checking whether red_test_pert_agent/
@@ -3867,15 +3956,38 @@ def main():
                     }
 
                     model_pre_unlearn = copy.deepcopy(model)
-                    print(f"    [Unlearn] task {t} (alpha={UNLEARN_ALPHA}, si_c={UNLEARN_SI_C}, "
-                          f"n_forget={len(forget_idx)}, n_retain={len(retain_idx)})...")
-                    unlearn_diag = unlearn_teacher_guided(
-                        model=model, teacher_model=model_pre_unlearn,
-                        forget_loader=forget_loader, retain_loader=retain_loader,
-                        omega=omega, p_old_task=p_old_task, si_c=UNLEARN_SI_C,
-                        epochs=UNLEARN_EPOCHS, lr=UNLEARN_LR, alpha=UNLEARN_ALPHA, device=DEVICE,
-                    )
-                    grad_steps += UNLEARN_EPOCHS * len(forget_loader)
+
+                    # DIAGNOSTIC (retrain-vs-unlearn comparison): at exactly
+                    # FULL_RETRAIN_DIAGNOSTIC_TASKS, skip unlearn_teacher_
+                    # guided entirely and fully retrain a fresh classifier on
+                    # ONLY the retain set instead -- see
+                    # retrain_classifier_from_scratch's docstring. Every
+                    # other task's unlearning is completely unaffected.
+                    # model_pre_unlearn above was already snapshotted before
+                    # either branch touches `model`, so measure_unlearning_
+                    # efficacy/downstream "before/after" comparisons below
+                    # work identically regardless of which branch ran.
+                    if t in FULL_RETRAIN_DIAGNOSTIC_TASKS:
+                        print(f"    [Unlearn] task {t}: DIAGNOSTIC full retrain on retain set only "
+                              f"(n_retain={len(retain_idx)}, forget set of {len(forget_idx)} samples "
+                              f"discarded -- NOT trained on) instead of unlearn_teacher_guided...")
+                        retrained_model, unlearn_diag = retrain_classifier_from_scratch(
+                            feature_dim, retain_idx, forget_idx, Xtr, ytr, omega, DEVICE,
+                            epochs=RETRAIN_FULL_EPOCHS, lr=RETRAIN_FULL_LR, batch_size=BATCH_SIZE,
+                        )
+                        model.load_state_dict(retrained_model.state_dict())
+                        grad_steps += unlearn_diag["n_steps"]
+                    else:
+                        print(f"    [Unlearn] task {t} (alpha={UNLEARN_ALPHA}, si_c={UNLEARN_SI_C}, "
+                              f"n_forget={len(forget_idx)}, n_retain={len(retain_idx)})...")
+                        unlearn_diag = unlearn_teacher_guided(
+                            model=model, teacher_model=model_pre_unlearn,
+                            forget_loader=forget_loader, retain_loader=retain_loader,
+                            omega=omega, p_old_task=p_old_task, si_c=UNLEARN_SI_C,
+                            epochs=UNLEARN_EPOCHS, lr=UNLEARN_LR, alpha=UNLEARN_ALPHA, device=DEVICE,
+                        )
+                        grad_steps += UNLEARN_EPOCHS * len(forget_loader)
+                    unlearn_diag.setdefault("method", "unlearn_teacher_guided")
                     unlearning_ran_this_task = True  # TEMPORARY DIAGNOSTIC (pocket-targeting)
                     print(f"    [Unlearn diag] omega_l2={unlearn_diag['omega_l2_norm']:.3f}, raw losses "
                           f"forget={unlearn_diag['raw_forget_loss_mean']:.4f} "
@@ -4212,6 +4324,20 @@ def main():
             "buffer_snapshots": buffer_snapshots,
         })
 
+        # NEW: end-of-task classifier checkpoint -- OVERWRITES the previous
+        # task's file each time, so classifier_checkpoint_path always holds
+        # only the just-finished task's classifier (this task's C2/C3, i.e.
+        # post-unlearning if it ran this task, matching `model`'s current
+        # weights at this point in the loop). Includes the scaler so the
+        # checkpoint alone is enough to reconstruct a working classifier
+        # wrapper later, without needing the rest of the run's state.
+        torch.save({
+            "task_id": t,
+            "model_state_dict": model.state_dict(),
+            "scaler": scaler,
+            "feature_dim": feature_dim,
+        }, classifier_checkpoint_path)
+
         # TEMPORARY DIAGNOSTIC (pocket-targeting investigation): pause at the
         # end of every task after task 2, so pocket_diag_entries / the
         # written log section / any live variable above can be inspected
@@ -4240,6 +4366,10 @@ def main():
         "perturbation_classifier_n": PERTURBATION_CLASSIFIER_N,
         "clean_replay_buffer_of_perturbed": CLEAN_REPLAY_BUFFER_OF_PERTURBED,
         "red_epsilon": RED_EPSILON, "red_max_steps": RED_MAX_STEPS,
+        "red_c1_mismatch_patience": RED_C1_MISMATCH_PATIENCE,
+        "full_retrain_diagnostic_tasks": sorted(FULL_RETRAIN_DIAGNOSTIC_TASKS),
+        "retrain_full_epochs": RETRAIN_FULL_EPOCHS, "retrain_full_lr": RETRAIN_FULL_LR,
+        "classifier_checkpoint_path": classifier_checkpoint_path,
         "red_timesteps_per_task": RED_TIMESTEPS_PER_TASK, "alpha_contrast": ALPHA_CONTRAST,
         "contrastive_ema": CONTRASTIVE_EMA, "contrastive_recency_decay": CONTRASTIVE_RECENCY_DECAY,
         "max_eval_samples_per_task": MAX_EVAL_SAMPLES_PER_TASK, "feature_dim": feature_dim,

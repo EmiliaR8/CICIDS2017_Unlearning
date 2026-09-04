@@ -1786,6 +1786,11 @@ def main():
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
 
+    # NEW: single classifier checkpoint, stored alongside the logs and
+    # OVERWRITTEN at the end of every task -- see
+    # madar_unlearning_cl_pipeline.py's identical addition for the rationale.
+    classifier_checkpoint_path = os.path.join(out_dir, "logs", "classifier_checkpoint.pt")
+
     # TEMPORARY DIAGNOSTIC (pocket-targeting investigation) -- ported from
     # madar_unlearning_cl_pipeline.py so the two pipelines' pocket-targeting
     # behavior can be compared directly. See write_pocket_targeting_
@@ -2717,6 +2722,17 @@ def main():
             "replay_buffer_composition": buffer_summary,
         })
 
+        # NEW: end-of-task classifier checkpoint -- OVERWRITES the previous
+        # task's file each time, so classifier_checkpoint_path always holds
+        # only the just-finished task's classifier. See
+        # madar_unlearning_cl_pipeline.py's identical addition for rationale.
+        torch.save({
+            "task_id": t,
+            "model_state_dict": model.state_dict(),
+            "scaler": scaler,
+            "feature_dim": feature_dim,
+        }, classifier_checkpoint_path)
+
     config = {
         "strategy": "madar_er_kd_si",
         "h5_path": args.h5_path, "seed": args.seed, "num_tasks": NUM_TASKS,
@@ -2732,6 +2748,8 @@ def main():
         "test_side_attack_method": "pgd_boundary_search",
         "poison_test_data": POISON_TEST_DATA,
         "red_epsilon": RED_EPSILON, "red_max_steps": RED_MAX_STEPS,
+        "red_c1_mismatch_patience": RED_C1_MISMATCH_PATIENCE,
+        "classifier_checkpoint_path": classifier_checkpoint_path,
         "red_timesteps_per_task": RED_TIMESTEPS_PER_TASK, "alpha_contrast": ALPHA_CONTRAST,
         "contrastive_ema": CONTRASTIVE_EMA, "contrastive_recency_decay": CONTRASTIVE_RECENCY_DECAY,
         "max_eval_samples_per_task": MAX_EVAL_SAMPLES_PER_TASK, "feature_dim": feature_dim,
