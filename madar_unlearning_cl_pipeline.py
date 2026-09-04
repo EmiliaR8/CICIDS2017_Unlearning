@@ -373,6 +373,18 @@ TEST_AGGREGATE_FRACTION = 0.40  # per class: fraction of this task's own row cou
                                  # task's own test split + task (t-1)'s own test split) pool.
                                  # Same "actual count can land under quota" caveat as train
                                  # above -- see the TEST-SIDE blocks for the tiering logic.
+RECYCLE_TEST_POCKETS = True  # toggle: True (current/default behavior) unions this task's own
+                              # test split with task (t-1)'s own test split before selection,
+                              # and persists any recycled successes as new rows into this
+                              # task's task_test_splits[t] (see the TEST-SIDE blocks below).
+                              # False disables recycling entirely -- the perturbable test pool
+                              # is just this task's own test rows, selection/tiering/the joint
+                              # C1-correct-and-C2-wrong success condition are otherwise
+                              # unchanged. Implemented as a single gate on X_prev_test/
+                              # y_prev_test/gid_prev_test (forced to empty arrays when off) --
+                              # every downstream recycled_*/n_poisoned_test_recycled_prev*
+                              # computation naturally reduces to "nothing recycled" without
+                              # its own separate branch.
 
 
 RED_EPSILON = 0.25
@@ -1340,14 +1352,67 @@ def _ratio_str(numer, denom):
     return f"{numer}/{denom} ({numer / denom:.3f})" if denom > 0 else f"{numer}/0 (n/a)"
 
 
-def write_test_accuracy_breakdown(log_path, task_id, pre_stats, post_stats=None):
+def _confusion_matrix_4x2(snapshot, mal_label, benign_label):
+    """
+    2 (predicted: benign, malicious) x 4 (category: malicious, benign,
+    perturbed_malicious, perturbed_benign) breakdown, built entirely from a
+    _test_accuracy_snapshot dict -- unlike evaluate_classifier's plain 2x2
+    confusion matrix, this keeps perturbed rows in their own columns
+    instead of folding them into the ordinary malicious/benign columns, so
+    a reader can see at a glance where errors concentrate (clean vs
+    perturbed). "malicious"/"benign" columns are this task's CLEAN rows
+    only (the perturbed ones are split out into their own columns).
+    Returns (columns, row_benign, row_malicious).
+    """
+    clean_true, clean_pred = snapshot["clean_true"], snapshot["clean_pred"]
+    mal_mask = clean_true == mal_label
+    ben_mask = clean_true == benign_label
+
+    def _counts(pred_subset):
+        n_benign = int(np.sum(pred_subset == benign_label)) if len(pred_subset) else 0
+        n_mal = int(np.sum(pred_subset == mal_label)) if len(pred_subset) else 0
+        return n_benign, n_mal
+
+    clean_mal_pred_benign, clean_mal_pred_mal = _counts(clean_pred[mal_mask])
+    clean_ben_pred_benign, clean_ben_pred_mal = _counts(clean_pred[ben_mask])
+    pert_mal_pred_mal = snapshot["mal_correct"]
+    pert_mal_pred_benign = snapshot["n_perturbed_mal"] - pert_mal_pred_mal
+    pert_ben_pred_benign = snapshot["ben_correct"]
+    pert_ben_pred_mal = snapshot["n_perturbed_ben"] - pert_ben_pred_benign
+
+    columns = ["malicious", "benign", "perturbed_malicious", "perturbed_benign"]
+    row_benign = [clean_mal_pred_benign, clean_ben_pred_benign, pert_mal_pred_benign, pert_ben_pred_benign]
+    row_malicious = [clean_mal_pred_mal, clean_ben_pred_mal, pert_mal_pred_mal, pert_ben_pred_mal]
+    return columns, row_benign, row_malicious
+
+
+def _format_confusion_matrix(columns, row_benign, row_malicious):
+    col_w = max(max(len(c) for c in columns), 9) + 2
+    header = " " * 14 + "".join(f"{c:>{col_w}}" for c in columns)
+    line_benign = f"  {'benign':<12}" + "".join(f"{v:>{col_w}}" for v in row_benign)
+    line_malicious = f"  {'malicious':<12}" + "".join(f"{v:>{col_w}}" for v in row_malicious)
+    return "\n".join([header, line_benign, line_malicious])
+
+
+def _format_metrics_line(metrics):
+    return (f"  balanced_accuracy (this task) = {metrics['balanced_accuracy']:.4f}, "
+            f"pooled_accuracy = {metrics['pooled_accuracy']:.4f}, "
+            f"mean_accuracy (mean per-task balanced accuracy) = {metrics['mean_accuracy']:.4f}")
+
+
+def write_test_accuracy_breakdown(log_path, task_id, pre_stats, pre_metrics, mal_label, benign_label,
+                                   post_stats=None, post_metrics=None):
     """
     Appends a human-readable Q1-6 test-accuracy breakdown for this task to
     `log_path` (the same pocket_targeting_diagnostic.txt file), right after
-    the existing per-sample correctness-pattern section for this task.
+    the existing per-sample correctness-pattern section for this task, plus
+    (right after each phase's items) a 2x4 confusion matrix and the
+    balanced/pooled/mean accuracy numbers for that phase.
     pre_stats/post_stats come from _test_accuracy_snapshot, captured right
     after this task's PRE-unlearning and POST-unlearning (if it ran)
-    evaluations respectively; post_stats is None when unlearning didn't run
+    evaluations respectively; pre_metrics/post_metrics are dicts with
+    balanced_accuracy/pooled_accuracy/mean_accuracy for that same
+    checkpoint. post_stats/post_metrics are None when unlearning didn't run
     this task (task 0, or an empty forget set).
     """
     n_pert = pre_stats["n_perturbed_mal"] + pre_stats["n_perturbed_ben"]
@@ -1362,6 +1427,9 @@ def write_test_accuracy_breakdown(log_path, task_id, pre_stats, post_stats=None)
                 f"benign {_ratio_str(pre_stats['ben_correct'], pre_stats['n_perturbed_ben'])}\n")
         f.write(f"  3. Clean samples correctly classified after adaptation (pre-unlearning): "
                 f"{_ratio_str(pre_stats['clean_correct'], pre_stats['clean_total'])}\n")
+        f.write("  [Confusion matrix -- pre-unlearning] (rows = predicted, columns = true category)\n")
+        f.write(_format_confusion_matrix(*_confusion_matrix_4x2(pre_stats, mal_label, benign_label)) + "\n")
+        f.write(_format_metrics_line(pre_metrics) + "\n")
         if post_stats is None:
             f.write("  4-6. Unlearning did not run this task -- no post-unlearning comparison.\n\n")
             return
@@ -1376,7 +1444,10 @@ def write_test_accuracy_breakdown(log_path, task_id, pre_stats, post_stats=None)
                            (post_stats["clean_pred"] != post_stats["clean_true"])))
         net = post_stats["clean_correct"] - pre_stats["clean_correct"]
         f.write(f"  6. Clean samples changed by unlearning: {gained} recovered (wrong->correct), "
-                f"{lost} lost (correct->wrong), net {net:+d}\n\n")
+                f"{lost} lost (correct->wrong), net {net:+d}\n")
+        f.write("  [Confusion matrix -- post-unlearning] (rows = predicted, columns = true category)\n")
+        f.write(_format_confusion_matrix(*_confusion_matrix_4x2(post_stats, mal_label, benign_label)) + "\n")
+        f.write(_format_metrics_line(post_metrics) + "\n\n")
 
 
 def write_pocket_targeting_diagnostic(log_path, task_id, entries, unlearning_ran,
@@ -2690,6 +2761,7 @@ def main():
         pocket_diag_entries = []
         unlearning_ran_this_task = False
         post_test_acc_snapshot = None  # set below only if unlearning actually runs this task
+        post_test_acc_metrics = None
 
         # ============================================================
         # 1. TRAIN on this task's train split.
@@ -2851,8 +2923,18 @@ def main():
             # longer-range pool that carries forward unused C1-correct samples
             # across more than one task back was considered and explicitly
             # deferred, not ruled out.
-            X_prev_test, y_prev_test = task_test_splits[t - 1]
-            gid_prev_test = task_test_gids[t - 1]
+            if RECYCLE_TEST_POCKETS:
+                X_prev_test, y_prev_test = task_test_splits[t - 1]
+                gid_prev_test = task_test_gids[t - 1]
+            else:
+                # RECYCLE_TEST_POCKETS off: force the "recycled" half of every
+                # union below to be empty, so mal_idx_test_ext/benign_idx_test_ext
+                # reduce to exactly this task's own candidates, and every
+                # recycled_*/n_poisoned_test_recycled_prev* value downstream
+                # comes out as 0/empty with no separate code path needed.
+                X_prev_test = np.empty((0, X.shape[1]), dtype=X.dtype)
+                y_prev_test = np.empty((0,), dtype=y.dtype)
+                gid_prev_test = np.empty((0,), dtype=np.int64)
 
             if POISON_TEST_DATA and len(mal_idx_test) > 0:
                 # X_test_ext/y_test_ext concatenate [this task's X_test, task
@@ -3220,6 +3302,11 @@ def main():
         pre_test_acc_snapshot = _test_accuracy_snapshot(
             classifier_wrapper, X_test_t, y_test_t, poison_idx_test, poison_idx_test_benign, mal_label, benign_label
         )
+        pre_test_acc_metrics = {
+            "balanced_accuracy": per_task_eval[t]["balanced_accuracy"],
+            "pooled_accuracy": pooled_eval["accuracy"],
+            "mean_accuracy": mean_per_task_bal_acc,
+        }
 
         # TEMPORARY DIAGNOSTIC (pocket-targeting investigation), C1/C2 capture:
         # `classifier_wrapper` right now IS C2 (post-CL-training this task,
@@ -3436,6 +3523,11 @@ def main():
                         [v["balanced_accuracy"] for v in post_unlearn_per_task_eval.values()]
                     ))
                     post_unlearn_pooled_eval = evaluate_classifier(classifier_wrapper, pooled_X, pooled_y)
+                    post_test_acc_metrics = {
+                        "balanced_accuracy": post_unlearn_this_task_eval["balanced_accuracy"],
+                        "pooled_accuracy": post_unlearn_pooled_eval["accuracy"],
+                        "mean_accuracy": post_unlearn_mean_per_task_bal_acc,
+                    }
 
                     # POST-unlearn perturbed_test_eval (REWORK, pocket-targeted test
                     # poisoning follow-up): same rows/mask logic as perturbed_test_eval
@@ -3629,7 +3721,8 @@ def main():
             benign_label, mal_label,
         )
         write_test_accuracy_breakdown(
-            pocket_diag_log_path, t, pre_test_acc_snapshot, post_test_acc_snapshot
+            pocket_diag_log_path, t, pre_test_acc_snapshot, pre_test_acc_metrics, mal_label, benign_label,
+            post_test_acc_snapshot, post_test_acc_metrics,
         )
 
         # p_old_task updated to the FINAL (post-unlearning, if it ran this task)
@@ -3699,6 +3792,7 @@ def main():
         "task_fractions": TASK_FRACTIONS, "task_test_frac": TASK_TEST_FRAC,
         "train_uncertain_fraction": TRAIN_UNCERTAIN_FRACTION,
         "test_aggregate_fraction": TEST_AGGREGATE_FRACTION,
+        "recycle_test_pockets": RECYCLE_TEST_POCKETS,
         "red_train_target_margin_confidence": RED_TRAIN_TARGET_MARGIN_CONFIDENCE,
         "proximity_shaping_enabled": PROXIMITY_SHAPING_ENABLED,
         "poison_test_data": POISON_TEST_DATA,
