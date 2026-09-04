@@ -1428,10 +1428,13 @@ def main():
             "Each task's perturbable test pool is the UNION of that task's own C1-correct\n"
             "test rows AND task (t-1)'s own C1-correct test rows, recycled in (train-side\n"
             "pools are NOT C1-filtered -- they batch straight from the task's own training\n"
-            "data). A recycled row's perturbed value is NEVER written back into task\n"
-            "(t-1)'s own test split -- it is captured and scored only in the recycling\n"
-            "task's own section below, tagged '[recycled_from_task_N]'; entries without\n"
-            "that tag are this task's own test rows.\n\n"
+            "data). A recycled row's perturbed value, if successful, is now APPENDED as a\n"
+            "new row into the recycling task's OWN test split (task_test_splits[t]) -- it\n"
+            "never overwrites task (t-1)'s own copy of that row, so the same physical\n"
+            "sample can appear twice across the run's cumulative pooled_eval (once as\n"
+            "task (t-1)'s original clean row, once here). Entries below tagged\n"
+            "'[recycled_from_task_N]' are these; entries without that tag are this task's\n"
+            "own test rows.\n\n"
         )
 
     print(f"Loading {args.h5_path} and building {NUM_TASKS} pooled chronological tasks...")
@@ -1936,22 +1939,48 @@ def main():
                         poison_idx_test_ext = np.where(evaded_mask_test)[0]
 
                         own_mask_test = poison_idx_test_ext < n_own_test
-                        poison_idx_test = poison_idx_test_ext[own_mask_test]
+                        poison_idx_test_own = poison_idx_test_ext[own_mask_test]
                         recycled_ext_idx_mal = poison_idx_test_ext[~own_mask_test]
                         recycled_local_idx_mal = recycled_ext_idx_mal - n_own_test
-                        n_poisoned_test = len(poison_idx_test)
+                        n_poisoned_test_own = len(poison_idx_test_own)
 
                         X_test = X_test.copy()
-                        X_test[poison_idx_test] = X_test_ext_pert[poison_idx_test]
-                        task_test_splits[t] = (X_test, y_test)
-                        poisoned_test_sample_ids = gid_test[poison_idx_test].tolist() if n_poisoned_test > 0 else []
+                        X_test[poison_idx_test_own] = X_test_ext_pert[poison_idx_test_own]
 
                         recycled_gids_mal = gid_prev_test[recycled_local_idx_mal]
                         recycled_Xpert_mal = X_test_ext_pert[recycled_ext_idx_mal]
+                        n_recycled_mal = len(recycled_gids_mal)
+
+                        # REWORK (recycled-pocket test pool, now persisted): recycled
+                        # successes are appended as NEW rows into task_test_splits[t]/
+                        # task_test_gids[t] (they have no "slot" to overwrite in this
+                        # task's own split) so they now count toward this task's own
+                        # per_task_eval/pooled_eval/perturbed_test_eval, same as an
+                        # own-task success. Confirmed tradeoff: the same physical
+                        # sample can now appear TWICE across pooled_eval's cumulative
+                        # test corpus this run -- once as task (t-1)'s original clean
+                        # row (still sitting unmodified in task_test_splits[t-1]),
+                        # once here as task t's perturbed row -- not deduplicated.
+                        if n_recycled_mal > 0:
+                            recycled_new_idx_mal = np.arange(len(X_test), len(X_test) + n_recycled_mal)
+                            X_test = np.concatenate([X_test, recycled_Xpert_mal], axis=0)
+                            y_test = np.concatenate(
+                                [y_test, np.full(n_recycled_mal, mal_label, dtype=y_test.dtype)], axis=0
+                            )
+                            gid_test = np.concatenate([gid_test, recycled_gids_mal], axis=0)
+                        else:
+                            recycled_new_idx_mal = np.array([], dtype=np.int64)
+
+                        poison_idx_test = np.concatenate([poison_idx_test_own, recycled_new_idx_mal]).astype(np.int64)
+                        n_poisoned_test = len(poison_idx_test)
+                        task_test_splits[t] = (X_test, y_test)
+                        task_test_gids[t] = gid_test
+                        poisoned_test_sample_ids = gid_test[poison_idx_test].tolist() if n_poisoned_test > 0 else []
 
                         print(f"[Task {t}] poisoned {n_poisoned_test}/{len(attack_pool_mal_test)} attacked "
                               f"({n_tier1_used_mal} C1-correct, {n_tier2_used_mal} padded) malicious TEST samples "
-                              f"(+ {len(recycled_local_idx_mal)} recycled from task {t - 1}'s test split) -- "
+                              f"({n_poisoned_test_own} own + {n_recycled_mal} recycled from task {t - 1}'s test "
+                              f"split, both now persisted into task_test_splits[{t}]) -- "
                               f"success rate on C1-correct starts was "
                               f"{(n_poisoned_test / n_tier1_used_mal) if n_tier1_used_mal > 0 else float('nan'):.3f}")
 
@@ -2033,23 +2062,43 @@ def main():
                         poison_idx_test_ext_benign = np.where(evaded_mask_test_benign)[0]
 
                         own_mask_test_benign = poison_idx_test_ext_benign < n_own_test_benign
-                        poison_idx_test_benign = poison_idx_test_ext_benign[own_mask_test_benign]
+                        poison_idx_test_benign_own = poison_idx_test_ext_benign[own_mask_test_benign]
                         recycled_ext_idx_ben = poison_idx_test_ext_benign[~own_mask_test_benign]
                         recycled_local_idx_ben = recycled_ext_idx_ben - n_own_test_benign
-                        n_poisoned_test_benign = len(poison_idx_test_benign)
+                        n_poisoned_test_benign_own = len(poison_idx_test_benign_own)
 
                         X_test = X_test.copy()
-                        X_test[poison_idx_test_benign] = X_test_ext_pert_benign[poison_idx_test_benign]
-                        task_test_splits[t] = (X_test, y_test)
-                        poisoned_test_sample_ids_benign = gid_test[poison_idx_test_benign].tolist() \
-                            if n_poisoned_test_benign > 0 else []
+                        X_test[poison_idx_test_benign_own] = X_test_ext_pert_benign[poison_idx_test_benign_own]
 
                         recycled_gids_ben = gid_prev_test[recycled_local_idx_ben]
                         recycled_Xpert_ben = X_test_ext_pert_benign[recycled_ext_idx_ben]
+                        n_recycled_ben = len(recycled_gids_ben)
+
+                        # REWORK (recycled-pocket test pool, now persisted): mirror of
+                        # the malicious side's identical append above.
+                        if n_recycled_ben > 0:
+                            recycled_new_idx_ben = np.arange(len(X_test), len(X_test) + n_recycled_ben)
+                            X_test = np.concatenate([X_test, recycled_Xpert_ben], axis=0)
+                            y_test = np.concatenate(
+                                [y_test, np.full(n_recycled_ben, benign_label, dtype=y_test.dtype)], axis=0
+                            )
+                            gid_test = np.concatenate([gid_test, recycled_gids_ben], axis=0)
+                        else:
+                            recycled_new_idx_ben = np.array([], dtype=np.int64)
+
+                        poison_idx_test_benign = np.concatenate(
+                            [poison_idx_test_benign_own, recycled_new_idx_ben]
+                        ).astype(np.int64)
+                        n_poisoned_test_benign = len(poison_idx_test_benign)
+                        task_test_splits[t] = (X_test, y_test)
+                        task_test_gids[t] = gid_test
+                        poisoned_test_sample_ids_benign = gid_test[poison_idx_test_benign].tolist() \
+                            if n_poisoned_test_benign > 0 else []
 
                         print(f"[Task {t}] poisoned {n_poisoned_test_benign}/{len(attack_pool_ben_test)} attacked "
                               f"({n_tier1_used_ben} C1-correct, {n_tier2_used_ben} padded) benign TEST samples "
-                              f"(+ {len(recycled_local_idx_ben)} recycled from task {t - 1}'s test split) -- "
+                              f"({n_poisoned_test_benign_own} own + {n_recycled_ben} recycled from task {t - 1}'s "
+                              f"test split, both now persisted into task_test_splits[{t}]) -- "
                               f"success rate on C1-correct starts was "
                               f"{(n_poisoned_test_benign / n_tier1_used_ben) if n_tier1_used_ben > 0 else float('nan'):.3f}")
 
@@ -2137,53 +2186,39 @@ def main():
         if t > 0:
             pocket_diag_entries = []
             X_test_diag, _ = task_test_splits[t]
+            # REWORK (recycled-pocket test pool, now persisted): poison_idx_test/
+            # poison_idx_test_benign are each [own successes..., recycled
+            # successes...] in that order (see the selection blocks above), and
+            # task_test_splits[t] now actually holds the recycled rows too (as
+            # trailing appended rows) -- so a single predict() call over each
+            # already covers both own and recycled entries; local_i past the
+            # "own" count identifies a recycled entry for the source tag.
             if len(poison_idx_test) > 0:
                 X_mal_pert_diag = X_test_diag[poison_idx_test]
                 c1_mal = pre_train_classifier_wrapper.predict(X_mal_pert_diag)
                 c2_mal = classifier_wrapper.predict(X_mal_pert_diag)
                 for local_i, idx in enumerate(poison_idx_test):
-                    pocket_diag_entries.append({
+                    entry = {
                         "gid": int(gid_test[idx]), "group": "malicious_perturbed",
                         "true_label": int(mal_label),
                         "c1_pred": int(c1_mal[local_i]), "c2_pred": int(c2_mal[local_i]),
-                    })
+                    }
+                    if local_i >= n_poisoned_test_own:
+                        entry["source"] = f"recycled_from_task_{t - 1}"
+                    pocket_diag_entries.append(entry)
             if len(poison_idx_test_benign) > 0:
                 X_ben_pert_diag = X_test_diag[poison_idx_test_benign]
                 c1_ben = pre_train_classifier_wrapper.predict(X_ben_pert_diag)
                 c2_ben = classifier_wrapper.predict(X_ben_pert_diag)
                 for local_i, idx in enumerate(poison_idx_test_benign):
-                    pocket_diag_entries.append({
+                    entry = {
                         "gid": int(gid_test[idx]), "group": "benign_perturbed",
                         "true_label": int(benign_label),
                         "c1_pred": int(c1_ben[local_i]), "c2_pred": int(c2_ben[local_i]),
-                    })
-
-            # REWORK (recycled-pocket test pool): C1/C2 capture for rows recycled
-            # from task (t-1)'s test split -- mirror of
-            # madar_unlearning_cl_pipeline.py's identical addition (minus the C3
-            # step, which doesn't exist here). Their perturbed feature values live
-            # ONLY in recycled_Xpert_mal/recycled_Xpert_ben (never written into
-            # task_test_splits[t-1]), tagged with their ORIGINAL task-(t-1) gid.
-            if len(recycled_gids_mal) > 0:
-                c1_mal_rec = pre_train_classifier_wrapper.predict(recycled_Xpert_mal)
-                c2_mal_rec = classifier_wrapper.predict(recycled_Xpert_mal)
-                for local_i in range(len(recycled_gids_mal)):
-                    pocket_diag_entries.append({
-                        "gid": int(recycled_gids_mal[local_i]), "group": "malicious_perturbed",
-                        "true_label": int(mal_label),
-                        "c1_pred": int(c1_mal_rec[local_i]), "c2_pred": int(c2_mal_rec[local_i]),
-                        "source": f"recycled_from_task_{t - 1}",
-                    })
-            if len(recycled_gids_ben) > 0:
-                c1_ben_rec = pre_train_classifier_wrapper.predict(recycled_Xpert_ben)
-                c2_ben_rec = classifier_wrapper.predict(recycled_Xpert_ben)
-                for local_i in range(len(recycled_gids_ben)):
-                    pocket_diag_entries.append({
-                        "gid": int(recycled_gids_ben[local_i]), "group": "benign_perturbed",
-                        "true_label": int(benign_label),
-                        "c1_pred": int(c1_ben_rec[local_i]), "c2_pred": int(c2_ben_rec[local_i]),
-                        "source": f"recycled_from_task_{t - 1}",
-                    })
+                    }
+                    if local_i >= n_poisoned_test_benign_own:
+                        entry["source"] = f"recycled_from_task_{t - 1}"
+                    pocket_diag_entries.append(entry)
 
             write_pocket_targeting_diagnostic(
                 pocket_diag_log_path, t, pocket_diag_entries, benign_label, mal_label,
