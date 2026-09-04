@@ -606,9 +606,67 @@ def generate_train_variants(env, red_agent, X_pert, evaded_mask, gid_array, true
 # SAC/NetworkAttackEnv rollout for TEST-SIDE agents only. See
 # madar_unlearning_cl_pipeline.py's identical function for the full
 # docstring/rationale -- ported unchanged.
+def _log_pgd_break_diagnostics(diag_log_path, diag_label, break_reasons, steps_survived,
+                                c1_mismatch_steps, initial_confidences, pert_norms,
+                                epsilon, max_steps, attacked):
+    """
+    DIAGNOSTIC (why-so-few-test-pockets investigation): summarizes, for one
+    pgd_boundary_search_batch() call, how many attacked samples ended up
+    evaded vs. broke for each reason (C1 disagreeing, the gradient
+    vanishing, or simply exhausting max_steps still C1-correct but never
+    reaching benign_label), how many steps the non-evaded ones survived
+    before that, and how much of the epsilon L2 budget they actually used.
+    This is purely observational -- it never affects success/evaded_mask or
+    the return contract -- meant to tell apart "ran out of epsilon budget"
+    from "C1 disagreed almost immediately" as the dominant failure mode.
+    Prints unconditionally; also appended to diag_log_path (the
+    pocket_targeting_diagnostic log) when one is given, matching
+    c1_correct_pool's dual console+log convention.
+    """
+    if attacked == 0:
+        return
+    label = diag_label or "pgd_boundary_search_batch"
+    counts = {"evaded": 0, "c1_mismatch": 0, "vanishing_grad": 0, "max_steps_exhausted": 0}
+    for r in break_reasons:
+        counts[r] += 1
+
+    lines = [f"    [PGD break diagnostic] {label}: {attacked} attacked -- "
+             f"evaded={counts['evaded']}, c1_mismatch={counts['c1_mismatch']}, "
+             f"vanishing_grad={counts['vanishing_grad']}, "
+             f"max_steps_exhausted={counts['max_steps_exhausted']}"]
+
+    if c1_mismatch_steps:
+        frac_step1 = sum(1 for s in c1_mismatch_steps if s == 1) / len(c1_mismatch_steps)
+        lines.append(f"      c1_mismatch broke at step (median)="
+                     f"{float(np.median(c1_mismatch_steps)):.1f}/{max_steps}, "
+                     f"{frac_step1:.0%} of those broke on step 1")
+
+    if steps_survived:
+        lines.append(f"      avg steps survived (non-evaded only)="
+                     f"{float(np.mean(steps_survived)):.1f}/{max_steps}")
+
+    if initial_confidences:
+        lines.append(f"      initial confidence toward target label: "
+                     f"mean={float(np.mean(initial_confidences)):.3f}, "
+                     f"median={float(np.median(initial_confidences)):.3f}")
+
+    if pert_norms:
+        util = np.asarray(pert_norms) / epsilon
+        lines.append(f"      epsilon-budget utilization (final L2 / epsilon={epsilon}): "
+                     f"mean={util.mean():.2f}, median={float(np.median(util)):.2f}, "
+                     f"max={util.max():.2f}")
+
+    msg = "\n".join(lines)
+    print(msg)
+    if diag_log_path is not None:
+        with open(diag_log_path, "a") as f:
+            f.write(msg + "\n")
+
+
 def pgd_boundary_search_batch(classifier_wrapper, X, y, benign_label, allowed_start_indices,
                                shift_reference_classifier=None, epsilon=None, max_steps=None,
-                               margin_low=0.55, margin_high=0.65, device=None, max_test=None):
+                               margin_low=0.55, margin_high=0.65, device=None, max_test=None,
+                               diag_log_path=None, diag_label=None):
     epsilon = RED_EPSILON if epsilon is None else epsilon
     max_steps = RED_MAX_STEPS if max_steps is None else max_steps
     device = DEVICE if device is None else device
@@ -639,6 +697,14 @@ def pgd_boundary_search_batch(classifier_wrapper, X, y, benign_label, allowed_st
     evasion = 0
     attacked = 0
 
+    # DIAGNOSTIC (why-so-few-test-pockets investigation) -- see
+    # _log_pgd_break_diagnostics's docstring. Tracked per attacked sample,
+    # aggregated/printed once after the loop below.
+    break_reasons = []
+    steps_survived = []
+    c1_mismatch_steps = []
+    initial_confidences = []
+
     model.eval()
     for i in indices:
         attacked += 1
@@ -647,8 +713,13 @@ def pgd_boundary_search_batch(classifier_wrapper, X, y, benign_label, allowed_st
         x_cur = x0.copy()
         success = False
         final_confidence = 0.0
+        initial_confidences.append(float(_probs(x0)[benign_label]))
 
-        for _ in range(max_steps):
+        steps_taken = 0
+        c1_mismatch_at = None
+        vanishing_grad_hit = False
+
+        for step_num in range(1, max_steps + 1):
             x_t = torch.tensor(x_cur, dtype=torch.float32, device=device, requires_grad=True)
             logits = model(_scaled(x_t).unsqueeze(0))
             loss = F.cross_entropy(logits, target_t)
@@ -657,7 +728,9 @@ def pgd_boundary_search_batch(classifier_wrapper, X, y, benign_label, allowed_st
             grad = x_t.grad.detach().cpu().numpy()
 
             grad_norm = np.linalg.norm(grad, ord=2)
+            steps_taken = step_num
             if grad_norm < 1e-12:
+                vanishing_grad_hit = True
                 break
             step = -grad / grad_norm
 
@@ -677,6 +750,7 @@ def pgd_boundary_search_batch(classifier_wrapper, X, y, benign_label, allowed_st
                 ref_pred = shift_reference_classifier.predict(x_cur.reshape(1, -1))[0]
                 c1_correct = bool(ref_pred == true_label)
                 if not c1_correct:
+                    c1_mismatch_at = step_num
                     break
 
             c2_evaded = bool(predicted_label == benign_label)
@@ -692,9 +766,24 @@ def pgd_boundary_search_batch(classifier_wrapper, X, y, benign_label, allowed_st
             evasion += 1
             X_pert[i] = x_cur
             evaded_mask[i] = True
+            break_reasons.append("evaded")
+        else:
+            steps_survived.append(steps_taken)
+            if c1_mismatch_at is not None:
+                break_reasons.append("c1_mismatch")
+                c1_mismatch_steps.append(c1_mismatch_at)
+            elif vanishing_grad_hit:
+                break_reasons.append("vanishing_grad")
+            else:
+                break_reasons.append("max_steps_exhausted")
 
     evasion_rate = evasion / max(attacked, 1)
     avg_pert_norm = float(np.mean(pert_norms)) if pert_norms else 0.0
+
+    _log_pgd_break_diagnostics(diag_log_path, diag_label, break_reasons, steps_survived,
+                                c1_mismatch_steps, initial_confidences, pert_norms,
+                                epsilon, max_steps, attacked)
+
     return X_pert, evasion_rate, rewards, avg_pert_norm, attacked, evaded_mask
 
 
@@ -2237,6 +2326,7 @@ def main():
                                 epsilon=RED_EPSILON, max_steps=RED_MAX_STEPS,
                                 margin_low=RED_TARGET_MARGIN_CONFIDENCE, margin_high=RED_TARGET_MARGIN_HIGH,
                                 max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                                diag_log_path=pocket_diag_log_path, diag_label=f"Task {t} test-side malicious",
                             )
                         red_report["test_evasion_rate"] = test_evasion_rate
                         red_report["test_attacked"] = test_attacked
@@ -2349,6 +2439,7 @@ def main():
                             epsilon=RED_EPSILON, max_steps=RED_MAX_STEPS,
                             margin_low=RED_TARGET_MARGIN_CONFIDENCE, margin_high=RED_TARGET_MARGIN_HIGH,
                             max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                            diag_log_path=pocket_diag_log_path, diag_label=f"Task {t} test-side benign",
                         )
                         red_report["test_benign_evasion_rate"] = test_evasion_rate_benign
                         red_report["test_benign_attacked"] = test_attacked_benign
