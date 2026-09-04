@@ -2111,17 +2111,25 @@ def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, poison_idx_be
 
 
 def retrain_classifier_from_scratch(feature_dim, retain_idx, forget_idx, Xtr, ytr, omega, device,
-                                     epochs=None, lr=None, batch_size=None):
+                                     replay_buffer=None, epochs=None, lr=None, batch_size=None):
     """
     DIAGNOSTIC (retrain-vs-unlearn comparison, FULL_RETRAIN_DIAGNOSTIC_TASKS
     only): the "exact unlearning" gold standard -- a freshly-initialized
-    classifier (fresh weights, fresh optimizer) trained ONLY on the retain
-    set, so it has structurally never seen the forget set at all, unlike
-    unlearn_teacher_guided's approximate SI/KD-anchored corrective approach.
-    Swapped in for specific tasks only; CL training (and the SI omega/
-    p_old_task trackers) for every other task is unaffected -- this function
-    doesn't touch omega/p_old_task itself, it only produces a new model's
-    weights for the caller to load into the existing model in place.
+    classifier (fresh weights, fresh optimizer) trained on the retain set
+    PLUS the current replay buffer, so it has structurally never seen the
+    forget set at all, unlike unlearn_teacher_guided's approximate SI/KD-
+    anchored corrective approach. The replay buffer is included (not just
+    this task's retain set) so the comparison is apples-to-apples:
+    unlearn_teacher_guided also trains against retain + replay (+ KD) --
+    omitting replay here would just catastrophically forget every prior
+    task and confound "does full retrain forget the poisoned data better"
+    with "this model saw none of the other 7-8 tasks." The buffer is
+    already scrubbed of forget-pool matches by _clean_buffer, so including
+    it can't leak anything this diagnostic is meant to forget. Swapped in
+    for specific tasks only; CL training (and the SI omega/p_old_task
+    trackers) for every other task is unaffected -- this function doesn't
+    touch omega/p_old_task itself, it only produces a new model's weights
+    for the caller to load into the existing model in place.
 
     Returns (new_model, diag) where diag deliberately mirrors unlearn_
     teacher_guided's return keys (omega_l2_norm/n_steps/raw_forget_loss_mean/
@@ -2132,6 +2140,7 @@ def retrain_classifier_from_scratch(feature_dim, retain_idx, forget_idx, Xtr, yt
     term is used here), and raw_forget_loss_mean is the NEW model's
     resulting forget-set CE loss (informative even though never optimized
     against, unlike the other two which are true training-loss averages).
+    n_replay (extra key) records how many buffer rows were folded in.
     """
     epochs = RETRAIN_FULL_EPOCHS if epochs is None else epochs
     lr = RETRAIN_FULL_LR if lr is None else lr
@@ -2140,9 +2149,20 @@ def retrain_classifier_from_scratch(feature_dim, retain_idx, forget_idx, Xtr, yt
     new_model = ClassifierNN(feature_dim, 2).to(device)
     optimizer = optim.Adam(new_model.parameters(), lr=lr)
     retain_idx_t = torch.tensor(retain_idx, dtype=torch.long)
-    drop_last = (len(retain_idx) % batch_size == 1)
+
+    train_X = [Xtr[retain_idx_t]]
+    train_y = [ytr[retain_idx_t]]
+    n_replay = 0
+    if replay_buffer:
+        train_X.append(torch.stack([entry[0] for entry in replay_buffer]))
+        train_y.append(torch.stack([entry[1] for entry in replay_buffer]))
+        n_replay = len(replay_buffer)
+    train_X = torch.cat(train_X, dim=0)
+    train_y = torch.cat(train_y, dim=0)
+
+    drop_last = (len(train_X) % batch_size == 1)
     loader = data.DataLoader(
-        data.TensorDataset(Xtr[retain_idx_t], ytr[retain_idx_t]), batch_size=batch_size,
+        data.TensorDataset(train_X, train_y), batch_size=batch_size,
         shuffle=True, drop_last=drop_last,
     )
 
@@ -2170,9 +2190,10 @@ def retrain_classifier_from_scratch(feature_dim, retain_idx, forget_idx, Xtr, yt
     omega_l2_norm = float(torch.sqrt(sum((v ** 2).sum() for v in omega.values())).item())
 
     diag = {
-        "method": "full_retrain_on_retain_set",
+        "method": "full_retrain_on_retain_set_plus_replay",
         "omega_l2_norm": omega_l2_norm,
         "n_steps": len(raw_retain_losses),
+        "n_replay": n_replay,
         "raw_forget_loss_mean": raw_forget_loss_mean,
         "raw_retain_loss_mean": float(np.mean(raw_retain_losses)) if raw_retain_losses else None,
         "raw_si_loss_mean": 0.0,
@@ -4077,11 +4098,13 @@ def main():
                     # efficacy/downstream "before/after" comparisons below
                     # work identically regardless of which branch ran.
                     if t in FULL_RETRAIN_DIAGNOSTIC_TASKS:
-                        print(f"    [Unlearn] task {t}: DIAGNOSTIC full retrain on retain set only "
-                              f"(n_retain={len(retain_idx)}, forget set of {len(forget_idx)} samples "
-                              f"discarded -- NOT trained on) instead of unlearn_teacher_guided...")
+                        print(f"    [Unlearn] task {t}: DIAGNOSTIC full retrain on retain set + "
+                              f"replay buffer (n_retain={len(retain_idx)}, n_replay={len(replay_buffer)}, "
+                              f"forget set of {len(forget_idx)} samples discarded -- NOT trained on) "
+                              f"instead of unlearn_teacher_guided...")
                         retrained_model, unlearn_diag = retrain_classifier_from_scratch(
                             feature_dim, retain_idx, forget_idx, Xtr, ytr, omega, DEVICE,
+                            replay_buffer=replay_buffer,
                             epochs=RETRAIN_FULL_EPOCHS, lr=RETRAIN_FULL_LR, batch_size=BATCH_SIZE,
                         )
                         model.load_state_dict(retrained_model.state_dict())
