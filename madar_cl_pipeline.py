@@ -976,6 +976,66 @@ def evaluate_classifier(classifier, X, y):
 
 
 # ---------------------------------------------------------------------------
+# TEMPORARY DIAGNOSTIC (pocket-targeting investigation), test-accuracy
+# breakdown -- MADAR version, ported from madar_unlearning_cl_pipeline.py.
+# Answers, per task, the 3 questions that apply without an unlearning step:
+# (1) how many rows are in this task's test split (own reserved + recycled
+# successes appended in), and how many of those are actually-perturbed rows
+# counted in the reported accuracy; (2) of the perturbed rows, how many the
+# classifier STILL gets right after adaptation, per class; (3) of the clean
+# rows, how many it gets right after adaptation. Appended into the SAME
+# pocket_targeting_diagnostic.txt log, right after the existing
+# correctness-pattern section for that task.
+# ---------------------------------------------------------------------------
+def _test_accuracy_snapshot(classifier_wrapper, X_test, y_test, poison_idx_test, poison_idx_test_benign,
+                             mal_label, benign_label):
+    """See madar_unlearning_cl_pipeline.py's identical function for the full
+    docstring -- ported unchanged (MADAR just never calls it a second time
+    for a "post" snapshot, since there's no unlearning step)."""
+    n_test_total = len(y_test)
+    poison_idx_test = np.asarray(poison_idx_test, dtype=np.int64)
+    poison_idx_test_benign = np.asarray(poison_idx_test_benign, dtype=np.int64)
+    all_poison_idx = np.concatenate([poison_idx_test, poison_idx_test_benign])
+    clean_idx = np.setdiff1d(np.arange(n_test_total, dtype=np.int64), all_poison_idx)
+
+    mal_pred = classifier_wrapper.predict(X_test[poison_idx_test]) if len(poison_idx_test) > 0 else np.array([])
+    ben_pred = classifier_wrapper.predict(X_test[poison_idx_test_benign]) if len(poison_idx_test_benign) > 0 else np.array([])
+    clean_pred = classifier_wrapper.predict(X_test[clean_idx]) if len(clean_idx) > 0 else np.array([])
+    clean_true = y_test[clean_idx]
+
+    return {
+        "n_test_total": int(n_test_total),
+        "n_perturbed_mal": int(len(poison_idx_test)), "n_perturbed_ben": int(len(poison_idx_test_benign)),
+        "mal_correct": int(np.sum(mal_pred == mal_label)),
+        "ben_correct": int(np.sum(ben_pred == benign_label)),
+        "clean_idx": clean_idx, "clean_true": clean_true, "clean_pred": clean_pred,
+        "clean_total": int(len(clean_idx)),
+        "clean_correct": int(np.sum(clean_pred == clean_true)) if len(clean_idx) > 0 else 0,
+    }
+
+
+def _ratio_str(numer, denom):
+    return f"{numer}/{denom} ({numer / denom:.3f})" if denom > 0 else f"{numer}/0 (n/a)"
+
+
+def write_test_accuracy_breakdown(log_path, task_id, pre_stats, post_stats=None):
+    """MADAR version -- post_stats is always None (no unlearning step), kept
+    as a parameter only so the call site matches madar_unlearning_cl_pipeline.py's."""
+    n_pert = pre_stats["n_perturbed_mal"] + pre_stats["n_perturbed_ben"]
+    with open(log_path, "a") as f:
+        f.write(f"[Test accuracy breakdown] Task {task_id}\n")
+        f.write(f"  1. Reserved for testing (incl. recycled successes persisted this task): "
+                f"{pre_stats['n_test_total']} total\n")
+        f.write(f"     Perturbed & actually used (counted in the reported accuracy above): "
+                f"{n_pert} ({pre_stats['n_perturbed_mal']} malicious + {pre_stats['n_perturbed_ben']} benign)\n")
+        f.write(f"  2. Perturbed samples still classified CORRECTLY after adaptation: "
+                f"malicious {_ratio_str(pre_stats['mal_correct'], pre_stats['n_perturbed_mal'])}, "
+                f"benign {_ratio_str(pre_stats['ben_correct'], pre_stats['n_perturbed_ben'])}\n")
+        f.write(f"  3. Clean samples correctly classified after adaptation: "
+                f"{_ratio_str(pre_stats['clean_correct'], pre_stats['clean_total'])}\n\n")
+
+
+# ---------------------------------------------------------------------------
 # TEMPORARY DIAGNOSTIC (pocket-targeting investigation) -- MADAR version.
 # Ported from madar_unlearning_cl_pipeline.py so the two pipelines' pocket-
 # targeting behavior can be compared directly (same run, same seed, same
@@ -2176,6 +2236,19 @@ def main():
               f"pooled bal_acc={pooled_eval['balanced_accuracy']:.4f} "
               f"mean-per-task bal_acc={mean_per_task_bal_acc:.4f}")
 
+        # TEMPORARY DIAGNOSTIC (test-accuracy breakdown, Q1-3): snapshot of
+        # THIS task's own (recycled-extended) test split against the current
+        # classifier -- see _test_accuracy_snapshot's docstring. Uses
+        # task_test_splits[t] directly rather than the loop-local X_test/
+        # y_test to guarantee it matches exactly what per_task_eval[t] above
+        # was computed against. Computed for every task (including t==0,
+        # where it's trivially all-clean) so write_test_accuracy_breakdown
+        # below always has something to report.
+        X_test_t, y_test_t = task_test_splits[t]
+        pre_test_acc_snapshot = _test_accuracy_snapshot(
+            classifier_wrapper, X_test_t, y_test_t, poison_idx_test, poison_idx_test_benign, mal_label, benign_label
+        )
+
         # TEMPORARY DIAGNOSTIC (pocket-targeting investigation), ported from
         # madar_unlearning_cl_pipeline.py: `classifier_wrapper` right now IS
         # C2 (this task's FINAL state -- MADAR has no unlearning step to run
@@ -2223,6 +2296,8 @@ def main():
             write_pocket_targeting_diagnostic(
                 pocket_diag_log_path, t, pocket_diag_entries, benign_label, mal_label,
             )
+
+        write_test_accuracy_breakdown(pocket_diag_log_path, t, pre_test_acc_snapshot)
 
         results.append({
             "task_id": t,

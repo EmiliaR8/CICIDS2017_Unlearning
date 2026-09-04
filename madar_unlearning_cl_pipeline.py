@@ -1282,10 +1282,103 @@ def evaluate_classifier(classifier, X, y):
 
 
 # ---------------------------------------------------------------------------
-# TEMPORARY DIAGNOSTIC (pocket-targeting investigation) -- see module-level
-# pocket_diag_log_path's header comment in main() for context on why this
-# exists. Not part of the pipeline's normal metrics.
+# TEMPORARY DIAGNOSTIC (pocket-targeting investigation), test-accuracy
+# breakdown -- answers, per task, the 6 questions: (1) how many rows are in
+# this task's test split (own reserved + recycled successes appended in),
+# and how many of those are actually-perturbed rows counted in the reported
+# accuracy; (2) of the perturbed rows, how many the classifier STILL gets
+# right after adaptation, per class; (3) of the clean rows, how many it gets
+# right after adaptation; (4) how many perturbed rows unlearning recovers,
+# per class; (5) how many clean rows are right after unlearning; (6) how
+# many clean rows unlearning flipped right->wrong or wrong->right (not just
+# the net delta). Appended into the SAME pocket_targeting_diagnostic.txt
+# log, right after the existing correctness-pattern section for that task.
 # ---------------------------------------------------------------------------
+def _test_accuracy_snapshot(classifier_wrapper, X_test, y_test, poison_idx_test, poison_idx_test_benign,
+                             mal_label, benign_label):
+    """
+    One-shot accuracy snapshot of a task's (possibly recycled-extended) test
+    split against whatever classifier state `classifier_wrapper` currently
+    holds -- called once right after PRE-unlearning eval (classifier == C2)
+    and again right after POST-unlearning eval (classifier == C3), on the
+    SAME X_test/y_test/poison_idx_test/poison_idx_test_benign (unlearning
+    changes only the classifier's weights, never the test data or which
+    rows are flagged perturbed), so the two snapshots' clean_pred arrays are
+    directly comparable row-for-row -- see write_test_accuracy_breakdown's
+    Q6 computation.
+
+    Returns a dict: n_test_total, n_perturbed_mal/n_perturbed_ben (== the
+    count of malicious/benign rows counted in the reported accuracy, own +
+    persisted recycled), mal_correct/ben_correct (of those, how many the
+    classifier still gets right), clean_total/clean_correct, and
+    clean_idx/clean_true/clean_pred (raw arrays, kept for the row-level
+    diff against a later snapshot).
+    """
+    n_test_total = len(y_test)
+    poison_idx_test = np.asarray(poison_idx_test, dtype=np.int64)
+    poison_idx_test_benign = np.asarray(poison_idx_test_benign, dtype=np.int64)
+    all_poison_idx = np.concatenate([poison_idx_test, poison_idx_test_benign])
+    clean_idx = np.setdiff1d(np.arange(n_test_total, dtype=np.int64), all_poison_idx)
+
+    mal_pred = classifier_wrapper.predict(X_test[poison_idx_test]) if len(poison_idx_test) > 0 else np.array([])
+    ben_pred = classifier_wrapper.predict(X_test[poison_idx_test_benign]) if len(poison_idx_test_benign) > 0 else np.array([])
+    clean_pred = classifier_wrapper.predict(X_test[clean_idx]) if len(clean_idx) > 0 else np.array([])
+    clean_true = y_test[clean_idx]
+
+    return {
+        "n_test_total": int(n_test_total),
+        "n_perturbed_mal": int(len(poison_idx_test)), "n_perturbed_ben": int(len(poison_idx_test_benign)),
+        "mal_correct": int(np.sum(mal_pred == mal_label)),
+        "ben_correct": int(np.sum(ben_pred == benign_label)),
+        "clean_idx": clean_idx, "clean_true": clean_true, "clean_pred": clean_pred,
+        "clean_total": int(len(clean_idx)),
+        "clean_correct": int(np.sum(clean_pred == clean_true)) if len(clean_idx) > 0 else 0,
+    }
+
+
+def _ratio_str(numer, denom):
+    return f"{numer}/{denom} ({numer / denom:.3f})" if denom > 0 else f"{numer}/0 (n/a)"
+
+
+def write_test_accuracy_breakdown(log_path, task_id, pre_stats, post_stats=None):
+    """
+    Appends a human-readable Q1-6 test-accuracy breakdown for this task to
+    `log_path` (the same pocket_targeting_diagnostic.txt file), right after
+    the existing per-sample correctness-pattern section for this task.
+    pre_stats/post_stats come from _test_accuracy_snapshot, captured right
+    after this task's PRE-unlearning and POST-unlearning (if it ran)
+    evaluations respectively; post_stats is None when unlearning didn't run
+    this task (task 0, or an empty forget set).
+    """
+    n_pert = pre_stats["n_perturbed_mal"] + pre_stats["n_perturbed_ben"]
+    with open(log_path, "a") as f:
+        f.write(f"[Test accuracy breakdown] Task {task_id}\n")
+        f.write(f"  1. Reserved for testing (incl. recycled successes persisted this task): "
+                f"{pre_stats['n_test_total']} total\n")
+        f.write(f"     Perturbed & actually used (counted in the reported accuracy above): "
+                f"{n_pert} ({pre_stats['n_perturbed_mal']} malicious + {pre_stats['n_perturbed_ben']} benign)\n")
+        f.write(f"  2. Perturbed samples still classified CORRECTLY after adaptation (pre-unlearning): "
+                f"malicious {_ratio_str(pre_stats['mal_correct'], pre_stats['n_perturbed_mal'])}, "
+                f"benign {_ratio_str(pre_stats['ben_correct'], pre_stats['n_perturbed_ben'])}\n")
+        f.write(f"  3. Clean samples correctly classified after adaptation (pre-unlearning): "
+                f"{_ratio_str(pre_stats['clean_correct'], pre_stats['clean_total'])}\n")
+        if post_stats is None:
+            f.write("  4-6. Unlearning did not run this task -- no post-unlearning comparison.\n\n")
+            return
+        f.write(f"  4. Perturbed samples RECOVERED by unlearning (now correct, were wrong pre-unlearning): "
+                f"malicious {_ratio_str(post_stats['mal_correct'], pre_stats['n_perturbed_mal'])}, "
+                f"benign {_ratio_str(post_stats['ben_correct'], pre_stats['n_perturbed_ben'])}\n")
+        f.write(f"  5. Clean samples correctly classified after unlearning: "
+                f"{_ratio_str(post_stats['clean_correct'], post_stats['clean_total'])}\n")
+        gained = int(np.sum((pre_stats["clean_pred"] != pre_stats["clean_true"]) &
+                             (post_stats["clean_pred"] == post_stats["clean_true"])))
+        lost = int(np.sum((pre_stats["clean_pred"] == pre_stats["clean_true"]) &
+                           (post_stats["clean_pred"] != post_stats["clean_true"])))
+        net = post_stats["clean_correct"] - pre_stats["clean_correct"]
+        f.write(f"  6. Clean samples changed by unlearning: {gained} recovered (wrong->correct), "
+                f"{lost} lost (correct->wrong), net {net:+d}\n\n")
+
+
 def write_pocket_targeting_diagnostic(log_path, task_id, entries, unlearning_ran,
                                        benign_label, mal_label):
     """
@@ -2340,6 +2433,9 @@ def main():
         )
         task_test_splits[t] = (X_test, y_test)
         task_test_gids[t] = gid_test
+        n_test_reserved = len(X_test)  # this task's own row count, BEFORE any
+                                        # recycled-success rows get appended below --
+                                        # used by the test-accuracy-breakdown logging
 
         mal_idx_train = np.where(y_train == mal_label)[0]
         benign_idx_train = np.where(y_train == benign_label)[0]
@@ -2593,6 +2689,7 @@ def main():
         # to check" by write_pocket_targeting_diagnostic).
         pocket_diag_entries = []
         unlearning_ran_this_task = False
+        post_test_acc_snapshot = None  # set below only if unlearning actually runs this task
 
         # ============================================================
         # 1. TRAIN on this task's train split.
@@ -3113,6 +3210,17 @@ def main():
               f"pooled bal_acc={pooled_eval['balanced_accuracy']:.4f} "
               f"mean-per-task bal_acc={mean_per_task_bal_acc:.4f}")
 
+        # TEMPORARY DIAGNOSTIC (test-accuracy breakdown, Q1-3): snapshot of
+        # THIS task's own (recycled-extended) test split against C2 (pre-
+        # unlearning) -- see _test_accuracy_snapshot's docstring. Uses
+        # task_test_splits[t] directly rather than the loop-local X_test/
+        # y_test to guarantee it matches exactly what per_task_eval[t] above
+        # was computed against.
+        X_test_t, y_test_t = task_test_splits[t]
+        pre_test_acc_snapshot = _test_accuracy_snapshot(
+            classifier_wrapper, X_test_t, y_test_t, poison_idx_test, poison_idx_test_benign, mal_label, benign_label
+        )
+
         # TEMPORARY DIAGNOSTIC (pocket-targeting investigation), C1/C2 capture:
         # `classifier_wrapper` right now IS C2 (post-CL-training this task,
         # pre-unlearning -- nothing has touched `model` since train_cl_er/the
@@ -3298,6 +3406,18 @@ def main():
                     print(f"    [This task] bal_acc after its own unlearning: "
                           f"{per_task_eval[t]['balanced_accuracy']:.4f} -> "
                           f"{post_unlearn_this_task_eval['balanced_accuracy']:.4f}")
+
+                    # TEMPORARY DIAGNOSTIC (test-accuracy breakdown, Q4-6): same
+                    # snapshot as pre_test_acc_snapshot above, now against C3
+                    # (post-unlearning) -- same X_test_t/y_test_t/poison_idx_test/
+                    # poison_idx_test_benign (unlearning changes only the
+                    # classifier's weights, never the test data), so the two
+                    # snapshots' clean_pred arrays are directly comparable
+                    # row-for-row in write_test_accuracy_breakdown's Q6.
+                    post_test_acc_snapshot = _test_accuracy_snapshot(
+                        classifier_wrapper, X_test_t, y_test_t, poison_idx_test, poison_idx_test_benign,
+                        mal_label, benign_label
+                    )
 
                     # POST-unlearn per_task_eval/pooled_eval/mean_per_task_balanced_
                     # accuracy (REWORK, task_metrics.png follow-up): the pre-unlearn
@@ -3507,6 +3627,9 @@ def main():
         write_pocket_targeting_diagnostic(
             pocket_diag_log_path, t, pocket_diag_entries, unlearning_ran_this_task,
             benign_label, mal_label,
+        )
+        write_test_accuracy_breakdown(
+            pocket_diag_log_path, t, pre_test_acc_snapshot, post_test_acc_snapshot
         )
 
         # p_old_task updated to the FINAL (post-unlearning, if it ran this task)
