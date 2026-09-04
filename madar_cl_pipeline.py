@@ -1766,16 +1766,75 @@ def plot_decision_boundary_grid(panels, out_path):
     plt.close(fig)
 
 
+def _compute_global_pca_basis(tasks, to_tensor, pad=0.5):
+    """
+    GLOBAL (run-wide) PCA basis for plot_decision_boundary -- see
+    madar_unlearning_cl_pipeline.py's identical helper for the full
+    rationale. Pure function of `tasks` + the scaler `to_tensor` uses, so a
+    resumed run (see main()'s --resume_from) can call this again with its
+    restored scaler and get back the IDENTICAL basis the original run would
+    have used at this point, rather than needing to persist it.
+    """
+    all_X_scaled = to_tensor(
+        np.concatenate([np.clip(tk["features"].astype(np.float32), 0.0, 1.0) for tk in tasks], axis=0)
+    ).numpy()
+    pca_mean = all_X_scaled.mean(axis=0)
+    _, _, pca_Vt = np.linalg.svd(all_X_scaled - pca_mean, full_matrices=False)
+    pca_components = pca_Vt[:2]
+    Z_all = (all_X_scaled - pca_mean) @ pca_components.T
+    pca_extent = (
+        float(Z_all[:, 0].min() - pad), float(Z_all[:, 0].max() + pad),
+        float(Z_all[:, 1].min() - pad), float(Z_all[:, 1].max() + pad),
+    )
+    return pca_mean, pca_components, pca_extent
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
     start_time = time.perf_counter()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--log_name", type=str, default="madar_cl_run")
     ap.add_argument("--h5-path", type=str, default=H5_DATASET_PATH)
+    # NEW (full-resume support): see madar_unlearning_cl_pipeline.py's
+    # identical flag for the full rationale -- ported here for parity.
+    ap.add_argument("--resume_from", type=str, default=None,
+                     help="Path to a classifier_checkpoint.pt from a prior run; resumes "
+                          "right after that checkpoint's task_id.")
     args = ap.parse_args()
+
+    resume_checkpoint = None
+    resume_task_id = None
+    if args.resume_from:
+        print(f"Loading resume checkpoint from {args.resume_from} ...")
+        # weights_only=False: this checkpoint carries plain Python objects
+        # (StandardScaler, the contrastive bank's numpy state, task_test_
+        # splits, etc.), not just tensors. Trusted input: this is a local
+        # research checkpoint written by this same script, never
+        # user-supplied/untrusted data.
+        resume_checkpoint = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        resume_task_id = resume_checkpoint["task_id"]
+        if resume_task_id >= NUM_TASKS - 1:
+            raise ValueError(
+                f"Checkpoint is already at task {resume_task_id}, the last task "
+                f"(NUM_TASKS={NUM_TASKS}) -- there is nothing left to resume."
+            )
+        print(f"Resuming after task {resume_task_id} -- next task to run is {resume_task_id + 1}.")
+
+    # Seed must match the ORIGINAL run's seed for a resumed run's own
+    # train_test_split calls (random_state=args.seed) to land on the same
+    # rows the original run would have produced for the not-yet-processed
+    # tasks -- default to the checkpoint's seed when resuming and none was
+    # given explicitly, otherwise fall back to this script's historical
+    # default (42).
+    if args.seed is None:
+        args.seed = resume_checkpoint["seed"] if resume_checkpoint is not None else 42
+    elif resume_checkpoint is not None and args.seed != resume_checkpoint["seed"]:
+        print(f"WARNING: --seed {args.seed} differs from the checkpoint's original seed "
+              f"{resume_checkpoint['seed']} -- task splits from here on will NOT match "
+              f"what the original run would have produced.")
 
     global SEED
     SEED = args.seed
@@ -1868,28 +1927,73 @@ def main():
     # feature_dim/X_train are known. Persistent across every task -- MADAR fine
     # -tunes ONE model forward (like naive), it just protects earlier tasks via
     # the ER/KD/SI machinery instead of never revisiting them.
-    scaler = None
-    model = None
-    classifier_wrapper = None
-    teacher_model = None
-    W = omega = p_old_task = None
-
     def to_tensor(X_raw):
         X_scaled = np.clip(scaler.transform(X_raw.astype(np.float32)), -FEATURE_CLIP, FEATURE_CLIP)
         return torch.tensor(X_scaled, dtype=torch.float32)
 
-    task_test_splits = {}
-    task_test_gids = {}  # t -> gid_test, so later checkpoints can identify which rows in
-                          # task_test_splits[t] are the poisoned ones (see task_poisoned_test_gids)
-    task_poisoned_test_gids = {}  # t -> that task's own poisoned_test_sample_ids, recorded once
-                                   # per task (immutable afterward) -- feeds perturbed_test_eval
-    results = []
-    warnings_log = []
-    boundary_panels = []  # accumulates plot_decision_boundary's return dict per captured
-                           # checkpoint, for the end-of-run summary grid (plot_decision_boundary_grid)
-    pca_mean = pca_components = pca_extent = None  # set once at task 0, below
+    if resume_checkpoint is not None:
+        # NEW (full-resume support): restore every carried-across-tasks piece
+        # of state a normal run would have accumulated through the end of
+        # task resume_task_id -- see madar_unlearning_cl_pipeline.py's
+        # identical block for the full rationale (ported here for parity,
+        # minus the forget/retain-only fields that don't exist in plain
+        # MADAR). classifier_wrapper wraps `model` BY REFERENCE (same
+        # pattern the t==0 branch below uses) so every later in-place
+        # update is automatically visible through it without reconstruction.
+        scaler = resume_checkpoint["scaler"]
+        model = ClassifierNN(feature_dim, 2).to(DEVICE)
+        model.load_state_dict(resume_checkpoint["model_state_dict"])
+        classifier_wrapper = TorchIDSWrapper(model, scaler, DEVICE)
+        teacher_model = copy.deepcopy(model)
+        teacher_model.eval()
+        omega = resume_checkpoint["omega"]
+        p_old_task = resume_checkpoint["p_old_task"]
+        W = {k: torch.zeros_like(v) for k, v in omega.items()}  # always reset per-task anyway
+
+        replay_buffer.clear()
+        replay_buffer.extend(resume_checkpoint["replay_buffer"])
+        bank.protos = resume_checkpoint["bank_protos"]
+        bank.counts = resume_checkpoint["bank_counts"]
+        bank.episode_embs = resume_checkpoint["bank_episode_embs"]
+        bank.task_order = resume_checkpoint["bank_task_order"]
+
+        task_test_splits = resume_checkpoint["task_test_splits"]
+        task_test_gids = resume_checkpoint["task_test_gids"]
+        task_poisoned_test_gids = resume_checkpoint["task_poisoned_test_gids"]
+        results = resume_checkpoint["results"]
+        warnings_log = resume_checkpoint["warnings_log"]
+        boundary_panels = resume_checkpoint["boundary_panels"]
+
+        # Global PCA basis (see the t==0 branch below for why this depends
+        # on `scaler`) -- recomputed identically here since it's a pure
+        # function of tasks + the (now-restored) scaler, not of training
+        # state, so there's nothing to gain from trying to persist it.
+        pca_mean, pca_components, pca_extent = _compute_global_pca_basis(tasks, to_tensor)
+    else:
+        scaler = None
+        model = None
+        classifier_wrapper = None
+        teacher_model = None
+        W = omega = p_old_task = None
+
+        task_test_splits = {}
+        task_test_gids = {}  # t -> gid_test, so later checkpoints can identify which rows in
+                              # task_test_splits[t] are the poisoned ones (see task_poisoned_test_gids)
+        task_poisoned_test_gids = {}  # t -> that task's own poisoned_test_sample_ids, recorded once
+                                       # per task (immutable afterward) -- feeds perturbed_test_eval
+        results = []
+        warnings_log = []
+        boundary_panels = []  # accumulates plot_decision_boundary's return dict per captured
+                               # checkpoint, for the end-of-run summary grid (plot_decision_boundary_grid)
+        pca_mean = pca_components = pca_extent = None  # set once at task 0, below
 
     for t, task in enumerate(tasks):
+        # NEW (full-resume support): everything through resume_task_id was
+        # already processed by the run that produced resume_checkpoint --
+        # its effects are already restored above, so just skip straight to
+        # the next task.
+        if resume_checkpoint is not None and t <= resume_task_id:
+            continue
         X = np.clip(task["features"].astype(np.float32), 0.0, 1.0)  # data is documented [0,1]-scaled already
         y = task["labels"].astype(np.int64)
         gid = task_offsets[t] + np.arange(len(y), dtype=np.int64)  # this task's pool-local id -> global id
@@ -2173,22 +2277,12 @@ def main():
             omega = {n.replace('.', '__'): torch.zeros_like(p).to(DEVICE) for n, p in model.named_parameters() if p.requires_grad}
 
             # GLOBAL (run-wide) PCA basis for plot_decision_boundary -- fit
-            # ONCE, here, on ALL tasks' scaled features (already fully
-            # loaded in `tasks`), reused unchanged for every subsequent
-            # task/checkpoint's boundary plot for the rest of the run.
-            all_X_scaled = to_tensor(
-                np.concatenate([np.clip(tk["features"].astype(np.float32), 0.0, 1.0) for tk in tasks], axis=0)
-            ).numpy()
-            pca_mean = all_X_scaled.mean(axis=0)
-            _, _, pca_Vt = np.linalg.svd(all_X_scaled - pca_mean, full_matrices=False)
-            pca_components = pca_Vt[:2]
-            Z_all = (all_X_scaled - pca_mean) @ pca_components.T
-            pca_pad = 0.5
-            pca_extent = (
-                float(Z_all[:, 0].min() - pca_pad), float(Z_all[:, 0].max() + pca_pad),
-                float(Z_all[:, 1].min() - pca_pad), float(Z_all[:, 1].max() + pca_pad),
-            )
-            del all_X_scaled, Z_all
+            # ONCE, here, reused unchanged for every task/checkpoint's
+            # boundary plot for the rest of the run. Factored into
+            # _compute_global_pca_basis so a resumed run (see --resume_from
+            # above) can recompute the identical basis from its restored
+            # scaler without duplicating this code.
+            pca_mean, pca_components, pca_extent = _compute_global_pca_basis(tasks, to_tensor)
 
         Xtr = to_tensor(X_train_for_classifier)
         ytr = torch.tensor(y_train, dtype=torch.long)
@@ -2722,15 +2816,34 @@ def main():
             "replay_buffer_composition": buffer_summary,
         })
 
-        # NEW: end-of-task classifier checkpoint -- OVERWRITES the previous
-        # task's file each time, so classifier_checkpoint_path always holds
-        # only the just-finished task's classifier. See
-        # madar_unlearning_cl_pipeline.py's identical addition for rationale.
+        # NEW: end-of-task checkpoint -- OVERWRITES the previous task's file
+        # each time, so classifier_checkpoint_path always holds only the
+        # just-finished task's state. Carries everything main()'s
+        # --resume_from path restores (see that block's comment for why
+        # each field is needed) -- not just the classifier -- so a later
+        # run can pick up at task t+1 as if this process had kept going.
+        # See madar_unlearning_cl_pipeline.py's identical checkpoint for
+        # the full rationale (ported here for parity, minus the
+        # forget/retain-only fields that don't exist in plain MADAR).
         torch.save({
             "task_id": t,
+            "seed": args.seed,
             "model_state_dict": model.state_dict(),
             "scaler": scaler,
             "feature_dim": feature_dim,
+            "omega": omega,
+            "p_old_task": p_old_task,
+            "replay_buffer": list(replay_buffer),
+            "bank_protos": bank.protos,
+            "bank_counts": bank.counts,
+            "bank_episode_embs": bank.episode_embs,
+            "bank_task_order": bank.task_order,
+            "task_test_splits": task_test_splits,
+            "task_test_gids": task_test_gids,
+            "task_poisoned_test_gids": task_poisoned_test_gids,
+            "results": results,
+            "warnings_log": warnings_log,
+            "boundary_panels": boundary_panels,
         }, classifier_checkpoint_path)
 
     config = {
@@ -2750,6 +2863,7 @@ def main():
         "red_epsilon": RED_EPSILON, "red_max_steps": RED_MAX_STEPS,
         "red_c1_mismatch_patience": RED_C1_MISMATCH_PATIENCE,
         "classifier_checkpoint_path": classifier_checkpoint_path,
+        "resumed_from": args.resume_from, "resumed_from_task_id": resume_task_id,
         "red_timesteps_per_task": RED_TIMESTEPS_PER_TASK, "alpha_contrast": ALPHA_CONTRAST,
         "contrastive_ema": CONTRASTIVE_EMA, "contrastive_recency_decay": CONTRASTIVE_RECENCY_DECAY,
         "max_eval_samples_per_task": MAX_EVAL_SAMPLES_PER_TASK, "feature_dim": feature_dim,
