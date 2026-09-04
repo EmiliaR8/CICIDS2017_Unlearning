@@ -3803,6 +3803,17 @@ def main():
                         "pooled_accuracy": post_unlearn_pooled_eval["accuracy"],
                         "mean_accuracy": post_unlearn_mean_per_task_bal_acc,
                     }
+                    # NEW: POST-unlearning counterpart of the "[Task {t} classifier,
+                    # PRE-unlearning]" line above -- same three numbers
+                    # (this-task/pooled/mean-per-task balanced accuracy), now off
+                    # post_unlearn_this_task_eval/post_unlearn_pooled_eval/
+                    # post_unlearn_mean_per_task_bal_acc instead, so both are
+                    # directly diffable line-for-line in the console log without
+                    # needing to go dig them out of results.json.
+                    print(f"[Task {t} classifier, POST-unlearning] "
+                          f"this-task bal_acc={post_unlearn_this_task_eval['balanced_accuracy']:.4f} "
+                          f"pooled bal_acc={post_unlearn_pooled_eval['balanced_accuracy']:.4f} "
+                          f"mean-per-task bal_acc={post_unlearn_mean_per_task_bal_acc:.4f}")
 
                     # POST-unlearn perturbed_test_eval (REWORK, pocket-targeted test
                     # poisoning follow-up): same rows/mask logic as perturbed_test_eval
