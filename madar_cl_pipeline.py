@@ -269,6 +269,11 @@ RED_TARGET_MARGIN_CONFIDENCE = 0.55  # REWORK (margin-minimizing evasion): passe
                                       # perturbation_classifier (an explicitly boundary-adjacent
                                       # detector). Set to None to restore the original
                                       # confidence-maximizing reward for both agents.
+RED_TARGET_MARGIN_HIGH = 0.65  # See madar_unlearning_cl_pipeline.py's identical constant --
+                                # upper end of the test-side target confidence band
+                                # [RED_TARGET_MARGIN_CONFIDENCE, RED_TARGET_MARGIN_HIGH]
+                                # pgd_boundary_search_batch keeps stepping toward past the
+                                # first boundary crossing.
 
 RED_TRAIN_TARGET_MARGIN_CONFIDENCE = 0.65  # REWORK (uncertainty-margin pipeline): passed to
                                       # BOTH train_pert_agent and train_benign_pert_agent
@@ -288,40 +293,11 @@ RED_TRAIN_TARGET_MARGIN_CONFIDENCE = 0.65  # REWORK (uncertainty-margin pipeline
                                       # changes. Identical constant/value to
                                       # madar_unlearning_cl_pipeline.py's.
 
-POCKET_SHIFT_WEIGHT = 5.0  # REWORK (pocket-targeted test poisoning): weight on
-                            # NetworkAttackEnv's pocket_term (see its docstring) for
-                            # red_test_pert_agent/red_test_benign_pert_agent ONLY --
-                            # train-side agents are unchanged, since they're what
-                            # SHIFTS the boundary in the first place (there's no
-                            # "before" snapshot to compare against for them; using
-                            # one would be circular). Same 5x scale as
-                            # confidence_term so neither term structurally dominates
-                            # by construction. Identical constant/value to
-                            # madar_unlearning_cl_pipeline.py's, so both pipelines
-                            # face the same attack -- see that file's module
-                            # docstring UPDATE 7 for the full rationale. Set to
-                            # None/0 to disable (falls back to whatever
-                            # target_margin_confidence alone produces).
-
-PROXIMITY_SHAPING_ENABLED = False  # REWORK (uncertainty-margin pipeline): master toggle for
-                         # the proximity-anchored reward term below -- OFF by default. The new
-                         # test-side objective (C1-correct/C2-wrong joint condition over the
-                         # uncertainty-tiered aggregated pool) doesn't depend on this at all;
-                         # it's kept only as an OPTIONAL, opt-in extra shaping term for future
-                         # experiments, never applied automatically. When False, PROXIMITY_WEIGHT
-                         # is forced to None at every call site below regardless of its own value,
-                         # so flipping this one flag is enough to fully disable it.
-PROXIMITY_WEIGHT = 3.0  # REWORK (proximity-anchored pocket targeting): weight on
-                         # NetworkAttackEnv's proximity_term (see its docstring) for
-                         # red_test_pert_agent/red_test_benign_pert_agent ONLY.
-                         # Identical constant/value to madar_unlearning_cl_pipeline.py's
-                         # (see that file's definition for the full rationale), so both
-                         # pipelines face the same attack -- plain MADAR has no
-                         # unlearning step to anchor toward, but the test-side agent
-                         # construction stays identical between the two files either
-                         # way. Set to None/0 to disable.
-PROXIMITY_LENGTH_SCALE = 5.0  # See madar_unlearning_cl_pipeline.py's definition.
-PROXIMITY_ANCHOR_MAX = 200  # See madar_unlearning_cl_pipeline.py's definition.
+# REWORK (gradient-attack branch): POCKET_SHIFT_WEIGHT/PROXIMITY_SHAPING_ENABLED/
+# PROXIMITY_WEIGHT/PROXIMITY_LENGTH_SCALE/PROXIMITY_ANCHOR_MAX removed -- see
+# madar_unlearning_cl_pipeline.py's identical removal note for the full
+# rationale (no reward being optimized in a direct gradient search, so these
+# RL-reward-shaping terms had no analog to carry forward).
 
 # Caps evaluate_agent_on_batch's per-task episode count for runtime; None = every malicious sample.
 MAX_EVAL_SAMPLES_PER_TASK = 5000
@@ -619,6 +595,102 @@ def generate_train_variants(env, red_agent, X_pert, evaded_mask, gid_array, true
         "display_gids": display_gids,
         "n_variants_by_original": n_variants_by_original,
     }
+
+
+# NEW (gradient-attack branch): PGD nearest-boundary search, replacing the
+# SAC/NetworkAttackEnv rollout for TEST-SIDE agents only. See
+# madar_unlearning_cl_pipeline.py's identical function for the full
+# docstring/rationale -- ported unchanged.
+def pgd_boundary_search_batch(classifier_wrapper, X, y, benign_label, allowed_start_indices,
+                               shift_reference_classifier=None, epsilon=None, max_steps=None,
+                               margin_low=0.55, margin_high=0.65, device=None, max_test=None):
+    epsilon = RED_EPSILON if epsilon is None else epsilon
+    max_steps = RED_MAX_STEPS if max_steps is None else max_steps
+    device = DEVICE if device is None else device
+    margin_mid = (margin_low + margin_high) / 2.0
+
+    model, scaler = classifier_wrapper.model, classifier_wrapper.scaler
+    mean_t = torch.tensor(scaler.mean_, dtype=torch.float32, device=device)
+    scale_t = torch.tensor(scaler.scale_, dtype=torch.float32, device=device)
+    target_t = torch.tensor([benign_label], dtype=torch.long, device=device)
+
+    def _scaled(x_t):
+        return torch.clamp((x_t - mean_t) / scale_t, -FEATURE_CLIP, FEATURE_CLIP)
+
+    def _probs(x_np):
+        with torch.no_grad():
+            xt = torch.tensor(x_np, dtype=torch.float32, device=device)
+            return F.softmax(model(_scaled(xt).unsqueeze(0)), dim=1)[0].cpu().numpy()
+
+    indices = np.where(y != benign_label)[0]
+    if allowed_start_indices is not None:
+        indices = np.intersect1d(indices, np.asarray(allowed_start_indices))
+    if max_test is not None:
+        indices = indices[:max_test]
+
+    X_pert = X.copy()
+    evaded_mask = np.zeros(X.shape[0], dtype=bool)
+    rewards, pert_norms = [], []
+    evasion = 0
+    attacked = 0
+
+    model.eval()
+    for i in indices:
+        attacked += 1
+        x0 = X[i].astype(np.float32)
+        true_label = int(y[i])
+        x_cur = x0.copy()
+        success = False
+        final_confidence = 0.0
+
+        for _ in range(max_steps):
+            x_t = torch.tensor(x_cur, dtype=torch.float32, device=device, requires_grad=True)
+            logits = model(_scaled(x_t).unsqueeze(0))
+            loss = F.cross_entropy(logits, target_t)
+            model.zero_grad(set_to_none=True)
+            loss.backward()
+            grad = x_t.grad.detach().cpu().numpy()
+
+            grad_norm = np.linalg.norm(grad, ord=2)
+            if grad_norm < 1e-12:
+                break
+            step = -grad / grad_norm
+
+            delta = (x_cur + (epsilon / max_steps) * step) - x0
+            delta_norm = np.linalg.norm(delta, ord=2)
+            if delta_norm > epsilon:
+                delta = delta * (epsilon / delta_norm)
+            x_cur = np.clip(x0 + delta, 0.0, 1.0).astype(np.float32)
+
+            probs = _probs(x_cur)
+            predicted_label = int(np.argmax(probs))
+            confidence = float(probs[benign_label])
+            final_confidence = confidence
+
+            c1_correct = True
+            if shift_reference_classifier is not None:
+                ref_pred = shift_reference_classifier.predict(x_cur.reshape(1, -1))[0]
+                c1_correct = bool(ref_pred == true_label)
+                if not c1_correct:
+                    break
+
+            c2_evaded = bool(predicted_label == benign_label)
+            if c2_evaded and c1_correct:
+                success = True
+                if confidence >= margin_low:
+                    break
+
+        rewards.append(5 * (0.5 - abs(final_confidence - margin_mid)))
+        pert_norms.append(float(np.linalg.norm(x_cur - x0, ord=2)))
+
+        if success:
+            evasion += 1
+            X_pert[i] = x_cur
+            evaded_mask[i] = True
+
+    evasion_rate = evasion / max(attacked, 1)
+    avg_pert_norm = float(np.mean(pert_norms)) if pert_norms else 0.0
+    return X_pert, evasion_rate, rewards, avg_pert_norm, attacked, evaded_mask
 
 
 RED_AGENT_SEED_OFFSETS = {"train": 0, "test": 100_000, "train_benign": 200_000, "test_benign": 300_000}
@@ -2078,11 +2150,14 @@ def main():
             # HERE, after this task's CL training has finished, so
             # red_test_pert_agent/red_test_benign_pert_agent can be scored
             # against the POST-training classifier while comparing to
-            # pre_train_classifier_wrapper (captured above). See
-            # NetworkAttackEnv's pocket_term and POCKET_SHIFT_WEIGHT's
-            # definitions for the mechanism. Only runs when this task actually
-            # had train-side agents/poisoning above (mirrors the nesting this
-            # code used to live inside, before the reorder).
+            # pre_train_classifier_wrapper (captured above) -- now
+            # pgd_boundary_search_batch's shift_reference_classifier, re-checked
+            # every PGD step (REWORK, gradient-attack branch: the dense
+            # POCKET_SHIFT_WEIGHT reward bonus this used to also drive is gone,
+            # only the hard joint success condition remains -- see that
+            # function's definition). Only runs when this task actually had
+            # train-side agents/poisoning above (mirrors the nesting this code
+            # used to live inside, before the reorder).
             if len(mal_idx_train) > 0:
                 # REWORK (recycled-pocket test pool): fetched once here (not
                 # inside the malicious/benign sub-blocks) so both classes see it
@@ -2145,30 +2220,18 @@ def main():
                             f"skipping red_test_pert_agent."
                         )
                     else:
-                        # REWORK (proximity-anchored pocket targeting): this task's
-                        # own TRAIN-side poisoned malicious exemplars, subsampled to
-                        # PROXIMITY_ANCHOR_MAX. See PROXIMITY_WEIGHT's definition.
-                        mal_anchor_X = X_train_pert[poison_idx]
-                        if len(mal_anchor_X) > PROXIMITY_ANCHOR_MAX:
-                            anchor_rng = np.random.RandomState(args.seed + t + 50_000)
-                            anchor_sel = anchor_rng.choice(len(mal_anchor_X), size=PROXIMITY_ANCHOR_MAX, replace=False)
-                            mal_anchor_X = mal_anchor_X[anchor_sel]
-
-                        env_test, agent_test = train_red_agent_for_task(
-                            t, "test", classifier_wrapper, X_test_ext, y_test_ext, benign_label, bank, args.seed, out_dir,
-                            target_margin_confidence=RED_TARGET_MARGIN_CONFIDENCE,
-                            shift_reference_classifier=pre_train_classifier_wrapper,
-                            pocket_shift_weight=POCKET_SHIFT_WEIGHT,
-                            proximity_anchor_X=mal_anchor_X,
-                            proximity_weight=PROXIMITY_WEIGHT if PROXIMITY_SHAPING_ENABLED else None,
-                            proximity_length_scale=PROXIMITY_LENGTH_SCALE,
-                            allowed_start_indices=attack_pool_mal_test,
-                        )
+                        # NEW (gradient-attack branch): test-side malicious agent is
+                        # now pgd_boundary_search_batch -- see its definition
+                        # (madar_unlearning_cl_pipeline.py has the full rationale) for
+                        # why the RL rollout/reward-shaping machinery above is gone.
                         X_test_ext_pert, test_evasion_rate, test_rewards, test_avg_norm, test_attacked, evaded_mask_test = \
-                            evaluate_agent_on_batch(
-                                env_test, agent_test, X_test_ext, y_test_ext, benign_label,
-                                only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                            pgd_boundary_search_batch(
+                                classifier_wrapper, X_test_ext, y_test_ext, benign_label,
                                 allowed_start_indices=attack_pool_mal_test,
+                                shift_reference_classifier=pre_train_classifier_wrapper,
+                                epsilon=RED_EPSILON, max_steps=RED_MAX_STEPS,
+                                margin_low=RED_TARGET_MARGIN_CONFIDENCE, margin_high=RED_TARGET_MARGIN_HIGH,
+                                max_test=MAX_EVAL_SAMPLES_PER_TASK,
                             )
                         red_report["test_evasion_rate"] = test_evasion_rate
                         red_report["test_attacked"] = test_attacked
@@ -2271,31 +2334,16 @@ def main():
                             f"skipping red_test_benign_pert_agent."
                         )
                     else:
-                        # REWORK (proximity-anchored pocket targeting): mirror of
-                        # mal_anchor_X above, on the benign side.
-                        benign_anchor_X = X_train_pert_benign[poison_idx_benign]
-                        if len(benign_anchor_X) > PROXIMITY_ANCHOR_MAX:
-                            anchor_rng_benign = np.random.RandomState(args.seed + t + 60_000)
-                            anchor_sel_benign = anchor_rng_benign.choice(
-                                len(benign_anchor_X), size=PROXIMITY_ANCHOR_MAX, replace=False
-                            )
-                            benign_anchor_X = benign_anchor_X[anchor_sel_benign]
-
-                        env_test_benign, agent_test_benign = train_red_agent_for_task(
-                            t, "test_benign", classifier_wrapper, X_test_ext_benign, y_test_ext_benign, mal_label,
-                            bank, args.seed, out_dir,
-                            shift_reference_classifier=pre_train_classifier_wrapper,
-                            pocket_shift_weight=POCKET_SHIFT_WEIGHT,
-                            proximity_anchor_X=benign_anchor_X,
-                            proximity_weight=PROXIMITY_WEIGHT if PROXIMITY_SHAPING_ENABLED else None,
-                            proximity_length_scale=PROXIMITY_LENGTH_SCALE,
-                            allowed_start_indices=attack_pool_ben_test,
-                        )
+                        # NEW (gradient-attack branch): mirror of the malicious
+                        # test-side block above.
                         (X_test_ext_pert_benign, test_evasion_rate_benign, test_rewards_benign, test_avg_norm_benign,
-                         test_attacked_benign, evaded_mask_test_benign) = evaluate_agent_on_batch(
-                            env_test_benign, agent_test_benign, X_test_ext_benign, y_test_ext_benign, mal_label,
-                            only_malicious=True, deterministic=True, max_test=MAX_EVAL_SAMPLES_PER_TASK,
+                         test_attacked_benign, evaded_mask_test_benign) = pgd_boundary_search_batch(
+                            classifier_wrapper, X_test_ext_benign, y_test_ext_benign, mal_label,
                             allowed_start_indices=attack_pool_ben_test,
+                            shift_reference_classifier=pre_train_classifier_wrapper,
+                            epsilon=RED_EPSILON, max_steps=RED_MAX_STEPS,
+                            margin_low=RED_TARGET_MARGIN_CONFIDENCE, margin_high=RED_TARGET_MARGIN_HIGH,
+                            max_test=MAX_EVAL_SAMPLES_PER_TASK,
                         )
                         red_report["test_benign_evasion_rate"] = test_evasion_rate_benign
                         red_report["test_benign_attacked"] = test_attacked_benign
@@ -2533,7 +2581,9 @@ def main():
         "variant_steps_per_level": VARIANT_STEPS_PER_LEVEL,
         "max_variants_per_sample": MAX_VARIANTS_PER_SAMPLE,
         "red_train_target_margin_confidence": RED_TRAIN_TARGET_MARGIN_CONFIDENCE,
-        "proximity_shaping_enabled": PROXIMITY_SHAPING_ENABLED,
+        "red_target_margin_confidence": RED_TARGET_MARGIN_CONFIDENCE,
+        "red_target_margin_high": RED_TARGET_MARGIN_HIGH,
+        "test_side_attack_method": "pgd_boundary_search",
         "poison_test_data": POISON_TEST_DATA,
         "red_epsilon": RED_EPSILON, "red_max_steps": RED_MAX_STEPS,
         "red_timesteps_per_task": RED_TIMESTEPS_PER_TASK, "alpha_contrast": ALPHA_CONTRAST,
