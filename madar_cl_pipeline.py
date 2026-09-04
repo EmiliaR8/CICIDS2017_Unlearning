@@ -554,6 +554,11 @@ def generate_train_variants(env, red_agent, X_pert, evaded_mask, gid_array, true
                              deterministic=True):
     """See madar_unlearning_cl_pipeline.py's identical function for the full
     docstring -- ported unchanged."""
+    # BUGFIX: see madar_unlearning_cl_pipeline.py's identical fix for the full
+    # rationale -- env is Monitor-wrapped; unwrap so env.step() below bypasses
+    # Monitor's needs_reset bookkeeping entirely.
+    env = getattr(env, "unwrapped", env)
+
     feat_dim = X_pert.shape[1]
     variant_rows, internal_gids, display_gids = [], [], []
     n_variants_by_original = {}

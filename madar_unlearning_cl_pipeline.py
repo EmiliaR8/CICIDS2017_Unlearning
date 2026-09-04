@@ -860,6 +860,17 @@ def generate_train_variants(env, red_agent, X_pert, evaded_mask, gid_array, true
     strings, same order), n_variants_by_original (dict original_gid -> how
     many variants it produced, for logging/parity-tracking).
     """
+    # BUGFIX: `env` as passed in from main() is train_red_agent_for_task's
+    # make_vec_env(...).envs[0] -- a Monitor-wrapped NetworkAttackEnv, not the
+    # raw env. Monitor tracks its own "needs_reset" flag and raises
+    # RuntimeError on any step() call after an episode ended without an
+    # intervening reset() -- exactly what evaluate_agent_on_batch's last
+    # episode already triggered before this function ever runs. Unwrap once
+    # here so every env.state=.../env.step() call below operates on the raw
+    # NetworkAttackEnv directly, bypassing Monitor's bookkeeping entirely
+    # (NetworkAttackEnv.step() itself has no such restriction).
+    env = getattr(env, "unwrapped", env)
+
     feat_dim = X_pert.shape[1]
     variant_rows, internal_gids, display_gids = [], [], []
     n_variants_by_original = {}
