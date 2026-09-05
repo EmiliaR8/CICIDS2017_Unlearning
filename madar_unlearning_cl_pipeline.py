@@ -603,19 +603,35 @@ UNLEARN_SI_C = 0.1  # SI penalty weight during UNLEARNING ONLY -- deliberately
                      # loss-component diagnostics logged in unlearn_teacher_guided's
                      # return value for the data to tune it against.
 
-FULL_RETRAIN_DIAGNOSTIC_TASKS = {8, 9}  # DIAGNOSTIC (retrain-vs-unlearn comparison): at
-                                          # exactly these task ids, skip unlearn_teacher_
-                                          # guided entirely and instead fully retrain a
-                                          # fresh classifier on ONLY the retain set (see
-                                          # retrain_classifier_from_scratch) -- the "exact
-                                          # unlearning" gold standard, for comparison
-                                          # against the approximate SI/KD-anchored method
-                                          # used every other task.
+DIAGNOSTIC_TASKS = {8, 9}  # DIAGNOSTIC (retrain-vs-unlearn comparison): at exactly these
+                            # task ids, --diagnostic_method (default "unlearn" == no
+                            # change) can swap unlearn_teacher_guided out for one of three
+                            # standalone ablations to compare against the approximate
+                            # SI/KD-anchored method used every other task:
+                            #   "full_retrain"   -- retrain_classifier_from_scratch: a
+                            #                       FRESH classifier trained on ONLY
+                            #                       retain+replay ("exact unlearning").
+                            #   "flip_label"      -- finetune_flip_label: CONTINUE the
+                            #                       current (checkpoint-resumed) model,
+                            #                       training retain+forget+replay all
+                            #                       under their true label (ytr is
+                            #                       always the true label already).
+                            #   "uncertain_half"  -- finetune_uncertain_half: CONTINUE the
+                            #                       current model, training retain+replay
+                            #                       under their true label while pushing
+                            #                       forget-set predictions toward a
+                            #                       uniform [0.5, 0.5] target instead.
+                            # All three are deliberately "pure" ablations -- no SI penalty,
+                            # no KD/teacher distillation -- per explicit confirmation, so
+                            # they're on equal footing with each other for comparison.
 RETRAIN_FULL_EPOCHS = TASK0_EPOCHS  # same budget as the very first from-scratch training
-                                     # at task 0, since this is the same kind of
-                                     # from-scratch supervised fit, just on the retain
-                                     # set instead of task 0's full training split.
-RETRAIN_FULL_LR = 1e-3  # matches task 0's pretraining optimizer's lr.
+                                     # at task 0, since full_retrain is the same kind of
+                                     # from-scratch supervised fit, just on retain+replay
+                                     # instead of task 0's full training split. Reused as
+                                     # the epoch budget for flip_label/uncertain_half too,
+                                     # for a fair comparison across all three methods.
+RETRAIN_FULL_LR = 1e-3  # matches task 0's pretraining optimizer's lr. Reused for
+                         # flip_label/uncertain_half too, same rationale.
 POISON_DETECTOR = "perturbation_classifier"  # logged into config/results for provenance --
                                               # REWORK, see module docstring: replaces the old
                                               # oracle-fraction forget set entirely.
@@ -2113,7 +2129,7 @@ def build_perturbation_classifier_forget_set(Xtr, ytr, poison_idx, poison_idx_be
 def retrain_classifier_from_scratch(feature_dim, retain_idx, forget_idx, Xtr, ytr, omega, device,
                                      replay_buffer=None, epochs=None, lr=None, batch_size=None):
     """
-    DIAGNOSTIC (retrain-vs-unlearn comparison, FULL_RETRAIN_DIAGNOSTIC_TASKS
+    DIAGNOSTIC (retrain-vs-unlearn comparison, DIAGNOSTIC_TASKS
     only): the "exact unlearning" gold standard -- a freshly-initialized
     classifier (fresh weights, fresh optimizer) trained on the retain set
     PLUS the current replay buffer, so it has structurally never seen the
@@ -2199,6 +2215,177 @@ def retrain_classifier_from_scratch(feature_dim, retain_idx, forget_idx, Xtr, yt
         "raw_si_loss_mean": 0.0,
     }
     return new_model, diag
+
+
+def finetune_flip_label(model, retain_idx, forget_idx, Xtr, ytr, replay_buffer, omega, device,
+                         epochs=None, lr=None, batch_size=None):
+    """
+    DIAGNOSTIC (retrain-vs-unlearn comparison, DIAGNOSTIC_TASKS only,
+    --diagnostic_method flip_label): CONTINUES fine-tuning the CURRENT
+    model IN PLACE (no fresh re-init, unlike retrain_classifier_from_
+    scratch -- this tactic restarts a run from an earlier checkpoint via
+    --resume_from but keeps that checkpoint's weights, then this task's own
+    CL adaptation already ran normally before this function is called) on
+    the union of retain set + forget set + replay buffer, all under their
+    TRUE label. ytr is always the true (pre-perturbation) label, even for
+    forget-set rows -- see the module docstring -- so "flipping the label
+    to the correct one" just means training the forget set as ordinary
+    supervised data instead of excluding or specially treating it, i.e.
+    what unlearn_teacher_guided's own corrective forget_loss already does
+    for its forget batch, but here as the ONLY objective (no retain/forget
+    split, no KD, no SI) -- a "pure" ablation, matching retrain_classifier_
+    from_scratch's simplicity, per explicit confirmation.
+
+    Mutates `model` directly (matching unlearn_teacher_guided's calling
+    convention) and returns a diag dict shaped like the other two methods'
+    (omega_l2_norm/n_steps/n_replay/raw_forget_loss_mean/raw_retain_loss_
+    mean/raw_si_loss_mean) so the existing "[Unlearn diag]" print line and
+    unlearning_metrics plumbing need no special-casing.
+    """
+    epochs = RETRAIN_FULL_EPOCHS if epochs is None else epochs
+    lr = RETRAIN_FULL_LR if lr is None else lr
+    batch_size = BATCH_SIZE if batch_size is None else batch_size
+
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    idx_t = torch.tensor(np.concatenate([retain_idx, forget_idx]), dtype=torch.long)
+    train_X = [Xtr[idx_t]]
+    train_y = [ytr[idx_t]]
+    n_replay = 0
+    if replay_buffer:
+        train_X.append(torch.stack([entry[0] for entry in replay_buffer]))
+        train_y.append(torch.stack([entry[1] for entry in replay_buffer]))
+        n_replay = len(replay_buffer)
+    train_X = torch.cat(train_X, dim=0)
+    train_y = torch.cat(train_y, dim=0)
+
+    drop_last = (len(train_X) % batch_size == 1)
+    loader = data.DataLoader(
+        data.TensorDataset(train_X, train_y), batch_size=batch_size,
+        shuffle=True, drop_last=drop_last,
+    )
+
+    model.train()
+    raw_losses = []
+    for _ in range(epochs):
+        for v, l in loader:
+            v, l = v.to(device), l.to(device)
+            optimizer.zero_grad()
+            loss = F.cross_entropy(model(v), l)
+            if not torch.isfinite(loss):
+                raise RuntimeError("Non-finite loss during diagnostic flip-label fine-tune - training diverged")
+            loss.backward()
+            optimizer.step()
+            raw_losses.append(loss.item())
+
+    model.eval()
+    raw_forget_loss_mean = None
+    if len(forget_idx) > 0:
+        forget_idx_t = torch.tensor(forget_idx, dtype=torch.long)
+        with torch.no_grad():
+            f_v, f_l = Xtr[forget_idx_t].to(device), ytr[forget_idx_t].to(device)
+            raw_forget_loss_mean = float(F.cross_entropy(model(f_v), f_l).item())
+
+    omega_l2_norm = float(torch.sqrt(sum((v ** 2).sum() for v in omega.values())).item())
+    return {
+        "method": "flip_label_finetune",
+        "omega_l2_norm": omega_l2_norm,
+        "n_steps": len(raw_losses),
+        "n_replay": n_replay,
+        "raw_forget_loss_mean": raw_forget_loss_mean,
+        "raw_retain_loss_mean": float(np.mean(raw_losses)) if raw_losses else None,
+        "raw_si_loss_mean": 0.0,
+    }
+
+
+def finetune_uncertain_half(model, retain_idx, forget_idx, Xtr, ytr, replay_buffer, omega, device,
+                             epochs=None, lr=None, batch_size=None):
+    """
+    DIAGNOSTIC (retrain-vs-unlearn comparison, DIAGNOSTIC_TASKS only,
+    --diagnostic_method uncertain_half): CONTINUES fine-tuning the CURRENT
+    model IN PLACE (same restart-from-checkpoint premise as flip_label
+    above) on retain set + replay buffer under their TRUE label (plain
+    cross-entropy), while forget-set samples are pushed toward MAXIMUM
+    UNCERTAINTY -- a uniform [0.5, 0.5] target distribution -- via
+    KL(uniform || model's softmax), instead of toward their true label.
+    This is the entropy-maximizing forget objective unlearn_teacher_
+    guided's docstring describes as its PRE-REWORK forget loss (see that
+    function's "KL-to-uniform" history comment) before it switched to
+    corrective cross-entropy -- reinstated here as a standalone diagnostic
+    tactic. Unweighted sum of the two losses, no SI penalty, no KD/teacher
+    distillation -- a "pure" ablation, matching retrain_classifier_from_
+    scratch's simplicity, per explicit confirmation.
+
+    Mutates `model` directly and returns a diag dict shaped like the other
+    two methods' (see finetune_flip_label's docstring for why).
+    """
+    epochs = RETRAIN_FULL_EPOCHS if epochs is None else epochs
+    lr = RETRAIN_FULL_LR if lr is None else lr
+    batch_size = BATCH_SIZE if batch_size is None else batch_size
+
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    retain_idx_t = torch.tensor(retain_idx, dtype=torch.long)
+    retain_X = [Xtr[retain_idx_t]]
+    retain_y = [ytr[retain_idx_t]]
+    n_replay = 0
+    if replay_buffer:
+        retain_X.append(torch.stack([entry[0] for entry in replay_buffer]))
+        retain_y.append(torch.stack([entry[1] for entry in replay_buffer]))
+        n_replay = len(replay_buffer)
+    retain_X = torch.cat(retain_X, dim=0)
+    retain_y = torch.cat(retain_y, dim=0)
+    drop_last_r = (len(retain_X) % batch_size == 1)
+    retain_loader = data.DataLoader(
+        data.TensorDataset(retain_X, retain_y), batch_size=batch_size,
+        shuffle=True, drop_last=drop_last_r,
+    )
+
+    has_forget = len(forget_idx) > 0
+    if has_forget:
+        forget_idx_t = torch.tensor(forget_idx, dtype=torch.long)
+        forget_X = Xtr[forget_idx_t]
+        drop_last_f = (len(forget_X) % batch_size == 1)
+        forget_loader = data.DataLoader(
+            data.TensorDataset(forget_X), batch_size=batch_size, shuffle=True, drop_last=drop_last_f,
+        )
+        forget_iter = iter(cycle(forget_loader))
+
+    model.train()
+    raw_retain_losses, raw_forget_losses = [], []
+    for _ in range(epochs):
+        for v, l in retain_loader:
+            v, l = v.to(device), l.to(device)
+            optimizer.zero_grad()
+            retain_loss = F.cross_entropy(model(v), l)
+
+            forget_loss = torch.tensor(0.0, device=device)
+            if has_forget:
+                (f_v,) = next(forget_iter)
+                f_v = f_v.to(device)
+                log_probs = F.log_softmax(model(f_v), dim=1)
+                uniform = torch.full_like(log_probs, 1.0 / log_probs.shape[1])
+                forget_loss = F.kl_div(log_probs, uniform, reduction="batchmean")
+
+            total_loss = retain_loss + forget_loss
+            if not torch.isfinite(total_loss):
+                raise RuntimeError("Non-finite loss during diagnostic uncertain-0.5 fine-tune - training diverged")
+            total_loss.backward()
+            optimizer.step()
+            raw_retain_losses.append(retain_loss.item())
+            if has_forget:
+                raw_forget_losses.append(forget_loss.item())
+
+    model.eval()
+    omega_l2_norm = float(torch.sqrt(sum((v ** 2).sum() for v in omega.values())).item())
+    return {
+        "method": "uncertain_half_finetune",
+        "omega_l2_norm": omega_l2_norm,
+        "n_steps": len(raw_retain_losses),
+        "n_replay": n_replay,
+        "raw_forget_loss_mean": float(np.mean(raw_forget_losses)) if raw_forget_losses else None,
+        "raw_retain_loss_mean": float(np.mean(raw_retain_losses)) if raw_retain_losses else None,
+        "raw_si_loss_mean": 0.0,
+    }
 
 
 def unlearn_teacher_guided(model, teacher_model, forget_loader, retain_loader, omega, p_old_task,
@@ -2853,11 +3040,20 @@ def main():
     # prototypes, the cross-task historical clean-sample pools, every prior
     # task's test split/results entry -- so the resumed tasks run exactly as
     # if the earlier tasks had just finished in THIS process. Primarily for
-    # the FULL_RETRAIN_DIAGNOSTIC_TASKS comparison (tasks 8/9): re-run just
-    # those two tasks from a task-7 checkpoint instead of the whole run.
+    # the DIAGNOSTIC_TASKS comparison (tasks 8/9): re-run just those two
+    # tasks from a task-7 checkpoint instead of the whole run.
     ap.add_argument("--resume_from", type=str, default=None,
                      help="Path to a classifier_checkpoint.pt from a prior run; resumes "
                           "right after that checkpoint's task_id.")
+    # NEW: which unlearning tactic to use at DIAGNOSTIC_TASKS (default
+    # "unlearn" = no change, unlearn_teacher_guided runs at every task
+    # exactly as before). One method per run -- to compare all four,
+    # invoke the script once per method (each with --resume_from the same
+    # task-7 checkpoint) and diff the resulting logs.
+    ap.add_argument("--diagnostic_method", type=str, default="unlearn",
+                     choices=["unlearn", "full_retrain", "flip_label", "uncertain_half"],
+                     help="Unlearning tactic to use at DIAGNOSTIC_TASKS instead of "
+                          "unlearn_teacher_guided. 'unlearn' (default) makes no change.")
     args = ap.parse_args()
 
     resume_checkpoint = None
@@ -4088,16 +4284,17 @@ def main():
                     model_pre_unlearn = copy.deepcopy(model)
 
                     # DIAGNOSTIC (retrain-vs-unlearn comparison): at exactly
-                    # FULL_RETRAIN_DIAGNOSTIC_TASKS, skip unlearn_teacher_
-                    # guided entirely and fully retrain a fresh classifier on
-                    # ONLY the retain set instead -- see
-                    # retrain_classifier_from_scratch's docstring. Every
-                    # other task's unlearning is completely unaffected.
-                    # model_pre_unlearn above was already snapshotted before
-                    # either branch touches `model`, so measure_unlearning_
-                    # efficacy/downstream "before/after" comparisons below
-                    # work identically regardless of which branch ran.
-                    if t in FULL_RETRAIN_DIAGNOSTIC_TASKS:
+                    # DIAGNOSTIC_TASKS, --diagnostic_method (default "unlearn"
+                    # == no change) can swap unlearn_teacher_guided out for
+                    # one of three standalone ablations -- see DIAGNOSTIC_
+                    # TASKS's own comment for what each one does. Every other
+                    # task's unlearning is completely unaffected regardless
+                    # of --diagnostic_method. model_pre_unlearn above was
+                    # already snapshotted before any branch touches `model`,
+                    # so measure_unlearning_efficacy/downstream "before/
+                    # after" comparisons below work identically no matter
+                    # which branch ran.
+                    if t in DIAGNOSTIC_TASKS and args.diagnostic_method == "full_retrain":
                         print(f"    [Unlearn] task {t}: DIAGNOSTIC full retrain on retain set + "
                               f"replay buffer (n_retain={len(retain_idx)}, n_replay={len(replay_buffer)}, "
                               f"forget set of {len(forget_idx)} samples discarded -- NOT trained on) "
@@ -4108,6 +4305,26 @@ def main():
                             epochs=RETRAIN_FULL_EPOCHS, lr=RETRAIN_FULL_LR, batch_size=BATCH_SIZE,
                         )
                         model.load_state_dict(retrained_model.state_dict())
+                        grad_steps += unlearn_diag["n_steps"]
+                    elif t in DIAGNOSTIC_TASKS and args.diagnostic_method == "flip_label":
+                        print(f"    [Unlearn] task {t}: DIAGNOSTIC flip-label fine-tune on retain+"
+                              f"forget+replay, all under their true label (n_retain={len(retain_idx)}, "
+                              f"n_forget={len(forget_idx)}, n_replay={len(replay_buffer)}) instead of "
+                              f"unlearn_teacher_guided...")
+                        unlearn_diag = finetune_flip_label(
+                            model, retain_idx, forget_idx, Xtr, ytr, replay_buffer, omega, DEVICE,
+                            epochs=RETRAIN_FULL_EPOCHS, lr=RETRAIN_FULL_LR, batch_size=BATCH_SIZE,
+                        )
+                        grad_steps += unlearn_diag["n_steps"]
+                    elif t in DIAGNOSTIC_TASKS and args.diagnostic_method == "uncertain_half":
+                        print(f"    [Unlearn] task {t}: DIAGNOSTIC uncertain-0.5 fine-tune -- retain+"
+                              f"replay under their true label, forget set pushed toward uniform "
+                              f"(n_retain={len(retain_idx)}, n_forget={len(forget_idx)}, "
+                              f"n_replay={len(replay_buffer)}) instead of unlearn_teacher_guided...")
+                        unlearn_diag = finetune_uncertain_half(
+                            model, retain_idx, forget_idx, Xtr, ytr, replay_buffer, omega, DEVICE,
+                            epochs=RETRAIN_FULL_EPOCHS, lr=RETRAIN_FULL_LR, batch_size=BATCH_SIZE,
+                        )
                         grad_steps += unlearn_diag["n_steps"]
                     else:
                         print(f"    [Unlearn] task {t} (alpha={UNLEARN_ALPHA}, si_c={UNLEARN_SI_C}, "
@@ -4516,7 +4733,7 @@ def main():
         "clean_replay_buffer_of_perturbed": CLEAN_REPLAY_BUFFER_OF_PERTURBED,
         "red_epsilon": RED_EPSILON, "red_max_steps": RED_MAX_STEPS,
         "red_c1_mismatch_patience": RED_C1_MISMATCH_PATIENCE,
-        "full_retrain_diagnostic_tasks": sorted(FULL_RETRAIN_DIAGNOSTIC_TASKS),
+        "diagnostic_tasks": sorted(DIAGNOSTIC_TASKS), "diagnostic_method": args.diagnostic_method,
         "retrain_full_epochs": RETRAIN_FULL_EPOCHS, "retrain_full_lr": RETRAIN_FULL_LR,
         "classifier_checkpoint_path": classifier_checkpoint_path,
         "resumed_from": args.resume_from, "resumed_from_task_id": resume_task_id,
