@@ -3054,6 +3054,19 @@ def main():
                      choices=["unlearn", "full_retrain", "flip_label", "uncertain_half"],
                      help="Unlearning tactic to use at DIAGNOSTIC_TASKS instead of "
                           "unlearn_teacher_guided. 'unlearn' (default) makes no change.")
+    # NEW (toggleable via terminal, default OFF): after _clean_buffer removes
+    # a task's forget-pool matches from a label's buffer slot, refill that
+    # slot back up to its MEM_SIZE//2 budget with the MOST CERTAIN (highest
+    # max-class-confidence under this task's current classifier) candidates
+    # from this task's own leftover clean rows + the historical_clean_*_pool
+    # cross-task pool -- see _refill_buffer's docstring. Only takes effect
+    # when CLEAN_REPLAY_BUFFER_OF_PERTURBED is also True (refill fills the
+    # gap cleaning leaves; with cleaning off there's no gap to fill).
+    ap.add_argument("--refill_buffer_after_clean", action="store_true",
+                     help="After cleaning a label's buffer slot of forget-pool matches, "
+                          "refill it back to budget with the most-certain available "
+                          "candidates. Default off (matches this pipeline's prior "
+                          "no-refill behavior).")
     args = ap.parse_args()
 
     resume_checkpoint = None
@@ -4509,13 +4522,12 @@ def main():
 
                 def _clean_buffer(label, forget_idx_for_label, category_tag):
                     """REWORK (uncertainty-margin pipeline): removes buffer entries
-                    matching this task's forget-pool gids for `label`. NO refill --
-                    POTENTIALLY REVISIT: refill (uncertainty-sampled from this
-                    task's own leftovers + the historical_clean_*_pool cross-task
-                    pools) was removed pending a possible future reimplementation.
-                    The buffer is intentionally left under budget for the rest of
-                    this run until a LATER task's own update_buffer_madar() call
-                    naturally tops it back up from that task's own full batch."""
+                    matching this task's forget-pool gids for `label`. No refill
+                    here -- the buffer is left under budget for the rest of this
+                    run until a LATER task's own update_buffer_madar() call
+                    naturally tops it back up, UNLESS --refill_buffer_after_clean
+                    is set, in which case _refill_buffer (below) runs right after
+                    this and fills the gap immediately instead of waiting."""
                     forget_gids = set(int(g) for g in gid_train[forget_idx_for_label])
                     before = len(label_buffers.get(label, []))
                     label_buffers[label] = [
@@ -4523,18 +4535,90 @@ def main():
                     ]
                     n_removed = before - len(label_buffers[label])
                     print(f"    [Buffer clean] label={category_tag}: removed {n_removed} forget-pool "
-                          f"matches (no refill -- POTENTIALLY REVISIT). Buffer size now "
-                          f"{len(label_buffers[label])}/{MEM_SIZE // 2}.")
+                          f"matches. Buffer size now {len(label_buffers[label])}/{MEM_SIZE // 2}.")
                     return {"n_removed": int(n_removed), "buffer_size_after": int(len(label_buffers[label]))}
+
+                def _refill_buffer(label, forget_gids, category_tag, historical_pool):
+                    """NEW (toggleable via --refill_buffer_after_clean, default off):
+                    refills `label`'s buffer slot back up to its MEM_SIZE//2 budget
+                    right after _clean_buffer emptied out some of it, with the MOST
+                    CERTAIN (highest max-class-confidence, under THIS task's
+                    just-updated model -- post-unlearning if it ran, matching
+                    update_buffer_madar's own convention of always reading the
+                    current model) candidates available. Candidate pool is the
+                    same one _clean_buffer's old docstring named as the (removed)
+                    original refill design's sources: this task's own leftover
+                    clean rows (same label, not in forget_gids) PLUS the cross-
+                    task historical_clean_mal_pool/historical_clean_benign_pool --
+                    just ranked most-certain-first here instead of uncertainty-
+                    first. historical_pool candidates are inherently safe to
+                    reuse (they're built from PAST tasks' non-forgotten rows,
+                    and this task's own rows aren't appended to it until AFTER
+                    this runs -- see the historical-pool growth step below), and
+                    this-task candidates are explicitly filtered against
+                    forget_gids, so nothing just-unlearned can sneak back in
+                    through either source. No-ops (returns n_added=0) if the
+                    slot's already at or above budget, or if no candidates exist."""
+                    budget = MEM_SIZE // 2
+                    current_size = len(label_buffers.get(label, []))
+                    needed = budget - current_size
+                    if needed <= 0:
+                        print(f"    [Buffer refill] label={category_tag}: already at budget "
+                              f"({current_size}/{budget}) -- nothing to refill.")
+                        return {"n_added": 0, "buffer_size_after": current_size}
+
+                    ytr_np = ytr.numpy()
+                    this_task_candidates = [
+                        (Xtr[i].clone(), ytr[i].clone(), category[i], int(gid_train[i]))
+                        for i in range(len(Xtr))
+                        if ytr_np[i] == label and int(gid_train[i]) not in forget_gids
+                    ]
+                    candidates = this_task_candidates + list(historical_pool)
+                    if not candidates:
+                        print(f"    [Buffer refill] label={category_tag}: no candidates available -- "
+                              f"buffer stays at {current_size}/{budget}.")
+                        return {"n_added": 0, "buffer_size_after": current_size}
+
+                    cand_X = torch.stack([c[0] for c in candidates]).to(DEVICE)
+                    model.eval()
+                    with torch.no_grad():
+                        confidence = F.softmax(model(cand_X), dim=1).max(dim=1).values.cpu().numpy()
+                    order = np.argsort(-confidence)  # descending: most certain first
+                    n_take = min(needed, len(candidates))
+
+                    for idx in order[:n_take]:
+                        label_buffers.setdefault(label, []).append(candidates[idx])
+
+                    mean_conf = float(confidence[order[:n_take]].mean())
+                    print(f"    [Buffer refill] label={category_tag}: added {n_take} most-certain "
+                          f"candidates (mean confidence {mean_conf:.3f}) from "
+                          f"{len(this_task_candidates)} this-task + {len(historical_pool)} historical "
+                          f"candidates. Buffer size now {len(label_buffers[label])}/{budget}.")
+                    return {
+                        "n_added": int(n_take),
+                        "buffer_size_after": int(len(label_buffers[label])),
+                        "mean_confidence": mean_conf,
+                        "n_candidates": int(len(candidates)),
+                    }
 
                 if len(pc_result["forget_idx_malicious"]) > 0:
                     buffer_refill_diag["malicious"] = _clean_buffer(
                         mal_label, pc_result["forget_idx_malicious"], "malicious"
                     )
+                    if args.refill_buffer_after_clean:
+                        forget_gids_mal = set(int(g) for g in gid_train[pc_result["forget_idx_malicious"]])
+                        buffer_refill_diag["malicious_refill"] = _refill_buffer(
+                            mal_label, forget_gids_mal, "malicious", historical_clean_mal_pool
+                        )
                 if len(pc_result["forget_idx_benign"]) > 0:
                     buffer_refill_diag["benign"] = _clean_buffer(
                         benign_label, pc_result["forget_idx_benign"], "benign"
                     )
+                    if args.refill_buffer_after_clean:
+                        forget_gids_ben = set(int(g) for g in gid_train[pc_result["forget_idx_benign"]])
+                        buffer_refill_diag["benign_refill"] = _refill_buffer(
+                            benign_label, forget_gids_ben, "benign", historical_clean_benign_pool
+                        )
 
                 replay_buffer.clear()
                 for buf in label_buffers.values():
@@ -4731,6 +4815,7 @@ def main():
         "poison_test_data": POISON_TEST_DATA,
         "perturbation_classifier_n": PERTURBATION_CLASSIFIER_N,
         "clean_replay_buffer_of_perturbed": CLEAN_REPLAY_BUFFER_OF_PERTURBED,
+        "refill_buffer_after_clean": args.refill_buffer_after_clean,
         "red_epsilon": RED_EPSILON, "red_max_steps": RED_MAX_STEPS,
         "red_c1_mismatch_patience": RED_C1_MISMATCH_PATIENCE,
         "diagnostic_tasks": sorted(DIAGNOSTIC_TASKS), "diagnostic_method": args.diagnostic_method,
