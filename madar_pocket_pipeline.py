@@ -742,34 +742,18 @@ def main():
             if len(poison_idx) else float("nan")
         )
 
-        # Step 5: ONE shared detector per task, trained from poisoned_baseline.
-        detected_poison_idx, detected_by_class, det_metrics = run_detector(
-            lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
-            benign_label, mal_label, args.detector_type, SEED,
-        )
-
-        # Step 6: each fix lineage adapts on poisoned data from ITS OWN prior
-        # weights first (this lineage's own "just got poisoned" state), then
-        # applies its own fix to the SAME shared detected_poison_idx.
-        for name in FIX_NAMES:
-            lineages[name].adapt(X_train_poisoned, y_train, replay_X=replay_X, replay_y=replay_y,
-                                  epochs=ADAPT_EPOCHS)
-        apply_dropped_rows(lineages["dropped_rows"], X_train_poisoned, y_train, detected_poison_idx,
-                            replay_X, replay_y)
-        apply_amnesiac(lineages["amnesiac"], X_train_poisoned, y_train, detected_poison_idx,
-                        replay_X, replay_y, benign_label, mal_label)
-        apply_opposite_class(lineages["opposite_class"], X_train_poisoned, y_train, detected_poison_idx,
-                              replay_X, replay_y, benign_label, mal_label)
-
-        # Step 7: craft this task's genuine-pocket test attack, ONCE, against
+        # Step 5: craft this task's genuine-pocket test attack, ONCE, against
         # poisoned_baseline (reference = clean) -- matches the notebook: the
         # same crafted points are then just re-scored under every lineage.
+        # Moved ahead of the fix lineages (below) so the same crafted test
+        # pool can be reused for BOTH the pre-unlearning and post-unlearning
+        # snapshots -- the test sets don't depend on which lineage scores them.
         eps_this_task = typical_class_gap(X_test_scaled, y_test, benign_label, mal_label) * ATTACK_EPS_MULTIPLIER
         X_test_adv, succ_pocket, norms_pocket = adversarial_attack_pocket(
             lineages["poisoned_baseline"], lineages["clean"], X_test_scaled, y_test, epsilon_max=eps_this_task,
         )
 
-        # Step 8: spillover check -- re-attack every PRIOR task's test set,
+        # Step 6: spillover check -- re-attack every PRIOR task's test set,
         # every task, same poisoned_baseline/clean reference pair.
         historical_adv = {}
         for s, (Xs_raw, ys) in task_test_splits.items():
@@ -781,8 +765,11 @@ def main():
             )
             historical_adv[s] = (Xs_adv, ys, succ_s, eps_s)
 
-        # Step 9: pooled/mean/per-class accuracy across all clean + adversarial
-        # test sets seen so far, for every lineage (clean included).
+        # Full clean + adversarial test-set pool for every task seen so far
+        # (0..t), built ONCE and reused below for the pre-unlearning snapshot,
+        # the final post-unlearning metrics, AND the per-source-task
+        # adversarial breakdown -- all three just re-score different lineage
+        # states against the same fixed set of test points.
         all_clean_sets = {s: (to_scaled(Xs_raw), ys) for s, (Xs_raw, ys) in task_test_splits.items()}
         all_clean_sets[t] = (X_test_scaled, y_test)
         all_test_sets_full = dict(all_clean_sets)
@@ -790,11 +777,47 @@ def main():
             all_test_sets_full[f"{s}_adversarial"] = (Xs_adv, ys)
         all_test_sets_full[f"{t}_adversarial"] = (X_test_adv, y_test)
 
-        pooled_results, mean_results, per_class_reports = {}, {}, {}
+        pocket_info_by_source = {s: (v[2], v[3]) for s, v in historical_adv.items()}
+        pocket_info_by_source[t] = (succ_pocket, eps_this_task)
+
+        # Step 7: ONE shared detector per task, trained from poisoned_baseline.
+        detected_poison_idx, detected_by_class, det_metrics = run_detector(
+            lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
+            benign_label, mal_label, args.detector_type, SEED,
+        )
+
+        # Step 8: each fix lineage adapts on poisoned data from ITS OWN prior
+        # weights first (this lineage's own "just got poisoned" state) --
+        # snapshot its task/pooled/mean accuracy HERE, before any fix, so the
+        # post-unlearning numbers below can be compared against a genuine
+        # "before" baseline -- then applies its own fix to the SAME shared
+        # detected_poison_idx.
+        pre_unlearn_metrics = {}
+        for name in FIX_NAMES:
+            lineages[name].adapt(X_train_poisoned, y_train, replay_X=replay_X, replay_y=replay_y,
+                                  epochs=ADAPT_EPOCHS)
+            pre_task_acc = lineages[name].score(X_test_scaled, y_test)
+            pre_pooled_acc, pre_mean_acc, _ = pooled_and_per_task_accuracy(lineages[name], all_test_sets_full)
+            pre_unlearn_metrics[name] = {
+                "task_acc": pre_task_acc, "pooled_acc": pre_pooled_acc, "mean_acc": pre_mean_acc,
+            }
+        apply_dropped_rows(lineages["dropped_rows"], X_train_poisoned, y_train, detected_poison_idx,
+                            replay_X, replay_y)
+        apply_amnesiac(lineages["amnesiac"], X_train_poisoned, y_train, detected_poison_idx,
+                        replay_X, replay_y, benign_label, mal_label)
+        apply_opposite_class(lineages["opposite_class"], X_train_poisoned, y_train, detected_poison_idx,
+                              replay_X, replay_y, benign_label, mal_label)
+
+        # Step 9: pooled/mean/per-class accuracy across all clean + adversarial
+        # test sets seen so far, for every lineage (clean included) -- and the
+        # per-source-task breakdown (per_task) needed for the adversarial
+        # breakdown section below.
+        pooled_results, mean_results, per_class_reports, per_task_by_lineage = {}, {}, {}, {}
         for name in LINEAGE_NAMES:
-            pooled_acc, mean_acc, _ = pooled_and_per_task_accuracy(lineages[name], all_test_sets_full)
+            pooled_acc, mean_acc, per_task = pooled_and_per_task_accuracy(lineages[name], all_test_sets_full)
             pooled_results[name] = pooled_acc
             mean_results[name] = mean_acc
+            per_task_by_lineage[name] = per_task
             per_class_reports[name] = _fmt_report(lineages[name], X_test_scaled, y_test)
 
         still_evades = {}
@@ -869,9 +892,20 @@ def main():
             f"detector training composition: {det_metrics['composition']}",
             f"replay buffer distribution (post-update, this task): {dist}",
             "",
-            f"{'lineage':<18} {'task acc':>10} {'pooled acc':>12} {'mean acc':>10} "
-            f"{'adv acc':>10} {'still-evades %':>16}",
+            "Pre-unlearning (poison-adapted, before any fix) accuracy:",
+            f"{'lineage':<18} {'task acc':>10} {'pooled acc':>12} {'mean acc':>10}",
         ]
+        for name in FIX_NAMES:
+            pre = pre_unlearn_metrics[name]
+            unlearn_lines.append(
+                f"{name:<18} {pre['task_acc']:>10.3f} {pre['pooled_acc']:>12.3f} {pre['mean_acc']:>10.3f}"
+            )
+        unlearn_lines.append("")
+        unlearn_lines.append("Post-unlearning accuracy:")
+        unlearn_lines.append(
+            f"{'lineage':<18} {'task acc':>10} {'pooled acc':>12} {'mean acc':>10} "
+            f"{'adv acc':>10} {'still-evades %':>16}"
+        )
         for name in FIX_NAMES:
             task_acc_name = lineages[name].score(X_test_scaled, y_test)
             adv_acc_name = lineages[name].score(X_test_adv, y_test)
@@ -885,11 +919,36 @@ def main():
             unlearn_lines.append(per_class_reports[name])
         unlearn_section = "\n".join(unlearn_lines)
 
+        breakdown_lines = [
+            "Genuine-pocket rate per source task's adv-test-set, attacked FRESH this task",
+            "(against THIS task's poisoned_baseline/clean -- not the rate recorded when",
+            "that set was first created at its own task):",
+            "",
+            f"{'source task':<12} {'n':>8} {'genuine pockets':>18} {'rate':>8} {'eps':>8}",
+        ]
+        for s in sorted(pocket_info_by_source.keys()):
+            succ_s, eps_s = pocket_info_by_source[s]
+            n_s = len(succ_s)
+            breakdown_lines.append(
+                f"{s:<12} {n_s:>8} {int(succ_s.sum()):>10}/{n_s:<7} {_fmt_pct(succ_s.mean()):>8} {eps_s:>8.4f}"
+            )
+        breakdown_lines.append("")
+        breakdown_lines.append(f"Task {t}'s (post-unlearning) classifier accuracy on each source task's adv-test-set:")
+        breakdown_lines.append(f"{'source task':<12} " + "".join(f"{name:>18}" for name in LINEAGE_NAMES))
+        for s in sorted(pocket_info_by_source.keys()):
+            row = f"{s:<12} "
+            for name in LINEAGE_NAMES:
+                acc_s, _n = per_task_by_lineage[name][f"{s}_adversarial"]
+                row += f"{acc_s:>18.3f}"
+            breakdown_lines.append(row)
+        breakdown_section = "\n".join(breakdown_lines)
+
         write_task_log(log_path, t, [
             ("Training Data information", train_section),
             ("Testing Data information", test_section),
             ("Adaptation step", adapt_section),
             ("Unlearning step", unlearn_section),
+            ("Adversarial test-set breakdown (per source task)", breakdown_section),
         ])
 
         spillover_summary = {s: float(v[2].mean()) for s, v in historical_adv.items()}
