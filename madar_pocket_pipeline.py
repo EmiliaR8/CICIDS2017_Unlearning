@@ -623,8 +623,16 @@ def main():
 
     scaler = None
     lineages = {}
-    label_buffers = {}
-    replay_buffer = []
+    # TWO separate replay buffers: `baseline_*` feeds ONLY poisoned_baseline
+    # and is NEVER cleaned -- it admits every row poisoned_baseline actually
+    # trained on this task, perturbed ones included, since it's the "no fix"
+    # lineage. `joint_*` feeds clean + the 3 unlearning variants and stays
+    # detector-clean-only, same as before. Both are logged separately (see
+    # write_task_log calls below), clearly labeled.
+    baseline_label_buffers = {}
+    baseline_replay_buffer = []
+    joint_label_buffers = {}
+    joint_replay_buffer = []
     task_test_splits = {}
     task_test_gids = {}
     results = []
@@ -683,8 +691,12 @@ def main():
 
             sample_id = gid_train
             category = np.where(y_train == benign_label, "benign", "malicious_clean")
-            replay_buffer = update_shared_buffer(
-                lineages["poisoned_baseline"], label_buffers, X_train_scaled, y_train, category, sample_id,
+            baseline_replay_buffer = update_shared_buffer(
+                lineages["poisoned_baseline"], baseline_label_buffers, X_train_scaled, y_train, category, sample_id,
+                benign_label, mal_label,
+            )
+            joint_replay_buffer = update_shared_buffer(
+                lineages["poisoned_baseline"], joint_label_buffers, X_train_scaled, y_train, category, sample_id,
                 benign_label, mal_label,
             )
 
@@ -711,7 +723,8 @@ def main():
                 "task_id": t, "seed": SEED, "feature_dim": feature_dim, "scaler": scaler,
                 "label_mapping": label_mapping,
                 "lineages": {name: lineages[name].model.state_dict() for name in LINEAGE_NAMES},
-                "label_buffers": label_buffers, "replay_buffer": replay_buffer,
+                "baseline_label_buffers": baseline_label_buffers, "baseline_replay_buffer": baseline_replay_buffer,
+                "joint_label_buffers": joint_label_buffers, "joint_replay_buffer": joint_replay_buffer,
                 "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
                 "results": results, "poison_fraction": poison_fraction,
             }, checkpoint_path)
@@ -722,7 +735,11 @@ def main():
         # -------------------------------------------------------------
         X_train_scaled = to_scaled(X_train_raw)
         X_test_scaled = to_scaled(X_test_raw)
-        replay_X, replay_y = flatten_replay(replay_buffer)  # buffer as it stood at end of PREVIOUS task
+        # Each buffer as it stood at the end of the PREVIOUS task.
+        # joint_replay_* feeds clean + the 3 unlearning variants;
+        # baseline_replay_* feeds ONLY poisoned_baseline.
+        replay_X, replay_y = flatten_replay(joint_replay_buffer)
+        baseline_replay_X, baseline_replay_y = flatten_replay(baseline_replay_buffer)
 
         # Step 2: clean lineage adapts on clean data only.
         lineages["clean"].adapt(X_train_scaled, y_train, replay_X=replay_X, replay_y=replay_y,
@@ -734,8 +751,10 @@ def main():
         )
         poison_idx = np.concatenate([idx_poison_ben, idx_poison_mal])
 
-        # Step 4: poisoned_baseline adapts on poisoned data ("no fix").
-        lineages["poisoned_baseline"].adapt(X_train_poisoned, y_train, replay_X=replay_X, replay_y=replay_y,
+        # Step 4: poisoned_baseline adapts on poisoned data ("no fix"), using
+        # its OWN separate replay buffer.
+        lineages["poisoned_baseline"].adapt(X_train_poisoned, y_train,
+                                             replay_X=baseline_replay_X, replay_y=baseline_replay_y,
                                              epochs=ADAPT_EPOCHS)
         acc_on_forced_labels = (
             lineages["poisoned_baseline"].score(X_train_poisoned[poison_idx], y_train[poison_idx])
@@ -826,14 +845,32 @@ def main():
             wrong = (pred != y_test)
             still_evades[name] = float(wrong[succ_pocket].mean()) if succ_pocket.any() else float("nan")
 
-        # Step 10: update the SHARED replay buffer -- only now, after every
+        # Step 10: update BOTH replay buffers -- only now, after every
         # lineage's adaptation/unlearning for this task is fully done.
+        # category_all reflects ORACLE ground truth (not the detector), so
+        # perturbed rows are always labeled honestly regardless of which
+        # buffer they end up in.
+        category_all = np.where(y_train == benign_label, "benign", "malicious_clean").astype(object)
+        category_all[idx_poison_ben] = "benign_perturbed"
+        category_all[idx_poison_mal] = "malicious_perturbed"
+
+        # baseline: NOT cleaned -- it's the "no fix" lineage, so its own
+        # buffer just replays whatever it actually trained on this task,
+        # perturbed rows included, unfiltered by the detector.
+        baseline_replay_buffer = update_shared_buffer(
+            lineages["poisoned_baseline"], baseline_label_buffers,
+            X_train_poisoned, y_train, category_all, gid_train,
+            benign_label, mal_label,
+        )
+
+        # joint: detector-clean rows only (unchanged) -- any detector false
+        # negative that slips past clean_mask still shows up honestly as a
+        # "*_perturbed" entry here, since category_all is oracle-based.
         clean_mask = np.ones(len(X_train_poisoned), dtype=bool)
         clean_mask[detected_poison_idx] = False
-        category = np.where(y_train == benign_label, "benign", "malicious_clean")
-        replay_buffer = update_shared_buffer(
-            lineages["poisoned_baseline"], label_buffers,
-            X_train_poisoned[clean_mask], y_train[clean_mask], category[clean_mask], gid_train[clean_mask],
+        joint_replay_buffer = update_shared_buffer(
+            lineages["poisoned_baseline"], joint_label_buffers,
+            X_train_poisoned[clean_mask], y_train[clean_mask], category_all[clean_mask], gid_train[clean_mask],
             benign_label, mal_label,
         )
 
@@ -870,18 +907,22 @@ def main():
             f"epsilon used this task: {eps_this_task:.4f}\n"
         )
 
+        baseline_dist = buffer_distribution(baseline_label_buffers)
         adapt_lines = [f"{'lineage':<18} {'task acc':>10} {'pooled acc':>12} {'mean acc':>10}"]
         for name in ["clean", "poisoned_baseline"]:
             task_acc_name = lineages[name].score(X_test_scaled, y_test)
             adapt_lines.append(f"{name:<18} {task_acc_name:>10.3f} {pooled_results[name]:>12.3f} "
                                 f"{mean_results[name]:>10.3f}")
         adapt_lines.append("")
+        adapt_lines.append(f"poisoned_baseline's OWN replay buffer distribution (post-update, this task): "
+                            f"{baseline_dist}")
+        adapt_lines.append("")
         for name in ["clean", "poisoned_baseline"]:
             adapt_lines.append(f"[{name}] classification report (this task's clean test):")
             adapt_lines.append(per_class_reports[name])
         adapt_section = "\n".join(adapt_lines)
 
-        dist = buffer_distribution(label_buffers)
+        joint_dist = buffer_distribution(joint_label_buffers)
         unlearn_lines = [
             f"detector type: {det_metrics['detector_type']}, train accuracy: {det_metrics['train_accuracy']:.3f}",
             f"detector precision/recall vs oracle -- benign: "
@@ -890,7 +931,8 @@ def main():
             f"P={det_metrics['class_metrics'][mal_label]['precision']:.2f} "
             f"R={det_metrics['class_metrics'][mal_label]['recall']:.2f}",
             f"detector training composition: {det_metrics['composition']}",
-            f"replay buffer distribution (post-update, this task): {dist}",
+            f"JOINT replay buffer distribution (dropped_rows/amnesiac/opposite_class share this one; "
+            f"post-update, this task): {joint_dist}",
             "",
             "Pre-unlearning (poison-adapted, before any fix) accuracy:",
             f"{'lineage':<18} {'task acc':>10} {'pooled acc':>12} {'mean acc':>10}",
@@ -962,7 +1004,8 @@ def main():
             "task_id": t, "seed": SEED, "feature_dim": feature_dim, "scaler": scaler,
             "label_mapping": label_mapping,
             "lineages": {name: lineages[name].model.state_dict() for name in LINEAGE_NAMES},
-            "label_buffers": label_buffers, "replay_buffer": replay_buffer,
+            "baseline_label_buffers": baseline_label_buffers, "baseline_replay_buffer": baseline_replay_buffer,
+            "joint_label_buffers": joint_label_buffers, "joint_replay_buffer": joint_replay_buffer,
             "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
             "results": results, "poison_fraction": poison_fraction,
         }, checkpoint_path)
@@ -977,8 +1020,8 @@ def main():
             plot_correctness_grid(os.path.join(out_dir, "plots", f"task{t}_correctness.png"), pca_fit, panels)
 
         if not args.no_breakpoint and t >= BREAKPOINT_FROM_TASK:
-            print(f"\n[breakpoint] Task {t} finished -- inspect `results`, `lineages`, `label_buffers`, "
-                  f"or the log at {log_path}. Continue with `c`.")
+            print(f"\n[breakpoint] Task {t} finished -- inspect `results`, `lineages`, "
+                  f"`baseline_label_buffers`, `joint_label_buffers`, or the log at {log_path}. Continue with `c`.")
             breakpoint()
 
     print(f"\nDone. Total runtime: {time.perf_counter() - start_time:.1f}s")
