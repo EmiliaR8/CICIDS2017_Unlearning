@@ -983,6 +983,23 @@ def main():
                 acc_s, _n = per_task_by_lineage[name][f"{s}_adversarial"]
                 row += f"{acc_s:>18.3f}"
             breakdown_lines.append(row)
+
+        # Same breakdown, but on each source task's CLEAN test set -- this is
+        # the plain-int key half of per_task_by_lineage that was already
+        # being computed for the pooled/mean accuracy above but never
+        # printed on its own. Needed to get a true combined (clean+adv)
+        # accuracy for a HISTORICAL task's data specifically, since the
+        # pooled/mean numbers only ever report an all-tasks-mixed-together
+        # figure, not one isolated source task's own clean+adv combination.
+        breakdown_lines.append("")
+        breakdown_lines.append(f"Task {t}'s (post-unlearning) classifier accuracy on each source task's CLEAN test-set:")
+        breakdown_lines.append(f"{'source task':<12} " + "".join(f"{name:>18}" for name in LINEAGE_NAMES))
+        for s in sorted(pocket_info_by_source.keys()):
+            row = f"{s:<12} "
+            for name in LINEAGE_NAMES:
+                acc_s, _n = per_task_by_lineage[name][s]
+                row += f"{acc_s:>18.3f}"
+            breakdown_lines.append(row)
         breakdown_section = "\n".join(breakdown_lines)
 
         write_task_log(log_path, t, [
