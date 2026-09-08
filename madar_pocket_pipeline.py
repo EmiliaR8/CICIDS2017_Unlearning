@@ -1000,6 +1000,28 @@ def main():
                 acc_s, _n = per_task_by_lineage[name][s]
                 row += f"{acc_s:>18.3f}"
             breakdown_lines.append(row)
+
+        # Same again, but CLEAN and adversarial rows for that source task
+        # POOLED into one combined set (concatenated, scored together) --
+        # tracks "general accuracy" (clean+adv together) per source task,
+        # at every task, for every lineage, so downstream plotting/summary
+        # scripts don't have to reconstruct it by averaging the two tables
+        # above themselves.
+        breakdown_lines.append("")
+        breakdown_lines.append(
+            f"Task {t}'s (post-unlearning) classifier COMBINED (clean+adversarial, pooled) "
+            f"accuracy on each source task's test-set:"
+        )
+        breakdown_lines.append(f"{'source task':<12} " + "".join(f"{name:>18}" for name in LINEAGE_NAMES))
+        for s in sorted(pocket_info_by_source.keys()):
+            Xs_clean, ys_clean = all_clean_sets[s]
+            Xs_adv, ys_adv = all_test_sets_full[f"{s}_adversarial"]
+            X_comb = np.vstack([Xs_clean, Xs_adv])
+            y_comb = np.concatenate([ys_clean, ys_adv])
+            row = f"{s:<12} "
+            for name in LINEAGE_NAMES:
+                row += f"{lineages[name].score(X_comb, y_comb):>18.3f}"
+            breakdown_lines.append(row)
         breakdown_section = "\n".join(breakdown_lines)
 
         write_task_log(log_path, t, [
