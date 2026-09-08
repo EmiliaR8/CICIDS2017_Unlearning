@@ -316,7 +316,7 @@ def run_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_ben, i
         "n_detected": len(detected_poison_idx),
         "n_oracle": len(idx_poison_ben) + len(idx_poison_mal),
     }
-    return detected_poison_idx, detected_by_class, metrics
+    return detected_poison_idx, detected_by_class, metrics, detector
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +594,15 @@ def main():
                           "Pass this to disable that filter -- the joint buffer then admits every row "
                           "of the task's poisoned training batch, unfiltered, same as poisoned_baseline's "
                           "own (always-unfiltered) buffer.")
+    ap.add_argument("--joint_buffer_purge_after_fill", action="store_true",
+                     help="Ablation: admits the JOINT buffer unfiltered (same effect as "
+                          "--joint_buffer_allow_perturbed, implied automatically -- no need to pass both), "
+                          "lets it fill/reselect as normal, THEN runs this task's shared detector over the "
+                          "buffer's current contents and removes whatever it flags as perturbed. Removed "
+                          "slots are NOT backfilled to top the buffer back up to budget -- the buffer is "
+                          "simply smaller from that point on, until ordinary admission next task grows it "
+                          "back (e.g. remove 200 malicious entries this task -> next task starts from the "
+                          "remaining 1800, not a refilled 2000).")
     args = ap.parse_args()
 
     SEED = args.seed
@@ -734,6 +743,7 @@ def main():
                 "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
                 "results": results, "poison_fraction": poison_fraction,
                 "joint_buffer_allow_perturbed": args.joint_buffer_allow_perturbed,
+                "joint_buffer_purge_after_fill": args.joint_buffer_purge_after_fill,
             }, checkpoint_path)
             continue
 
@@ -807,7 +817,7 @@ def main():
         pocket_info_by_source[t] = (succ_pocket, eps_this_task)
 
         # Step 7: ONE shared detector per task, trained from poisoned_baseline.
-        detected_poison_idx, detected_by_class, det_metrics = run_detector(
+        detected_poison_idx, detected_by_class, det_metrics, detector = run_detector(
             lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
             benign_label, mal_label, args.detector_type, SEED,
         )
@@ -871,11 +881,15 @@ def main():
         )
 
         # joint: detector-clean rows only, UNLESS --joint_buffer_allow_perturbed
-        # is set, in which case it admits the full unfiltered batch just like
-        # poisoned_baseline's own buffer. Any detector false negative that
-        # slips past clean_mask (filtered case) still shows up honestly as a
-        # "*_perturbed" entry here, since category_all is oracle-based.
-        if args.joint_buffer_allow_perturbed:
+        # or --joint_buffer_purge_after_fill is set (the latter implies the
+        # former -- purging after the fact only makes sense if perturbed rows
+        # were allowed in to begin with), in which case it admits the full
+        # unfiltered batch just like poisoned_baseline's own buffer. Any
+        # detector false negative that slips past clean_mask (filtered case)
+        # still shows up honestly as a "*_perturbed" entry here, since
+        # category_all is oracle-based.
+        joint_unfiltered = args.joint_buffer_allow_perturbed or args.joint_buffer_purge_after_fill
+        if joint_unfiltered:
             joint_X, joint_y, joint_cat, joint_gid = X_train_poisoned, y_train, category_all, gid_train
         else:
             clean_mask = np.ones(len(X_train_poisoned), dtype=bool)
@@ -887,6 +901,25 @@ def main():
             joint_X, joint_y, joint_cat, joint_gid,
             benign_label, mal_label,
         )
+
+        # Ablation: run this task's shared detector over the JUST-FILLED
+        # joint buffer and drop whatever it flags as perturbed -- no
+        # backfill/reselection afterward, so a removed slot simply stays
+        # empty until ordinary admission next task grows the buffer again.
+        joint_purge_counts = {benign_label: 0, mal_label: 0}
+        if args.joint_buffer_purge_after_fill:
+            for lbl in (benign_label, mal_label):
+                entries = joint_label_buffers.get(lbl, [])
+                if not entries:
+                    continue
+                X_buf = np.stack([e[0] for e in entries]).astype(np.float32)
+                preds = detector.predict(X_buf)
+                kept = [e for e, p in zip(entries, preds) if p == 0]
+                joint_purge_counts[lbl] = len(entries) - len(kept)
+                joint_label_buffers[lbl] = kept
+            joint_replay_buffer = []
+            for buf in joint_label_buffers.values():
+                joint_replay_buffer.extend(buf)
 
         task_test_splits[t] = (X_test_raw, y_test)
         task_test_gids[t] = gid_test
@@ -945,9 +978,23 @@ def main():
             f"P={det_metrics['class_metrics'][mal_label]['precision']:.2f} "
             f"R={det_metrics['class_metrics'][mal_label]['recall']:.2f}",
             f"detector training composition: {det_metrics['composition']}",
+        ]
+        if args.joint_buffer_purge_after_fill:
+            joint_mode_desc = "UNFILTERED admission + detector purge after fill, no refill"
+        elif args.joint_buffer_allow_perturbed:
+            joint_mode_desc = "UNFILTERED -- perturbed rows allowed"
+        else:
+            joint_mode_desc = "detector-clean only"
+        unlearn_lines.append(
             f"JOINT replay buffer distribution (dropped_rows/amnesiac/opposite_class share this one; "
-            f"{'UNFILTERED -- perturbed rows allowed' if args.joint_buffer_allow_perturbed else 'detector-clean only'}; "
-            f"post-update, this task): {joint_dist}",
+            f"{joint_mode_desc}; post-update, this task): {joint_dist}"
+        )
+        if args.joint_buffer_purge_after_fill:
+            unlearn_lines.append(
+                f"JOINT buffer purge this task (removed, NOT backfilled): "
+                f"benign={joint_purge_counts[benign_label]}, malicious={joint_purge_counts[mal_label]}"
+            )
+        unlearn_lines += [
             "",
             "Pre-unlearning (poison-adapted, before any fix) accuracy:",
             f"{'lineage':<18} {'task acc':>10} {'pooled acc':>12} {'mean acc':>10}",
@@ -1063,6 +1110,7 @@ def main():
             "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
             "results": results, "poison_fraction": poison_fraction,
             "joint_buffer_allow_perturbed": args.joint_buffer_allow_perturbed,
+            "joint_buffer_purge_after_fill": args.joint_buffer_purge_after_fill,
         }, checkpoint_path)
 
         print(f"Task {t} done. Genuine pocket rate: {_fmt_pct(succ_pocket.mean())}. "
