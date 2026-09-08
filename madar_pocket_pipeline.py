@@ -588,6 +588,12 @@ def main():
     ap.add_argument("--no_breakpoint", action="store_true",
                      help="Disable the interactive breakpoint() pause at the end of tasks >= "
                           f"{BREAKPOINT_FROM_TASK} (needed for a non-interactive/headless run).")
+    ap.add_argument("--joint_buffer_allow_perturbed", action="store_true",
+                     help="By default the JOINT replay buffer (dropped_rows/amnesiac/opposite_class) "
+                          "only ever admits rows the shared detector called clean, same as before. "
+                          "Pass this to disable that filter -- the joint buffer then admits every row "
+                          "of the task's poisoned training batch, unfiltered, same as poisoned_baseline's "
+                          "own (always-unfiltered) buffer.")
     args = ap.parse_args()
 
     SEED = args.seed
@@ -727,6 +733,7 @@ def main():
                 "joint_label_buffers": joint_label_buffers, "joint_replay_buffer": joint_replay_buffer,
                 "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
                 "results": results, "poison_fraction": poison_fraction,
+                "joint_buffer_allow_perturbed": args.joint_buffer_allow_perturbed,
             }, checkpoint_path)
             continue
 
@@ -863,14 +870,21 @@ def main():
             benign_label, mal_label,
         )
 
-        # joint: detector-clean rows only (unchanged) -- any detector false
-        # negative that slips past clean_mask still shows up honestly as a
+        # joint: detector-clean rows only, UNLESS --joint_buffer_allow_perturbed
+        # is set, in which case it admits the full unfiltered batch just like
+        # poisoned_baseline's own buffer. Any detector false negative that
+        # slips past clean_mask (filtered case) still shows up honestly as a
         # "*_perturbed" entry here, since category_all is oracle-based.
-        clean_mask = np.ones(len(X_train_poisoned), dtype=bool)
-        clean_mask[detected_poison_idx] = False
+        if args.joint_buffer_allow_perturbed:
+            joint_X, joint_y, joint_cat, joint_gid = X_train_poisoned, y_train, category_all, gid_train
+        else:
+            clean_mask = np.ones(len(X_train_poisoned), dtype=bool)
+            clean_mask[detected_poison_idx] = False
+            joint_X, joint_y = X_train_poisoned[clean_mask], y_train[clean_mask]
+            joint_cat, joint_gid = category_all[clean_mask], gid_train[clean_mask]
         joint_replay_buffer = update_shared_buffer(
             lineages["poisoned_baseline"], joint_label_buffers,
-            X_train_poisoned[clean_mask], y_train[clean_mask], category_all[clean_mask], gid_train[clean_mask],
+            joint_X, joint_y, joint_cat, joint_gid,
             benign_label, mal_label,
         )
 
@@ -932,6 +946,7 @@ def main():
             f"R={det_metrics['class_metrics'][mal_label]['recall']:.2f}",
             f"detector training composition: {det_metrics['composition']}",
             f"JOINT replay buffer distribution (dropped_rows/amnesiac/opposite_class share this one; "
+            f"{'UNFILTERED -- perturbed rows allowed' if args.joint_buffer_allow_perturbed else 'detector-clean only'}; "
             f"post-update, this task): {joint_dist}",
             "",
             "Pre-unlearning (poison-adapted, before any fix) accuracy:",
@@ -1047,6 +1062,7 @@ def main():
             "joint_label_buffers": joint_label_buffers, "joint_replay_buffer": joint_replay_buffer,
             "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
             "results": results, "poison_fraction": poison_fraction,
+            "joint_buffer_allow_perturbed": args.joint_buffer_allow_perturbed,
         }, checkpoint_path)
 
         print(f"Task {t} done. Genuine pocket rate: {_fmt_pct(succ_pocket.mean())}. "
