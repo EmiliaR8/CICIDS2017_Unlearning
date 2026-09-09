@@ -109,33 +109,34 @@ DEVICE = torch.device("cpu")
 SEED = 42  # overwritten from --seed in main()
 
 
+DEFAULT_HIDDEN_SIZES = (1024, 512, 256, 128)
+
+
 # ---------------------------------------------------------------------------
 # Model + continual-adaptation wrapper (same architecture/semantics as the
 # notebook; return_latent kept so the shared replay buffer's IsolationForest
 # selection has an embedding space to work in, matching this repo's existing
-# buffer mechanism).
+# buffer mechanism). hidden_sizes is configurable (--hidden_sizes) so the
+# whole framework can be tried against a simpler/deeper base classifier --
+# e.g. hidden_sizes=(128,) for a single-hidden-layer network, vs. the
+# original 4-hidden-layer (1024,512,256,128) default.
 # ---------------------------------------------------------------------------
 class ClassifierNN(nn.Module):
-    def __init__(self, input_dim, num_classes):
+    def __init__(self, input_dim, num_classes, hidden_sizes=DEFAULT_HIDDEN_SIZES):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, 1024)
-        self.fc1_bn = nn.BatchNorm1d(1024)
-        self.fc2 = nn.Linear(1024, 512)
-        self.fc2_bn = nn.BatchNorm1d(512)
-        self.fc3 = nn.Linear(512, 256)
-        self.fc3_bn = nn.BatchNorm1d(256)
-        self.fc4 = nn.Linear(256, 128)
-        self.fc4_bn = nn.BatchNorm1d(128)
+        if not hidden_sizes:
+            raise ValueError("hidden_sizes must have at least one layer")
+        sizes = [input_dim] + list(hidden_sizes)
+        self.layers = nn.ModuleList([nn.Linear(sizes[i], sizes[i + 1]) for i in range(len(sizes) - 1)])
+        self.bns = nn.ModuleList([nn.BatchNorm1d(sizes[i + 1]) for i in range(len(sizes) - 1)])
         self.relu = nn.ReLU()
-        self.fc_last = nn.Linear(128, num_classes)
+        self.fc_last = nn.Linear(sizes[-1], num_classes)
 
     def forward(self, x, return_latent=False):
-        x = self.relu(self.fc1_bn(self.fc1(x)))
-        x = self.relu(self.fc2_bn(self.fc2(x)))
-        x = self.relu(self.fc3_bn(self.fc3(x)))
-        latent = self.relu(self.fc4_bn(self.fc4(x)))
-        logits = self.fc_last(latent)
-        return (logits, latent) if return_latent else logits
+        for layer, bn in zip(self.layers, self.bns):
+            x = self.relu(bn(layer(x)))
+        logits = self.fc_last(x)
+        return (logits, x) if return_latent else logits
 
 
 class AdaptableClassifier:
@@ -190,7 +191,9 @@ def embed_latent(model_wrapper, X, batch_size=EMBED_BATCH_SIZE):
     for i in range(0, len(Xt), batch_size):
         _, latent = model_wrapper.model(Xt[i:i + batch_size], return_latent=True)
         parts.append(latent.numpy())
-    return np.concatenate(parts, axis=0) if parts else np.empty((0, 128), dtype=np.float32)
+    if parts:
+        return np.concatenate(parts, axis=0)
+    return np.empty((0, model_wrapper.model.fc_last.in_features), dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +606,13 @@ def main():
                           "simply smaller from that point on, until ordinary admission next task grows it "
                           "back (e.g. remove 200 malicious entries this task -> next task starts from the "
                           "remaining 1800, not a refilled 2000).")
+    ap.add_argument("--hidden_sizes", type=str, default=",".join(str(h) for h in DEFAULT_HIDDEN_SIZES),
+                     help="Comma-separated hidden-layer widths for ClassifierNN, e.g. '128' for a single "
+                          "hidden layer, '256,128' for two. Default matches the original architecture: "
+                          f"{','.join(str(h) for h in DEFAULT_HIDDEN_SIZES)}. Applies to all 5 lineages "
+                          "(they all start from the same task-0 model).")
     args = ap.parse_args()
+    hidden_sizes = tuple(int(h) for h in args.hidden_sizes.split(","))
 
     SEED = args.seed
     np.random.seed(SEED)
@@ -624,6 +633,7 @@ def main():
             "dropped_rows, amnesiac, opposite_class. One shared detector + one shared\n"
             "replay buffer per task (see module docstring). Task 0 is plain initial\n"
             "training only -- no poisoning/detection/unlearning yet.\n"
+            f"Classifier hidden layer sizes: {hidden_sizes}\n"
         )
 
     print(f"Loading {args.h5_path} and building {NUM_TASKS} pooled chronological tasks...")
@@ -677,7 +687,7 @@ def main():
             X_train_scaled = to_scaled(X_train_raw)
             X_test_scaled = to_scaled(X_test_raw)
 
-            base_model = ClassifierNN(feature_dim, 2).to(DEVICE)
+            base_model = ClassifierNN(feature_dim, 2, hidden_sizes=hidden_sizes).to(DEVICE)
             Xt = torch.tensor(X_train_scaled, dtype=torch.float32)
             yt = torch.tensor(y_train, dtype=torch.long)
             opt0 = torch.optim.Adam(base_model.parameters(), lr=TASK0_LR)
@@ -744,6 +754,7 @@ def main():
                 "results": results, "poison_fraction": poison_fraction,
                 "joint_buffer_allow_perturbed": args.joint_buffer_allow_perturbed,
                 "joint_buffer_purge_after_fill": args.joint_buffer_purge_after_fill,
+                "hidden_sizes": hidden_sizes,
             }, checkpoint_path)
             continue
 
@@ -1111,6 +1122,7 @@ def main():
             "results": results, "poison_fraction": poison_fraction,
             "joint_buffer_allow_perturbed": args.joint_buffer_allow_perturbed,
             "joint_buffer_purge_after_fill": args.joint_buffer_purge_after_fill,
+            "hidden_sizes": hidden_sizes,
         }, checkpoint_path)
 
         print(f"Task {t} done. Genuine pocket rate: {_fmt_pct(succ_pocket.mean())}. "
