@@ -90,9 +90,15 @@ DETECTOR_UNCERTAIN_FRACTION = 0.5
 LOGISTIC_PARAMS = dict(C=0.1, class_weight="balanced", max_iter=2000)
 XGBOOST_PARAMS = dict(n_estimators=20, max_depth=2, learning_rate=0.1, reg_lambda=10.0,
                        subsample=0.7, colsample_bytree=0.3, min_child_weight=5,
-                       eval_metric="logloss", device="cpu")  # force CPU: this detector's data is tiny
-                       # (a few hundred rows), a GPU path buys nothing and some xgboost builds will
-                       # auto-detect/attempt CUDA and surface unrelated driver/CUDA-context errors here
+                       eval_metric="logloss", device="cpu", tree_method="exact")
+                       # device="cpu" alone is NOT enough: with tree_method left at its default
+                       # (None/"hist"/"auto"), xgboost's sklearn wrapper still routes through
+                       # QuantileDMatrix's iterator-based ingestion (DataIter -> proxy.set_info)
+                       # regardless of device, and on some xgboost builds that path unconditionally
+                       # touches the CUDA runtime and can crash on an unrelated CUDA/driver issue on
+                       # a GPU machine. tree_method="exact" makes xgboost use the plain DMatrix
+                       # constructor instead, skipping that code path entirely -- fine at this
+                       # detector's scale (a few hundred rows, max_depth=2), no accuracy trade-off.
 
 AMNESIAC_ROUNDS = 15
 
