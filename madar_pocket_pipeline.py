@@ -371,7 +371,7 @@ def apply_opposite_class(lineage, X_train_poisoned, y_train, detected_poison_idx
 # ---------------------------------------------------------------------------
 def adversarial_attack_pocket(poisoned_model, clean_model, X, y, epsilon_max,
                                step=ATTACK_STEP, max_steps=ATTACK_MAX_STEPS,
-                               clean_weight=ATTACK_CLEAN_WEIGHT):
+                               clean_weight=ATTACK_CLEAN_WEIGHT, per_feature_epsilon=None):
     X_adv = X.copy()
     x0 = X.copy()
     success = np.zeros(len(X), dtype=bool)
@@ -412,6 +412,14 @@ def adversarial_attack_pocket(poisoned_model, clean_model, X, y, epsilon_max,
             d = d / nrm
             X_adv[idx_s] = X_adv[idx_s] + step * d
             delta = X_adv[idx_s] - x0[idx_s]
+            if per_feature_epsilon is not None:
+                # Per-feature (L-infinity) cap, same convention as the old RL
+                # pipeline's RED_EPSILON action-space bound -- clip BEFORE the
+                # L2 rescale below, so a subsequent rescale (which only ever
+                # multiplies by a factor <=1) can't push any coordinate back
+                # outside this cap.
+                delta = np.clip(delta, -per_feature_epsilon, per_feature_epsilon)
+                X_adv[idx_s] = x0[idx_s] + delta
             dn = np.linalg.norm(delta, axis=1, keepdims=True)
             too_far = dn.ravel() > epsilon_max
             if too_far.any():
@@ -619,6 +627,14 @@ def main():
                           "hidden layer, '256,128' for two. Default matches the original architecture: "
                           f"{','.join(str(h) for h in DEFAULT_HIDDEN_SIZES)}. Applies to all 5 lineages "
                           "(they all start from the same task-0 model).")
+    ap.add_argument("--per_feature_epsilon", type=float, default=None,
+                     help="Ablation: adds a per-feature (L-infinity) cap on top of the existing "
+                          "overall (L2) epsilon_max budget in adversarial_attack_pocket -- no single "
+                          "feature may move by more than this amount, in the same SCALED feature space "
+                          "epsilon_max already uses. Matches the old RL pipeline's RED_EPSILON=0.25 "
+                          "convention (its action space was Box(-epsilon, epsilon, shape=(feature_dim,))). "
+                          "Off by default (None) -- existing behavior (L2 budget only) is unchanged unless "
+                          "you pass this, e.g. --per_feature_epsilon 0.25.")
     args = ap.parse_args()
     hidden_sizes = tuple(int(h) for h in args.hidden_sizes.split(","))
 
@@ -642,6 +658,7 @@ def main():
             "replay buffer per task (see module docstring). Task 0 is plain initial\n"
             "training only -- no poisoning/detection/unlearning yet.\n"
             f"Classifier hidden layer sizes: {hidden_sizes}\n"
+            f"Per-feature epsilon cap: {args.per_feature_epsilon}\n"
         )
 
     print(f"Loading {args.h5_path} and building {NUM_TASKS} pooled chronological tasks...")
@@ -763,6 +780,7 @@ def main():
                 "joint_buffer_allow_perturbed": args.joint_buffer_allow_perturbed,
                 "joint_buffer_purge_after_fill": args.joint_buffer_purge_after_fill,
                 "hidden_sizes": hidden_sizes,
+                "per_feature_epsilon": args.per_feature_epsilon,
             }, checkpoint_path)
             continue
 
@@ -806,6 +824,7 @@ def main():
         eps_this_task = typical_class_gap(X_test_scaled, y_test, benign_label, mal_label) * ATTACK_EPS_MULTIPLIER
         X_test_adv, succ_pocket, norms_pocket = adversarial_attack_pocket(
             lineages["poisoned_baseline"], lineages["clean"], X_test_scaled, y_test, epsilon_max=eps_this_task,
+            per_feature_epsilon=args.per_feature_epsilon,
         )
 
         # Step 6: spillover check -- re-attack every PRIOR task's test set,
@@ -817,6 +836,7 @@ def main():
             eps_s = eps_s * ATTACK_EPS_MULTIPLIER if eps_s is not None else eps_this_task
             Xs_adv, succ_s, norms_s = adversarial_attack_pocket(
                 lineages["poisoned_baseline"], lineages["clean"], Xs_scaled, ys, epsilon_max=eps_s,
+                per_feature_epsilon=args.per_feature_epsilon,
             )
             historical_adv[s] = (Xs_adv, ys, succ_s, eps_s)
 
@@ -1131,6 +1151,7 @@ def main():
             "joint_buffer_allow_perturbed": args.joint_buffer_allow_perturbed,
             "joint_buffer_purge_after_fill": args.joint_buffer_purge_after_fill,
             "hidden_sizes": hidden_sizes,
+            "per_feature_epsilon": args.per_feature_epsilon,
         }, checkpoint_path)
 
         print(f"Task {t} done. Genuine pocket rate: {_fmt_pct(succ_pocket.mean())}. "
