@@ -84,19 +84,26 @@ def style_for(name, style_cache):
     return style_cache[name]
 
 
-# Lineage names are captured generically (\w+) rather than from a fixed
-# alternation -- the surrounding literal text (column shape, trailing '%',
-# end-of-line anchors) is specific enough to this pipeline family's log
-# format that no other line accidentally matches. See git history for the
-# previous fixed-alternation version if that assumption ever breaks.
-TASK0_LINE_RE = re.compile(rf"^(\w+): task test acc = ({NUM})\s*$", re.MULTILINE)
-ADAPT_TABLE_RE = re.compile(rf"^(\w+)\s+({NUM})\s+({NUM})\s+({NUM})\s*$", re.MULTILINE)
+# Lineage names are captured generically (a name, not a fixed alternation)
+# -- the surrounding literal text (column shape, trailing '%', end-of-line
+# anchors) is specific enough to this pipeline family's log format that no
+# other line accidentally matches. NAME requires a leading letter/underscore
+# (never a bare digit): the per-source-task breakdown tables have rows
+# shaped "<source task index> <NUM> <NUM> ...", and a pipeline with exactly
+# 3 lineages produces exactly 3 numeric columns there -- indistinguishable
+# from an Adaptation-step row's shape if the name could be a plain integer.
+# See git history for the previous fixed-alternation version if the
+# leading-letter assumption ever breaks (it would need a name that is a bare
+# number, which nothing in this project's pipelines uses).
+NAME = r"[A-Za-z_]\w*"
+TASK0_LINE_RE = re.compile(rf"^({NAME}): task test acc = ({NUM})\s*$", re.MULTILINE)
+ADAPT_TABLE_RE = re.compile(rf"^({NAME})\s+({NUM})\s+({NUM})\s+({NUM})\s*$", re.MULTILINE)
 POST_FIX_RE = re.compile(
-    rf"^(\w+)\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})%\s*$",
+    rf"^({NAME})\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})%\s*$",
     re.MULTILINE,
 )
 GENUINE_POCKETS_RE = re.compile(rf"genuine pockets found: \d+/\d+ \(({NUM})%\)")
-CLASS_MARKER_RE = re.compile(r"\[(\w+)\] classification report")
+CLASS_MARKER_RE = re.compile(rf"\[({NAME})\] classification report")
 CLASS_ROW_RE = re.compile(rf"^\s*(Benign|Malicious)\s+{NUM}\s+({NUM})\s+{NUM}\s+\d+\s*$", re.MULTILINE)
 # The parenthesized phrase varies by pipeline ("post-unlearning" in the
 # detector+fix-variant pipeline, "post-adaptation" in the SI/A-GEM one).

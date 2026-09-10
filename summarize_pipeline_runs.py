@@ -40,16 +40,20 @@ import statistics
 
 NUM = r"(?:[\d.]+|nan)"  # tolerates the literal "nan" the log prints for undefined still-evades %
 
-# Lineage names are captured generically (\w+) -- see plot_pipeline_metrics.py
-# for the rationale (the surrounding column shape is specific enough that no
-# other line accidentally matches).
+# Lineage names are captured generically -- see plot_pipeline_metrics.py for
+# the rationale. NAME requires a leading letter/underscore (never a bare
+# digit): the per-source-task breakdown tables have rows shaped "<source
+# task index> <NUM> <NUM> ...", and a pipeline with exactly 3 lineages
+# produces exactly 3 numeric columns there -- indistinguishable from an
+# Adaptation-step row's shape if the name could be a plain integer.
+NAME = r"[A-Za-z_]\w*"
 TASK_HEADER_RE = re.compile(r"^=+\n=== Task (\d+) ===\n=+\n", re.MULTILINE)
-ADAPT_TABLE_RE = re.compile(rf"^(\w+)\s+({NUM})\s+({NUM})\s+({NUM})\s*$", re.MULTILINE)
+ADAPT_TABLE_RE = re.compile(rf"^({NAME})\s+({NUM})\s+({NUM})\s+({NUM})\s*$", re.MULTILINE)
 POST_FIX_RE = re.compile(
-    rf"^(\w+)\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})%\s*$",
+    rf"^({NAME})\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})%\s*$",
     re.MULTILINE,
 )
-CLASS_MARKER_RE = re.compile(r"\[(\w+)\] classification report")
+CLASS_MARKER_RE = re.compile(rf"\[({NAME})\] classification report")
 MACRO_ROW_RE = re.compile(rf"^\s*macro avg\s+({NUM})\s+({NUM})\s+({NUM})\s+\d+\s*$", re.MULTILINE)
 # The parenthesized phrase varies by pipeline ("post-unlearning" vs "post-adaptation").
 ADV_BREAKDOWN_HEADER_RE = re.compile(
