@@ -123,8 +123,8 @@ from tinyimagenet_data_loader import (
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DATA_ROOT = "/mnt/erivas6/processed"
-RUNS_BASE_DIR = "/mnt/erivas6/runs"
+DATA_ROOT = "/home/erivas6"
+RUNS_BASE_DIR = "/home/erivas6/imagenet_runs"
 
 IMAGE_SHAPE = (3, 64, 64)
 
