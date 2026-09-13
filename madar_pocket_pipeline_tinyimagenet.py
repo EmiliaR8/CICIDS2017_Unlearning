@@ -437,6 +437,17 @@ def train_detector(detector_type, X_det, y_det, seed):
 
 def run_detector(poisoned_baseline, X_train_poisoned, y_train, poison_idx, new_classes,
                   detector_type, seed, n_active):
+    if len(poison_idx) == 0:
+        # --poison_fraction 0 baseline: the detector's training label (clean vs.
+        # poisoned) would only ever have ONE class in it here, and
+        # LogisticRegression.fit hard-errors on single-class data ("needs
+        # samples of at least 2 classes") -- so skip fitting a detector
+        # entirely rather than let that crash the run. detector=None; nothing
+        # downstream needs one to predict against when there's nothing to flag.
+        return np.array([], dtype=np.int64), {
+            "detector_type": None, "train_accuracy": float("nan"), "composition": {},
+            "n_detected": 0, "n_oracle": 0, "precision": float("nan"), "recall": float("nan"),
+        }, None
     X_det, y_det, composition = build_detector_training_set_mixed(
         poisoned_baseline, X_train_poisoned, y_train, poison_idx, new_classes,
         n_per_group=DETECTOR_N_PER_GROUP, uncertain_fraction=DETECTOR_UNCERTAIN_FRACTION,
@@ -1036,7 +1047,7 @@ def main():
         )
 
         joint_purge_counts = {c: 0 for c in new_classes}
-        if args.joint_buffer_purge_after_fill:
+        if args.joint_buffer_purge_after_fill and detector is not None:
             for lbl in new_classes:
                 entries = joint_label_buffers.get(lbl, [])
                 if not entries:
