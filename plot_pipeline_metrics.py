@@ -58,6 +58,27 @@ actually want. Two flags handle this:
                                       (plot legend, CSV lineage column) --
                                       does not change which logs/lineage
                                       names are matched. Repeatable.
+  --only-lineages n1,n2,...          Drop every OTHER already-aggregated
+                                      lineage from the plot/CSV -- e.g. pull
+                                      just clean+poisoned_baseline out of a
+                                      5-lineage log.
+
+COMPARING ONE LINEAGE ACROSS SEVERAL EXPERIMENTAL CONDITIONS ON ONE PLOT:
+poisoned_baseline (or any other name) is identical across every group of
+logs it appears in -- there is no way to tell "poisoned_baseline from the
+clean-buffer runs" apart from "poisoned_baseline from the dirty-buffer runs"
+by name alone. --split-lineage solves this by renaming BASE to NEWNAME for
+just one group of --logs positions, so each condition's copy becomes its
+own distinctly-labeled lineage BEFORE aggregation -- one call per condition:
+
+  --split-lineage BASE:NEWNAME=i,j,k   Rename BASE's data to NEWNAME, only
+                                        for these --logs positions. A file's
+                                        copy of BASE moves to NEWNAME, it is
+                                        not duplicated. Repeatable -- pair
+                                        several calls with the same BASE and
+                                        different NEWNAME/indices to split
+                                        one lineage into several plotted
+                                        lines, one per condition.
 
 Usage:
     python plot_pipeline_metrics.py --logs run1/pipeline_log.txt --task-acc --adv-acc
@@ -77,6 +98,22 @@ Usage:
         --restrict-lineage clean=0,1,2 --restrict-lineage poisoned_baseline=0,1,2 \\
         --rename poisoned_baseline=MADAR \\
         --mean-acc --pooled-acc --combined-acc --out-dir plots/
+
+    # One buffer ablation, one plot: 9 logs of ONE pipeline (0-2 = clean-buffer
+    # seeds, 3-5 = dirty-buffer seeds, 6-8 = unfilled-buffer seeds). Split
+    # poisoned_baseline into 3 lines (one per condition), keep ONE clean
+    # reference line from the dirty-buffer triplet, and drop everything else
+    # (dropped_rows/amnesiac/opposite_class) from this plot:
+    python plot_pipeline_metrics.py --logs \\
+        pipeline0/pipeline_log.txt pipeline1/pipeline_log.txt pipeline2/pipeline_log.txt \\
+        pipeline3/pipeline_log.txt pipeline4/pipeline_log.txt pipeline5/pipeline_log.txt \\
+        pipeline6/pipeline_log.txt pipeline7/pipeline_log.txt pipeline8/pipeline_log.txt \\
+        --split-lineage "poisoned_baseline:Poisoned Baseline (Clean Buffer)=0,1,2" \\
+        --split-lineage "poisoned_baseline:Poisoned Baseline (Dirty Buffer)=3,4,5" \\
+        --split-lineage "poisoned_baseline:Poisoned Baseline (Unfilled Buffer)=6,7,8" \\
+        --restrict-lineage clean=3,4,5 \\
+        --only-lineages "Poisoned Baseline (Clean Buffer),Poisoned Baseline (Dirty Buffer),Poisoned Baseline (Unfilled Buffer),clean" \\
+        --mean-acc --pooled-acc --combined-acc --out-dir plots/buffer_ablation
 """
 import argparse
 import csv
@@ -122,6 +159,24 @@ def _parse_restrict(entries):
             raise ValueError(f"--restrict-lineage indices must be integers, got {entry!r}")
         restrict[name] = idxs
     return restrict
+
+
+def _parse_split(entries):
+    """['poisoned_baseline:CleanBuffer=0,1,2'] -> [('poisoned_baseline', 'CleanBuffer', {0,1,2})]"""
+    out = []
+    for entry in entries:
+        if "=" not in entry:
+            raise ValueError(f"--split-lineage must be BASE:NEWNAME=i,j,k, got {entry!r}")
+        left, idx_str = entry.split("=", 1)
+        if ":" not in left:
+            raise ValueError(f"--split-lineage must be BASE:NEWNAME=i,j,k, got {entry!r}")
+        base, newname = left.split(":", 1)
+        try:
+            idxs = {int(x) for x in idx_str.split(",") if x.strip()}
+        except ValueError:
+            raise ValueError(f"--split-lineage indices must be integers, got {entry!r}")
+        out.append((base, newname, idxs))
+    return out
 
 
 def _parse_rename(entries):
@@ -441,6 +496,15 @@ def main():
                      help="Only aggregate LINEAGE from these 0-indexed positions in --logs "
                           "(comma-separated). Repeatable. See the module docstring for why this "
                           "matters when mixing several pipeline families' logs in one call.")
+    ap.add_argument("--split-lineage", action="append", default=[], metavar="BASE:NEWNAME=i,j,k",
+                     help="Rename BASE's data to NEWNAME, but ONLY for these 0-indexed --logs "
+                          "positions, before aggregation. Lets one lineage name that's identical "
+                          "across several runs (e.g. poisoned_baseline under different buffer "
+                          "ablation settings) become several distinctly-labeled lines on the "
+                          "SAME plot, one per group of log files. Repeatable -- e.g. three calls "
+                          "with the same BASE and different NEWNAME/indices split that lineage "
+                          "three ways. A file's copy of BASE is moved to NEWNAME, not duplicated, "
+                          "so it stops counting toward plain BASE once split.")
     ap.add_argument("--rename", action="append", default=[], metavar="OLD=NEW",
                      help="Relabel a lineage for display only (plot legend, CSV lineage column). "
                           "Repeatable.")
@@ -456,11 +520,17 @@ def main():
     only_lineages = set(args.only_lineages.split(",")) if args.only_lineages else None
 
     restrict = _parse_restrict(args.restrict_lineage)
+    splits = _parse_split(args.split_lineage)
     rename = _parse_rename(args.rename)
     for name, idxs in restrict.items():
         bad = {i for i in idxs if i < 0 or i >= len(args.logs)}
         if bad:
             ap.error(f"--restrict-lineage {name}=... has out-of-range index(es) {sorted(bad)} "
+                      f"for {len(args.logs)} --logs entries")
+    for base, newname, idxs in splits:
+        bad = {i for i in idxs if i < 0 or i >= len(args.logs)}
+        if bad:
+            ap.error(f"--split-lineage {base}:{newname}=... has out-of-range index(es) {sorted(bad)} "
                       f"for {len(args.logs)} --logs entries")
 
     flag_map = {
@@ -489,6 +559,19 @@ def main():
         tasks, data, gpr, order, fix_names = parse_log(log_text)
         if not tasks:
             raise ValueError(f"No '=== Task N ===' sections found in {path} -- is this a pipeline_log.txt?")
+
+        # --split-lineage: move BASE's data to NEWNAME for this run, before
+        # anything else touches it, so --restrict-lineage/--only-lineages/
+        # aggregate() all see NEWNAME as an ordinary lineage from here on.
+        renamed_by_split = []
+        for base, newname, idxs in splits:
+            if base in data and i in idxs:
+                data[newname] = data.pop(base)
+                order = [newname if n == base else n for n in order]
+                if base in fix_names:
+                    fix_names = (fix_names - {base}) | {newname}
+                renamed_by_split.append(f"{base}->{newname}")
+
         # --restrict-lineage: drop any restricted lineage's data from this run
         # unless this run's index is in its allowed set, so aggregate() (which
         # already only averages over runs where "name in data") naturally
@@ -499,8 +582,12 @@ def main():
             order = [n for n in order if n != name]
             fix_names = fix_names - {name}
         runs.append((tasks, data, gpr, order, fix_names))
-        print(f"{path}: detected lineages {order}" + (f" (dropped by --restrict-lineage: {dropped})"
-                                                        if dropped else ""))
+        note = ""
+        if renamed_by_split:
+            note += f" (split: {renamed_by_split})"
+        if dropped:
+            note += f" (dropped by --restrict-lineage: {dropped})"
+        print(f"{path}: detected lineages {order}{note}")
 
     task_counts = {len(tasks) for tasks, *_ in runs}
     if len(task_counts) > 1:
