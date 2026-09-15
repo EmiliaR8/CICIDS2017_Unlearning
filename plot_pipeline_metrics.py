@@ -600,10 +600,18 @@ def main():
     fix_order = [n for n in lineage_order if n in fix_names]
 
     if only_lineages is not None:
+        # --only-lineages is checked here against PRE-rename names (lineage_order
+        # hasn't been renamed yet -- rename is applied only at display time,
+        # below). Accept the renamed form too, via the reverse mapping, so
+        # --only-lineages "Clean" works exactly like --only-lineages "clean"
+        # when --rename clean=Clean is also passed -- matching either name a
+        # user might reasonably type is worth more than one canonical form.
+        reverse_rename = {v: k for k, v in rename.items()}
+        only_lineages = {reverse_rename.get(n, n) for n in only_lineages}
         missing = only_lineages - set(lineage_order)
         if missing:
             ap.error(f"--only-lineages named {sorted(missing)}, which the input logs don't contain "
-                      f"(detected: {lineage_order})")
+                      f"(detected, pre-rename: {lineage_order})")
         plot_order = [n for n in lineage_order if n in only_lineages]
         fix_order = [n for n in fix_order if n in only_lineages]
     else:
