@@ -444,7 +444,16 @@ def main():
     ap.add_argument("--rename", action="append", default=[], metavar="OLD=NEW",
                      help="Relabel a lineage for display only (plot legend, CSV lineage column). "
                           "Repeatable.")
+    ap.add_argument("--only-lineages", default=None, metavar="name1,name2,...",
+                     help="Only draw/write these lineage names, dropping any other lineage the "
+                          "input logs contain -- e.g. isolate clean+poisoned_baseline out of a "
+                          "5-lineage madar_pocket_pipeline.py log without touching dropped_rows/"
+                          "amnesiac/opposite_class. Unlike --restrict-lineage (which controls "
+                          "which LOG FILES a lineage is aggregated from), this only controls "
+                          "which already-aggregated lineages make it into the output.")
     args = ap.parse_args()
+
+    only_lineages = set(args.only_lineages.split(",")) if args.only_lineages else None
 
     restrict = _parse_restrict(args.restrict_lineage)
     rename = _parse_rename(args.rename)
@@ -503,12 +512,22 @@ def main():
     n_runs = len(runs)
     fix_order = [n for n in lineage_order if n in fix_names]
 
+    if only_lineages is not None:
+        missing = only_lineages - set(lineage_order)
+        if missing:
+            ap.error(f"--only-lineages named {sorted(missing)}, which the input logs don't contain "
+                      f"(detected: {lineage_order})")
+        plot_order = [n for n in lineage_order if n in only_lineages]
+        fix_order = [n for n in fix_order if n in only_lineages]
+    else:
+        plot_order = lineage_order
+
     out_dir = args.out_dir or os.path.dirname(os.path.abspath(args.logs[0]))
     os.makedirs(out_dir, exist_ok=True)
     style_cache = {}
 
     for metric in selected_metrics:
-        lineages = fix_order if metric == "still_evades_pct" else lineage_order
+        lineages = fix_order if metric == "still_evades_pct" else plot_order
         plot_one_metric(metric, lineages, all_tasks, mean_data, std_data,
                          os.path.join(out_dir, f"metrics_{metric}.png"), n_runs, style_cache,
                          runs_per_lineage, rename)
@@ -516,10 +535,10 @@ def main():
         plot_genuine_pocket_rate(all_tasks, mean_gpr, std_gpr,
                                   os.path.join(out_dir, "metrics_genuine_pocket_rate.png"), n_runs)
 
-    write_csv(lineage_order, all_tasks, mean_data, std_data, n_data, mean_gpr, std_gpr,
+    write_csv(plot_order, all_tasks, mean_data, std_data, n_data, mean_gpr, std_gpr,
               os.path.join(out_dir, "metrics_summary.csv"), rename)
-    display_names = [rename.get(n, n) for n in lineage_order]
-    print(f"\nParsed {n_runs} log(s), {len(all_tasks)} task(s) total, lineages: {display_names} "
+    display_names = [rename.get(n, n) for n in plot_order]
+    print(f"\nParsed {n_runs} log(s), {len(all_tasks)} task(s) total, lineages plotted: {display_names} "
           f"(n per lineage: {runs_per_lineage}).")
 
 
