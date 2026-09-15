@@ -143,7 +143,15 @@ KNOWN_STYLE = {
 FALLBACK_STYLE = [
     dict(color="#8c8c8c", marker="*"), dict(color="#c94141", marker="h"),
     dict(color="#4d9e4d", marker="8"), dict(color="#b8860b", marker="p"),
-]
+    dict(color="#4682b4", marker="v"), dict(color="#ff8c00", marker="^"),
+    dict(color="#a0522d", marker="<"), dict(color="#708090", marker=">"),
+    dict(color="#8b008b", marker="D"), dict(color="#556b2f", marker="o"),
+    dict(color="#008080", marker="s"), dict(color="#800000", marker="P"),
+    dict(color="#4b0082", marker="X"), dict(color="#d2691e", marker="*"),
+    dict(color="#2f4f4f", marker="h"), dict(color="#b22222", marker="8"),
+]  # 16 distinct combos -- e.g. --split-lineage into 9+ lines (one base
+   # lineage split several ways under --restrict-lineage's sibling flag)
+   # won't repeat a color/marker pair until well past any realistic plot.
 
 
 def _parse_restrict(entries):
