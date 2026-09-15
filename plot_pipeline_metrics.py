@@ -39,11 +39,44 @@ Available metrics:
   --genuine-pocket-rate   task-level (not per-lineage): how much of that
                            task's test set was successfully perturbed
 
+MIXING MULTIPLE PIPELINE FAMILIES IN ONE CALL: since clean/poisoned_baseline
+appear in every pipeline file (madar_pocket_pipeline.py,
+madar_pocket_pipeline_si_agem.py, madar_pocket_pipeline_deduce.py,
+madar_pocket_pipeline_naive_joint.py), passing --logs from several of those
+files at once would otherwise average clean/poisoned_baseline over ALL of
+them combined (e.g. 12 runs) instead of just the one triplet of seeds you
+actually want. Two flags handle this:
+
+  --restrict-lineage LINEAGE=i,j,k   Only aggregate LINEAGE from these
+                                      0-indexed positions in --logs (comma-
+                                      separated). Repeatable, one per
+                                      lineage that needs restricting.
+                                      Lineages with no --restrict-lineage
+                                      entry use every log that contains
+                                      them, as before.
+  --rename OLD=NEW                   Relabel a lineage for display only
+                                      (plot legend, CSV lineage column) --
+                                      does not change which logs/lineage
+                                      names are matched. Repeatable.
+
 Usage:
     python plot_pipeline_metrics.py --logs run1/pipeline_log.txt --task-acc --adv-acc
     python plot_pipeline_metrics.py --logs seed1/pipeline_log.txt seed2/pipeline_log.txt seed3/pipeline_log.txt \
         --out-dir plots/ --mean-acc --pooled-acc --combined-acc
     python plot_pipeline_metrics.py --logs *.txt --all --out-dir plots/
+
+    # 4 pipeline families x 3 seeds each (12 logs, indices 0-2 = madar_pocket_pipeline,
+    # 3-5 = naive_joint, 6-8 = si_agem, 9-11 = deduce). Only take clean/poisoned_baseline
+    # from the first triplet, and rename poisoned_baseline for the legend:
+    python plot_pipeline_metrics.py --logs \\
+        madar_pocket_pipeline/seed0/pipeline_log.txt madar_pocket_pipeline/seed1/pipeline_log.txt \\
+        madar_pocket_pipeline/seed2/pipeline_log.txt \\
+        naive_joint/seed0/pipeline_log.txt naive_joint/seed1/pipeline_log.txt naive_joint/seed2/pipeline_log.txt \\
+        si_agem/seed0/pipeline_log.txt si_agem/seed1/pipeline_log.txt si_agem/seed2/pipeline_log.txt \\
+        deduce/seed0/pipeline_log.txt deduce/seed1/pipeline_log.txt deduce/seed2/pipeline_log.txt \\
+        --restrict-lineage clean=0,1,2 --restrict-lineage poisoned_baseline=0,1,2 \\
+        --rename poisoned_baseline=MADAR \\
+        --mean-acc --pooled-acc --combined-acc --out-dir plots/
 """
 import argparse
 import csv
@@ -74,6 +107,32 @@ FALLBACK_STYLE = [
     dict(color="#8c8c8c", marker="*"), dict(color="#c94141", marker="h"),
     dict(color="#4d9e4d", marker="8"), dict(color="#b8860b", marker="p"),
 ]
+
+
+def _parse_restrict(entries):
+    """['clean=0,1,2', 'poisoned_baseline=0,1,2'] -> {'clean': {0,1,2}, ...}"""
+    restrict = {}
+    for entry in entries:
+        if "=" not in entry:
+            raise ValueError(f"--restrict-lineage must be LINEAGE=i,j,k, got {entry!r}")
+        name, idx_str = entry.split("=", 1)
+        try:
+            idxs = {int(x) for x in idx_str.split(",") if x.strip()}
+        except ValueError:
+            raise ValueError(f"--restrict-lineage indices must be integers, got {entry!r}")
+        restrict[name] = idxs
+    return restrict
+
+
+def _parse_rename(entries):
+    """['poisoned_baseline=MADAR'] -> {'poisoned_baseline': 'MADAR'}"""
+    rename = {}
+    for entry in entries:
+        if "=" not in entry:
+            raise ValueError(f"--rename must be OLD=NEW, got {entry!r}")
+        old, new = entry.split("=", 1)
+        rename[old] = new
+    return rename
 
 
 def style_for(name, style_cache):
@@ -276,6 +335,13 @@ def aggregate(runs):
     mean_data = {n: {m: {} for m in METRIC_KEYS} for n in lineage_order}
     std_data = {n: {m: {} for m in METRIC_KEYS} for n in lineage_order}
     n_data = {n: {m: {} for m in METRIC_KEYS} for n in lineage_order}
+    # How many of the input runs actually contributed to each lineage --
+    # tracked separately from n_data's per-(metric,task) counts because a
+    # restricted lineage (see --restrict-lineage) has the SAME denominator
+    # across every metric/task, and callers that just want "was this
+    # lineage restricted" (for legend/title text) shouldn't have to pick an
+    # arbitrary metric/task to read it off of.
+    runs_per_lineage = {n: sum(1 for _, data, _, _, _ in runs if n in data) for n in lineage_order}
 
     for name in lineage_order:
         for metric in METRIC_KEYS:
@@ -295,24 +361,31 @@ def aggregate(runs):
     mean_gpr = {t: float(np.mean(v)) for t, v in gpr_vals_by_task.items()}
     std_gpr = {t: float(np.std(v, ddof=1)) if len(v) > 1 else 0.0 for t, v in gpr_vals_by_task.items()}
 
-    return all_tasks, mean_data, std_data, n_data, mean_gpr, std_gpr, lineage_order, fix_names
+    return all_tasks, mean_data, std_data, n_data, mean_gpr, std_gpr, lineage_order, fix_names, runs_per_lineage
 
 
 def _series(d, tasks):
     return np.array([d.get(t, np.nan) for t in tasks], dtype=float)
 
 
-def plot_one_metric(metric_key, lineages, tasks, mean_data, std_data, out_path, n_runs, style_cache):
+def plot_one_metric(metric_key, lineages, tasks, mean_data, std_data, out_path, n_runs_total,
+                    style_cache, runs_per_lineage, rename):
     title = METRIC_TITLES[metric_key]
     fig, ax = plt.subplots(figsize=(8, 5.5))
     for name in lineages:
         y = _series(mean_data[name][metric_key], tasks)
         e = _series(std_data[name][metric_key], tasks)
         style = style_for(name, style_cache)
-        ax.plot(tasks, y, label=name, color=style["color"], marker=style["marker"], linewidth=2, markersize=7)
-        if n_runs > 1:
+        n_this = runs_per_lineage.get(name, n_runs_total)
+        disp = rename.get(name, name)
+        # Only append "(n=k)" when this lineage's run count differs from the
+        # total logs passed in -- i.e. it was actually restricted -- so an
+        # unrestricted call's legend looks exactly as it did before.
+        label = f"{disp} (n={n_this})" if n_this != n_runs_total else disp
+        ax.plot(tasks, y, label=label, color=style["color"], marker=style["marker"], linewidth=2, markersize=7)
+        if n_this > 1:
             ax.fill_between(tasks, y - e, y + e, color=style["color"], alpha=0.15, linewidth=0)
-    ax.set_title(title + (f"  (mean ± std, n={n_runs} runs)" if n_runs > 1 else ""), fontsize=11)
+    ax.set_title(title + (f"  (mean ± std across seeds)" if n_runs_total > 1 else ""), fontsize=11)
     ax.set_xlabel("task")
     ax.set_xticks(tasks)
     ax.grid(True, alpha=0.25)
@@ -341,7 +414,7 @@ def plot_genuine_pocket_rate(tasks, mean_gpr, std_gpr, out_path, n_runs):
     print(f"Wrote {out_path}")
 
 
-def write_csv(lineages, tasks, mean_data, std_data, n_data, mean_gpr, std_gpr, csv_path):
+def write_csv(lineages, tasks, mean_data, std_data, n_data, mean_gpr, std_gpr, csv_path, rename):
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["task", "lineage", "metric", "mean", "std", "n_runs"])
@@ -349,7 +422,7 @@ def write_csv(lineages, tasks, mean_data, std_data, n_data, mean_gpr, std_gpr, c
             for name in lineages:
                 for metric in METRIC_KEYS:
                     if t in mean_data[name][metric]:
-                        w.writerow([t, name, metric, mean_data[name][metric][t],
+                        w.writerow([t, rename.get(name, name), metric, mean_data[name][metric][t],
                                     std_data[name][metric][t], n_data[name][metric][t]])
             if t in mean_gpr:
                 w.writerow([t, "(pipeline)", "genuine_pocket_rate", mean_gpr[t], std_gpr[t], ""])
@@ -364,7 +437,22 @@ def main():
                  "malicious-recall", "benign-recall", "still-evades", "genuine-pocket-rate"]:
         ap.add_argument(f"--{flag}", action="store_true")
     ap.add_argument("--all", action="store_true", help="Plot every metric (each still gets its own file)")
+    ap.add_argument("--restrict-lineage", action="append", default=[], metavar="LINEAGE=i,j,k",
+                     help="Only aggregate LINEAGE from these 0-indexed positions in --logs "
+                          "(comma-separated). Repeatable. See the module docstring for why this "
+                          "matters when mixing several pipeline families' logs in one call.")
+    ap.add_argument("--rename", action="append", default=[], metavar="OLD=NEW",
+                     help="Relabel a lineage for display only (plot legend, CSV lineage column). "
+                          "Repeatable.")
     args = ap.parse_args()
+
+    restrict = _parse_restrict(args.restrict_lineage)
+    rename = _parse_rename(args.rename)
+    for name, idxs in restrict.items():
+        bad = {i for i in idxs if i < 0 or i >= len(args.logs)}
+        if bad:
+            ap.error(f"--restrict-lineage {name}=... has out-of-range index(es) {sorted(bad)} "
+                      f"for {len(args.logs)} --logs entries")
 
     flag_map = {
         "task_acc": args.task_acc, "adv_acc": args.adv_acc, "combined_acc": args.combined_acc,
@@ -386,21 +474,32 @@ def main():
         )
 
     runs = []
-    for path in args.logs:
+    for i, path in enumerate(args.logs):
         with open(path) as f:
             log_text = f.read()
         tasks, data, gpr, order, fix_names = parse_log(log_text)
         if not tasks:
             raise ValueError(f"No '=== Task N ===' sections found in {path} -- is this a pipeline_log.txt?")
+        # --restrict-lineage: drop any restricted lineage's data from this run
+        # unless this run's index is in its allowed set, so aggregate() (which
+        # already only averages over runs where "name in data") naturally
+        # skips it here without any change to aggregate() itself.
+        dropped = [name for name, idxs in restrict.items() if name in data and i not in idxs]
+        for name in dropped:
+            del data[name]
+            order = [n for n in order if n != name]
+            fix_names = fix_names - {name}
         runs.append((tasks, data, gpr, order, fix_names))
-        print(f"{path}: detected lineages {order}")
+        print(f"{path}: detected lineages {order}" + (f" (dropped by --restrict-lineage: {dropped})"
+                                                        if dropped else ""))
 
     task_counts = {len(tasks) for tasks, *_ in runs}
     if len(task_counts) > 1:
         print(f"WARNING: input logs have different numbers of tasks ({sorted(task_counts)}) -- "
               f"aggregating per-task over however many logs actually reach that task.\n")
 
-    all_tasks, mean_data, std_data, n_data, mean_gpr, std_gpr, lineage_order, fix_names = aggregate(runs)
+    all_tasks, mean_data, std_data, n_data, mean_gpr, std_gpr, lineage_order, fix_names, runs_per_lineage = \
+        aggregate(runs)
     n_runs = len(runs)
     fix_order = [n for n in lineage_order if n in fix_names]
 
@@ -411,14 +510,17 @@ def main():
     for metric in selected_metrics:
         lineages = fix_order if metric == "still_evades_pct" else lineage_order
         plot_one_metric(metric, lineages, all_tasks, mean_data, std_data,
-                         os.path.join(out_dir, f"metrics_{metric}.png"), n_runs, style_cache)
+                         os.path.join(out_dir, f"metrics_{metric}.png"), n_runs, style_cache,
+                         runs_per_lineage, rename)
     if want_gpr:
         plot_genuine_pocket_rate(all_tasks, mean_gpr, std_gpr,
                                   os.path.join(out_dir, "metrics_genuine_pocket_rate.png"), n_runs)
 
     write_csv(lineage_order, all_tasks, mean_data, std_data, n_data, mean_gpr, std_gpr,
-              os.path.join(out_dir, "metrics_summary.csv"))
-    print(f"\nParsed {n_runs} log(s), {len(all_tasks)} task(s) total, lineages: {lineage_order}.")
+              os.path.join(out_dir, "metrics_summary.csv"), rename)
+    display_names = [rename.get(n, n) for n in lineage_order]
+    print(f"\nParsed {n_runs} log(s), {len(all_tasks)} task(s) total, lineages: {display_names} "
+          f"(n per lineage: {runs_per_lineage}).")
 
 
 if __name__ == "__main__":
