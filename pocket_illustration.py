@@ -80,7 +80,7 @@ def _log_mvn_pdf(X, mean, cov):
     return -0.5 * (2 * np.log(2 * np.pi) + logdet + quad)
 
 
-def generate_data(seed=0, n_train=120, n_test=40, n_poison=8):
+def generate_data(seed=0, n_train=120, n_test=40, n_poison=20):
     rng = np.random.default_rng(seed)
     # Overlapping, DIFFERENTLY-SHAPED Gaussians (not just closer means) --
     # the two classes' covariances are rotated at different angles with
@@ -285,7 +285,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--n-train", type=int, default=120)
     ap.add_argument("--n-test", type=int, default=40)
-    ap.add_argument("--n-poison", type=int, default=8)
+    ap.add_argument("--n-poison", type=int, default=20,
+                     help="Perturbed samples PER CLASS, for both train (creates the pockets) "
+                          "and test (exploits them) -- 20 means 40 poisoned train + 40 "
+                          "adversarial test points total, split evenly across benign/malicious.")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
