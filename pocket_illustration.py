@@ -66,21 +66,46 @@ XLIM, YLIM = (-6, 6), (-4, 4)
 # ---------------------------------------------------------------------------
 # Data generation
 # ---------------------------------------------------------------------------
+def _rotated_cov(angle_deg, var1, var2):
+    theta = np.radians(angle_deg)
+    R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+    return R @ np.diag([var1, var2]) @ R.T
+
+
+def _log_mvn_pdf(X, mean, cov):
+    diff = X - mean
+    inv = np.linalg.inv(cov)
+    quad = np.einsum("ij,jk,ik->i", diff, inv, diff)
+    _sign, logdet = np.linalg.slogdet(cov)
+    return -0.5 * (2 * np.log(2 * np.pi) + logdet + quad)
+
+
 def generate_data(seed=0, n_train=120, n_test=40, n_poison=8):
     rng = np.random.default_rng(seed)
-    centers = {BENIGN: np.array([-2.5, 0.0]), MALICIOUS: np.array([2.5, 0.0])}
+    # Overlapping, DIFFERENTLY-SHAPED Gaussians (not just closer means) --
+    # the two classes' covariances are rotated at different angles with
+    # different aspect ratios, so their log-likelihood-ratio boundary is a
+    # genuine curve (a conic section), not a tilted straight line. Two same-
+    # shaped Gaussians would still give a straight bisector no matter how
+    # much they overlap; the SHAPE mismatch is what bends it.
+    centers = {BENIGN: np.array([-1.8, 0.0]), MALICIOUS: np.array([1.8, 0.3])}
+    covs = {
+        BENIGN: _rotated_cov(35, 1.9, 0.5),
+        MALICIOUS: _rotated_cov(-35, 0.6, 1.7),
+    }
 
     def draw(label, n):
-        return rng.normal(loc=centers[label], scale=[1.1, 1.0], size=(n, 2))
+        return rng.multivariate_normal(centers[label], covs[label], size=n)
 
     X_train = {c: draw(c, n_train) for c in (BENIGN, MALICIOUS)}
     X_test_clean = {c: draw(c, n_test) for c in (BENIGN, MALICIOUS)}
 
-    # C1: a clean linear boundary, decision(x,y) = x (>0 -> malicious side).
-    c1 = dict(w=np.array([1.0, 0.0]), b=0.0)
-
+    # C1: the log-likelihood-ratio between the two class Gaussians -- its
+    # zero-crossing is a curved (quadratic) boundary, entirely determined by
+    # how the two overlapping, differently-shaped blobs above are defined.
     def decision_c1(X):
-        return X @ c1["w"] + c1["b"]
+        return (_log_mvn_pdf(X, centers[MALICIOUS], covs[MALICIOUS])
+                - _log_mvn_pdf(X, centers[BENIGN], covs[BENIGN]))
 
     # --- craft_boundary_pocket_poison equivalent: near-boundary points of
     # each class, shifted toward the OPPOSITE class's centroid, true label
@@ -144,12 +169,11 @@ def generate_data(seed=0, n_train=120, n_test=40, n_poison=8):
             out = out + sign * amp * np.exp(-((X - center) ** 2).sum(axis=1) / (2 * sigma ** 2))
         return out
 
-    # --- C3: bumps attenuated (not zeroed) + a small global drift, so the
-    # boundary is close to but not identical to C1.
-    c3_global = dict(w=np.array([0.92, 0.12]), b=0.15)
-
+    # --- C3: C1's SAME curved base, plus the same bumps heavily attenuated
+    # (not zeroed) -- close to C1 but not pixel-identical, per "unlearning
+    # reduces the vulnerability, it doesn't guarantee an exact reversal."
     def decision_c3(X):
-        out = X @ c3_global["w"] + c3_global["b"]
+        out = decision_c1(X)
         for center, sign, amp, sigma in bumps:
             out = out + sign * (0.12 * amp) * np.exp(-((X - center) ** 2).sum(axis=1) / (2 * sigma ** 2))
         return out
@@ -170,7 +194,7 @@ def _shade_and_boundary(ax, decision_fn, resolution=300):
     zz = decision_fn(grid).reshape(xx.shape)
     ax.contourf(xx, yy, zz, levels=[-1e9, 0, 1e9],
                colors=[COLOR[BENIGN], COLOR[MALICIOUS]], alpha=0.12)
-    ax.contour(xx, yy, zz, levels=[0], colors="#333333", linewidths=2.2)
+    ax.contour(xx, yy, zz, levels=[0], colors="#333333", linewidths=2.2, linestyles="dashed")
 
 
 def _scatter(ax, X, label, marker="o", size=26, edgecolor="none", lw=0, alpha=1.0, name=None):
