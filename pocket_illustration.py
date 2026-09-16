@@ -54,7 +54,6 @@ import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Ellipse
 import numpy as np
 
 BENIGN, MALICIOUS = 0, 1
@@ -88,10 +87,10 @@ def generate_data(seed=0, n_train=120, n_test=40, n_poison=20):
     # genuine curve (a conic section), not a tilted straight line. Two same-
     # shaped Gaussians would still give a straight bisector no matter how
     # much they overlap; the SHAPE mismatch is what bends it.
-    centers = {BENIGN: np.array([-1.8, 0.0]), MALICIOUS: np.array([1.8, 0.3])}
+    centers = {BENIGN: np.array([-1.15, 0.0]), MALICIOUS: np.array([1.15, 0.25])}
     covs = {
-        BENIGN: _rotated_cov(35, 1.9, 0.5),
-        MALICIOUS: _rotated_cov(-35, 0.6, 1.7),
+        BENIGN: _rotated_cov(35, 2.1, 0.6),
+        MALICIOUS: _rotated_cov(-35, 0.7, 1.9),
     }
 
     def draw(label, n):
@@ -145,37 +144,49 @@ def generate_data(seed=0, n_train=120, n_test=40, n_poison=20):
         nearest = targets[np.argmin(d2, axis=1)]
         X_adv_test[c] = fresh + 0.9 * (nearest - fresh) + rng.normal(scale=0.1, size=fresh.shape)
 
-    # --- C2: C1 plus one Gaussian bump per TRAIN poison point, pulling the
-    # local decision value toward that point's TRUE label. Amplitude is
-    # ADAPTIVE per point (not a fixed constant): a point that landed far
-    # from the boundary after its shift needs a proportionally bigger bump
-    # to actually flip the local sign there, or its "pocket" would be a
-    # no-op that still misclassifies its own poisoned training point --
-    # not what a real classifier does (it always fits the training point
-    # given enough capacity/epochs, which is the whole reason a pocket
-    # forms at all).
+    # --- Global task drift: ordinary continual-learning drift, independent
+    # of the poisoning-induced local bumps below. Adapting to a new task's
+    # data shifts the WHOLE boundary a bit even without any poisoning at
+    # all; unlearning reverts most, not all, of that shift. Implemented as
+    # a coordinate shift applied to C1 itself, so the curve's SHAPE carries
+    # over exactly, just recentered.
+    drift = np.array([0.55, -0.45])
+    drift_retained_after_unlearning = 0.15
+
+    def decision_at_drift(X, drift_vec):
+        return decision_c1(X - drift_vec)
+
+    # --- C2: C1 shifted by the FULL drift, plus one Gaussian bump per TRAIN
+    # poison point pulling the local decision value toward that point's
+    # TRUE label. Amplitude is ADAPTIVE per point (not a fixed constant): a
+    # point that landed far from the (drifted) boundary needs a
+    # proportionally bigger bump to actually flip the local sign there, or
+    # its "pocket" would be a no-op that still misclassifies its own
+    # poisoned training point -- not what a real classifier does (it always
+    # fits the training point given enough capacity/epochs, which is the
+    # whole reason a pocket forms at all).
     target_margin = 2.2
     bumps = []  # (center, sign, amplitude, sigma)
     for c in (BENIGN, MALICIOUS):
         sign = -1.0 if c == BENIGN else 1.0
         for p in X_poison_train[c]:
-            base_val = float(decision_c1(p[None, :])[0])
+            base_val = float(decision_at_drift(p[None, :], drift)[0])
             amp = max(1.0, target_margin - sign * base_val)
             bumps.append((p, sign, amp, 0.55))
 
     def decision_c2(X):
-        out = decision_c1(X)
+        out = decision_at_drift(X, drift)
         for center, sign, amp, sigma in bumps:
             out = out + sign * amp * np.exp(-((X - center) ** 2).sum(axis=1) / (2 * sigma ** 2))
         return out
 
-    # --- C3: C1's SAME curved base, plus the same bumps heavily attenuated
-    # (not zeroed) -- close to C1 but not pixel-identical, per "unlearning
-    # reduces the vulnerability, it doesn't guarantee an exact reversal."
+    # --- C3: the drift mostly retracted (not fully -- unlearning reduces
+    # the vulnerability, it doesn't guarantee an exact reversal) plus the
+    # same bumps heavily attenuated.
     def decision_c3(X):
-        out = decision_c1(X)
+        out = decision_at_drift(X, drift_retained_after_unlearning * drift)
         for center, sign, amp, sigma in bumps:
-            out = out + sign * (0.12 * amp) * np.exp(-((X - center) ** 2).sum(axis=1) / (2 * sigma ** 2))
+            out = out + sign * (0.08 * amp) * np.exp(-((X - center) ** 2).sum(axis=1) / (2 * sigma ** 2))
         return out
 
     return dict(
@@ -201,12 +212,6 @@ def _scatter(ax, X, label, marker="o", size=26, edgecolor="none", lw=0, alpha=1.
     ax.scatter(X[:, 0], X[:, 1], s=size, c=COLOR[label], marker=marker,
               edgecolors=edgecolor, linewidths=lw, alpha=alpha,
               label=name, zorder=3)
-
-
-def _highlight_pockets(ax, bumps):
-    for center, _sign, _amp, sigma in bumps:
-        ax.add_patch(Ellipse(center, width=4 * sigma, height=4 * sigma, fill=False,
-                             linestyle="--", edgecolor="#555555", linewidth=1.3, zorder=4))
 
 
 def _finish(ax, title):
@@ -238,7 +243,6 @@ def plot_adaptation(data, out_path):
         _scatter(ax, data["X_train"][c], c, alpha=0.5, name=f"{NAME[c]} (clean train)")
         _scatter(ax, data["X_poison_train"][c], c, marker="D", size=70,
                 edgecolor="black", lw=1.1, name=f"{NAME[c]} (poisoned train, true label kept)")
-    _highlight_pockets(ax, data["bumps"])
     ax.annotate("pocket", xy=data["bumps"][0][0], xytext=(0, 2.6),
                textcoords="data", fontsize=10, color="#333333",
                arrowprops=dict(arrowstyle="->", color="#333333"))
@@ -271,7 +275,6 @@ def _plot_eval(data, decision_fn, out_path, title, show_correctness):
             ax.scatter(X_adv[:, 0], X_adv[:, 1], s=90, c=COLOR[c], marker="*",
                       edgecolors="black", linewidths=1.0, zorder=5,
                       label=f"{NAME[c]} (adversarial test)")
-    _highlight_pockets(ax, data["bumps"])
     _finish(ax, title)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
