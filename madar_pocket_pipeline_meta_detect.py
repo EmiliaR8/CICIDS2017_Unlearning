@@ -1,0 +1,751 @@
+"""
+madar_pocket_pipeline_meta_detect.py
+
+Same poisoning, test-time attack, unlearning mechanics (dropped_rows /
+amnesiac / opposite_class), buffers, and lineage set as
+madar_pocket_pipeline.py -- imported directly from it below, not
+reimplemented. The ONLY thing that changes is HOW `detected_poison_idx` is
+produced each task: instead of one xgboost/logistic classifier trained on a
+balanced oracle-labeled batch (`run_detector`), this uses a Reptile
+meta-learned detector, ported from task8_pipeline-Copy1-withmeta.ipynb's
+"META-LEARNED POISON DETECTOR (checkpoint1 only, episodic Reptile)" cell --
+the notebook's own comment marks this "THE CORRECT IMPLEMENTATION", as
+opposed to an earlier cell in the same notebook explicitly marked "BAD" for
+training across two separate checkpoints using every oracle label at once;
+that earlier cell is not ported.
+
+SAME FIVE lineages as madar_pocket_pipeline.py: clean, poisoned_baseline,
+dropped_rows, amnesiac, opposite_class -- `apply_dropped_rows`/
+`apply_amnesiac`/`apply_opposite_class` are reused UNCHANGED from `base`,
+so a fix's mechanism is byte-identical between the two files; only the
+index array it's handed differs. Because the lineage set and log section
+shapes are identical to madar_pocket_pipeline.py, the existing analysis
+scripts (plot_pipeline_metrics.py / summarize_pipeline_runs.py /
+build_latex_tables.py) need no changes to read this file's logs -- but if
+you want to compare THIS file's dropped_rows/amnesiac/opposite_class
+against the SAME-NAMED lineages in a madar_pocket_pipeline.py run on one
+plot, you'll need --split-lineage/--rename (see plot_pipeline_metrics.py's
+docstring) to tell the two apart, since the names collide by design.
+
+THE META-DETECTOR ITSELF, faithful to the notebook's scope (deliberately,
+per design discussion -- not an oversight):
+
+  * SINGLE-TASK episodic Reptile: every outer episode is drawn from THIS
+    task's own poisoned training batch only. There is no cross-task
+    transfer of a meta-learned initialization between tasks, even though
+    this pipeline (unlike the notebook's one-off diagnostic) has 9 poisoned
+    tasks it could in principle learn across. That would be a materially
+    different, more ambitious design (meta-train on tasks 1..t-1, fast-
+    adapt to task t with a small probe) -- deliberately out of scope here,
+    kept for a possible later file.
+
+  * PER-SAMPLE FEATURES (7-dim, computed from `poisoned_baseline`'s adapted
+    model + its own replay buffer, mostly unsupervised): two IsolationForest
+    anomaly scores (raw feature space, and a latent space pulled via a
+    forward hook), per-sample cross-entropy loss / entropy / top-2 softmax
+    margin from the model's own forward pass, a logistic density-ratio
+    score discriminating "replay buffer" from "this task's data", and mean
+    distance to each point's k-nearest same-class neighbors in the replay
+    buffer. The latent-feature hook is GENERALIZED from the notebook's
+    hardcoded `model.fc4_bn` (128-dim) to `model.bns[-1]` (whatever width
+    the last configured --hidden_sizes block has), so this works for any
+    architecture depth, matching the same generalization pattern already
+    used for DEDUCE's GUM.
+
+  * REPTILE META-TRAINING budget matches the notebook exactly: 8 outer
+    episodes x 3 inner steps x 10 samples/step (5 poisoned + 5 clean per
+    step, drawn from the ORACLE poison index -- same as the existing
+    detector's own oracle-labeled training set, just consumed as small
+    episodic draws instead of one flat balanced batch). This is NOT a
+    smaller labeled budget than the existing detector's ~240-label
+    convention -- the notebook's own real run touched 236 unique points,
+    essentially the same order -- it is simply spent differently. Pass
+    --meta_outer_episodes/--meta_inner_steps/--meta_samples_per_step to
+    make it smaller if you want that comparison instead.
+
+  * HELD-OUT EVALUATION: every point NOT touched by any episode is scored
+    by the final meta-parameters with no further fitting -- a genuine
+    few-shot generalization test within the task, not a train/test split
+    of a bigger labeled set.
+
+A note on optimizers: as in every other lineage in this project's
+pipelines, dropped_rows/amnesiac/opposite_class/poisoned_baseline/clean all
+train via AdaptableClassifier's Adam optimizer -- unaffected by any of this,
+since the meta-detector only decides WHICH indices those fixes are handed.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import os
+import time
+
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.decomposition import PCA
+from sklearn.ensemble import IsolationForest
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
+
+import madar_pocket_pipeline as base
+
+LINEAGE_NAMES = ["clean", "poisoned_baseline", "dropped_rows", "amnesiac", "opposite_class"]
+FIX_NAMES = ["dropped_rows", "amnesiac", "opposite_class"]
+
+
+# ---------------------------------------------------------------------------
+# Reptile meta-detector -- ported from task8_pipeline-Copy1-withmeta.ipynb's
+# "META-LEARNED POISON DETECTOR (checkpoint1 only, episodic Reptile)" cell.
+# ---------------------------------------------------------------------------
+def get_latent_features(model, X, batch_size=512):
+    """Runs X through `model` and returns the last hidden block's activation
+    (post-BN, pre-ReLU captured via a forward hook, ReLU applied manually --
+    matches the real forward pass exactly). Hooks model.bns[-1] rather than
+    a hardcoded layer name, so this works for any --hidden_sizes depth."""
+    model.eval()
+    captured = {}
+
+    def _hook(_module, _inp, out):
+        captured["z"] = out.detach()
+
+    handle = model.bns[-1].register_forward_hook(_hook)
+    latents = []
+    with torch.no_grad():
+        Xt = torch.as_tensor(np.asarray(X), dtype=torch.float32)
+        for i in range(0, len(Xt), batch_size):
+            _ = model(Xt[i:i + batch_size])
+            latents.append(torch.relu(captured["z"]).numpy())
+    handle.remove()
+    return np.concatenate(latents, axis=0)
+
+
+def replay_knn_distance(X, y, replay_X_np, replay_y_np, k=5):
+    """Mean distance (raw feature space) from each point to its k nearest
+    same-class neighbors in the replay buffer -- poisoned points, shifted
+    toward the opposite class, should sit unusually far from their own
+    class's established prior-task samples."""
+    dist = np.full(len(X), np.nan)
+    for c in np.unique(y):
+        mask = y == c
+        replay_mask = replay_y_np == c
+        if replay_mask.sum() == 0:
+            continue
+        kk = min(k, replay_mask.sum())
+        nn_ = NearestNeighbors(n_neighbors=kk).fit(replay_X_np[replay_mask])
+        d, _ = nn_.kneighbors(X[mask])
+        dist[mask] = d.mean(axis=1)
+    return dist
+
+
+def fit_density_ratio_model(X_current, replay_X_np):
+    """Discriminator separating replay-buffer ('old distribution', label 0)
+    from the current task's points ('new', label 1). p/(1-p) is the density
+    ratio: values >> 1 mean a point looks much more like the current task
+    than like anything in the established prior-task distribution."""
+    Xd = np.vstack([replay_X_np, X_current])
+    yd = np.concatenate([np.zeros(len(replay_X_np)), np.ones(len(X_current))])
+    return LogisticRegression(max_iter=1000, class_weight="balanced", random_state=0).fit(Xd, yd)
+
+
+def density_ratio_score(clf, X):
+    p = np.clip(clf.predict_proba(X)[:, 1], 1e-6, 1 - 1e-6)
+    return p / (1 - p)
+
+
+def extract_meta_features(adaptable_model, X, y, replay_X_np, replay_y_np, k=5):
+    """Builds the 7-dim per-sample feature table, fitting fresh
+    IsolationForests + density-ratio discriminator on this task's own
+    unlabeled data + replay buffer (no oracle labels used in this step)."""
+    net = adaptable_model.model
+    net.eval()
+    Xt = torch.as_tensor(np.asarray(X), dtype=torch.float32)
+    yt = torch.as_tensor(np.asarray(y), dtype=torch.long)
+
+    latent = get_latent_features(net, X)
+
+    iso_raw = IsolationForest(n_estimators=200, contamination="auto", random_state=0).fit(X)
+    iso_latent = IsolationForest(n_estimators=200, contamination="auto", random_state=0).fit(latent)
+    density_clf = fit_density_ratio_model(X, replay_X_np)
+    iso_raw_score = -iso_raw.score_samples(X)
+    iso_latent_score = -iso_latent.score_samples(latent)
+    density_ratio = density_ratio_score(density_clf, X)
+
+    with torch.no_grad():
+        logits = net(Xt)
+        proba = torch.softmax(logits, dim=1)
+        per_sample_loss = nn.functional.cross_entropy(logits, yt, reduction="none").numpy()
+        p = proba.numpy()
+        eps_ = 1e-12
+        entropy = -(p * np.log(p + eps_)).sum(axis=1)
+        sorted_p = np.sort(p, axis=1)
+        top2_margin = sorted_p[:, -1] - sorted_p[:, -2]
+
+    dist_to_replay = replay_knn_distance(X, y, replay_X_np, replay_y_np, k=k)
+
+    return np.column_stack([
+        iso_raw_score, iso_latent_score, per_sample_loss, entropy, top2_margin,
+        density_ratio, dist_to_replay,
+    ])
+
+
+def _sigmoid(z):
+    return 1 / (1 + np.exp(-np.clip(z, -30, 30)))
+
+
+def _bce_grad(w, b, X, y):
+    z = X @ w + b
+    p = _sigmoid(z)
+    grad_z = (p - y) / len(y)
+    grad_w = X.T @ grad_z
+    grad_b = grad_z.sum()
+    return grad_w, grad_b
+
+
+def run_meta_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
+                      replay_X_np, replay_y_np, seed, n_outer_episodes, n_inner_steps,
+                      samples_per_step, inner_lr, meta_lr, knn_k):
+    """Faithful port of the notebook's single-task episodic Reptile detector
+    -- every outer episode is drawn from THIS task's own poison pool only
+    (see the module docstring for why that's a deliberate scope choice)."""
+    poison_idx = np.concatenate([idx_poison_ben, idx_poison_mal])
+    feats = extract_meta_features(poisoned_baseline, X_train_poisoned, y_train,
+                                  replay_X_np, replay_y_np, k=knn_k)
+    is_poisoned = np.zeros(len(y_train), dtype=int)
+    is_poisoned[poison_idx] = 1
+
+    feats_std = StandardScaler().fit_transform(feats)
+
+    poison_pool = poison_idx
+    clean_pool = np.setdiff1d(np.arange(len(y_train)), poison_idx)
+
+    rng = np.random.default_rng(seed)
+    w_meta = np.zeros(feats_std.shape[1])
+    b_meta = 0.0
+    touched = set()
+    n_pos = samples_per_step // 2
+    n_neg = samples_per_step - n_pos
+
+    for _ in range(n_outer_episodes):
+        w, b = w_meta.copy(), b_meta
+        for _ in range(n_inner_steps):
+            idx_p = rng.choice(poison_pool, min(n_pos, len(poison_pool)), replace=False)
+            idx_c = rng.choice(clean_pool, min(n_neg, len(clean_pool)), replace=False)
+            touched.update(idx_p.tolist())
+            touched.update(idx_c.tolist())
+            Xb = np.vstack([feats_std[idx_p], feats_std[idx_c]])
+            yb = np.concatenate([np.ones(len(idx_p)), np.zeros(len(idx_c))])
+            gw, gb = _bce_grad(w, b, Xb, yb)
+            w = w - inner_lr * gw
+            b = b - inner_lr * gb
+        w_meta = w_meta + meta_lr * (w - w_meta)
+        b_meta = b_meta + meta_lr * (b - b_meta)
+
+    query_mask = np.ones(len(is_poisoned), dtype=bool)
+    query_mask[list(touched)] = False
+    Xq, yq = feats_std[query_mask], is_poisoned[query_mask]
+    scores = _sigmoid(Xq @ w_meta + b_meta)
+    preds = (scores > 0.5).astype(int)
+
+    if len(np.unique(yq)) > 1:
+        prec, rec, f1, _ = precision_recall_fscore_support(yq, preds, average="binary", zero_division=0)
+        auc = roc_auc_score(yq, scores)
+    else:
+        prec = rec = f1 = auc = float("nan")
+
+    meta_detected_poison_idx = np.where(query_mask)[0][preds == 1]
+
+    metrics = {
+        "detector_type": "reptile_meta (single-task episodic)",
+        "n_outer_episodes": n_outer_episodes, "n_inner_steps": n_inner_steps,
+        "samples_per_step": samples_per_step,
+        "nominal_budget": n_outer_episodes * n_inner_steps * samples_per_step,
+        "n_touched": len(touched), "n_query": int(query_mask.sum()),
+        "held_out_precision": float(prec), "held_out_recall": float(rec),
+        "held_out_f1": float(f1), "held_out_auc": float(auc),
+        "n_detected": len(meta_detected_poison_idx), "n_oracle": len(poison_idx),
+    }
+    return meta_detected_poison_idx, metrics
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    start_time = time.perf_counter()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--log_name", type=str, default="madar_pocket_meta_detect_run")
+    ap.add_argument("--h5-path", type=str, default=base.H5_DATASET_PATH)
+    ap.add_argument("--poison_fraction", type=float, default=base.POISON_FRACTION)
+    ap.add_argument("--hidden_sizes", type=str,
+                     default=",".join(str(h) for h in base.DEFAULT_HIDDEN_SIZES),
+                     help="Comma-separated hidden-layer widths for ClassifierNN. "
+                          "Same meaning/default as in madar_pocket_pipeline.py.")
+    ap.add_argument("--per_feature_epsilon", type=float, default=None,
+                     help="Same per-feature (L-infinity) attack cap as madar_pocket_pipeline.py. "
+                          "Off by default.")
+    ap.add_argument("--meta_outer_episodes", type=int, default=8,
+                     help="Reptile outer-loop episode count (notebook default: 8).")
+    ap.add_argument("--meta_inner_steps", type=int, default=3,
+                     help="Inner gradient steps per episode (notebook default: 3).")
+    ap.add_argument("--meta_samples_per_step", type=int, default=10,
+                     help="Samples per inner step, split evenly poisoned/clean (notebook default: "
+                          "10 -- 5+5). Total nominal labeled budget = episodes * steps * this value; "
+                          "lower this to test the meta-detector at a genuinely SMALLER labeled "
+                          "budget than the existing oracle detector's ~240-label convention.")
+    ap.add_argument("--meta_inner_lr", type=float, default=0.5, help="Inner-loop learning rate (notebook: 0.5).")
+    ap.add_argument("--meta_lr", type=float, default=0.3, help="Outer (Reptile) learning rate (notebook: 0.3).")
+    ap.add_argument("--meta_knn_k", type=int, default=5,
+                     help="k for the replay-buffer same-class nearest-neighbor distance feature.")
+    ap.add_argument("--no_breakpoint", action="store_true",
+                     help="Disable the interactive breakpoint() pause at the end of tasks "
+                          f">= {base.BREAKPOINT_FROM_TASK}.")
+    args = ap.parse_args()
+    hidden_sizes = tuple(int(h) for h in args.hidden_sizes.split(","))
+
+    base.SEED = args.seed  # update_shared_buffer reads this module-level global
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    poison_fraction = args.poison_fraction
+
+    out_dir = os.path.join(base.RUNS_BASE_DIR, "madar_pocket_meta_detect", args.log_name)
+    os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
+    os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
+    log_path = os.path.join(out_dir, "logs", "pipeline_log.txt")
+    checkpoint_path = os.path.join(out_dir, "logs", "classifier_checkpoint.pt")
+
+    with open(log_path, "w") as f:
+        f.write(
+            "MADAR POCKET-PIPELINE LOG (Reptile meta-learned detector)\n"
+            "==========================================================\n"
+            "5 lineages per task: clean (reference), poisoned_baseline (no fix),\n"
+            "dropped_rows, amnesiac, opposite_class. Same poisoning/attack/unlearning\n"
+            "mechanics as madar_pocket_pipeline.py -- see that file. The ONLY difference\n"
+            "is the detector: a single-task episodic Reptile meta-learner (ported from\n"
+            "task8_pipeline-Copy1-withmeta.ipynb) in place of the oracle-trained\n"
+            "xgboost/logistic classifier.\n"
+            f"Classifier hidden layer sizes: {hidden_sizes}\n"
+            f"Per-feature epsilon cap: {args.per_feature_epsilon}\n"
+            f"Reptile: {args.meta_outer_episodes} episodes x {args.meta_inner_steps} inner steps x "
+            f"{args.meta_samples_per_step} samples/step, inner_lr={args.meta_inner_lr}, "
+            f"meta_lr={args.meta_lr}, knn_k={args.meta_knn_k}\n"
+        )
+
+    print(f"Loading {args.h5_path} and building {base.NUM_TASKS} pooled chronological tasks...")
+    tasks, day_mapping, label_mapping = base.load_pooled_chronological_tasks(args.h5_path, base.TASK_FRACTIONS)
+    benign_label = label_mapping["Benign"]
+    mal_label = 1 - benign_label
+    feature_dim = tasks[0]["features"].shape[1]
+    print(f"day_mapping={day_mapping}, feature_dim={feature_dim}, "
+          f"task sizes={[len(t['labels']) for t in tasks]}")
+
+    task_offsets = np.concatenate([[0], np.cumsum([len(t["labels"]) for t in tasks])[:-1]])
+
+    scaler = None
+    lineages = {}
+    baseline_label_buffers, baseline_replay_buffer = {}, []
+    joint_label_buffers, joint_replay_buffer = {}, []
+    task_test_splits, task_test_gids = {}, {}
+    results = []
+
+    def to_scaled(X_raw):
+        return np.clip(scaler.transform(X_raw.astype(np.float32)), -base.FEATURE_CLIP,
+                       base.FEATURE_CLIP).astype(np.float32)
+
+    for t in range(base.NUM_TASKS):
+        print(f"\n{'#' * 60}\n# TASK {t}\n{'#' * 60}")
+        task = tasks[t]
+        X_raw = np.clip(task["features"].astype(np.float32), 0.0, 1.0)
+        y_all = task["labels"].astype(np.int64)
+        gid_all = task_offsets[t] + np.arange(len(y_all), dtype=np.int64)
+
+        X_train_raw, X_test_raw, y_train, y_test, gid_train, gid_test = train_test_split(
+            X_raw, y_all, gid_all, test_size=base.TASK_TEST_FRAC, random_state=args.seed, stratify=y_all,
+        )
+
+        # -------------------------------------------------------------
+        # Task 0: plain supervised pretraining only, no poisoning yet.
+        # -------------------------------------------------------------
+        if t == 0:
+            scaler = StandardScaler().fit(X_train_raw)
+            X_train_scaled = to_scaled(X_train_raw)
+            X_test_scaled = to_scaled(X_test_raw)
+
+            base_model = base.ClassifierNN(feature_dim, 2, hidden_sizes=hidden_sizes).to(base.DEVICE)
+            Xt = torch.tensor(X_train_scaled, dtype=torch.float32)
+            yt = torch.tensor(y_train, dtype=torch.long)
+            opt0 = torch.optim.Adam(base_model.parameters(), lr=base.TASK0_LR)
+            loss_fn0 = nn.CrossEntropyLoss()
+            base_model.train()
+            n = len(Xt)
+            for _ in range(base.TASK0_EPOCHS):
+                perm = torch.randperm(n)
+                for i in range(0, n, base.TASK0_BATCH_SIZE):
+                    idx = perm[i:i + base.TASK0_BATCH_SIZE]
+                    if len(idx) < 2:
+                        continue
+                    opt0.zero_grad()
+                    loss = loss_fn0(base_model(Xt[idx]), yt[idx])
+                    loss.backward()
+                    opt0.step()
+            base_model.eval()
+
+            for name in LINEAGE_NAMES:
+                lineages[name] = base.AdaptableClassifier(copy.deepcopy(base_model))
+
+            task_acc = {name: lineages[name].score(X_test_scaled, y_test) for name in LINEAGE_NAMES}
+
+            task_test_splits[0] = (X_test_raw, y_test)
+            task_test_gids[0] = gid_test
+
+            category = np.where(y_train == benign_label, "benign", "malicious_clean")
+            baseline_replay_buffer = base.update_shared_buffer(
+                lineages["poisoned_baseline"], baseline_label_buffers, X_train_scaled, y_train,
+                category, gid_train, benign_label, mal_label,
+            )
+            joint_replay_buffer = base.update_shared_buffer(
+                lineages["poisoned_baseline"], joint_label_buffers, X_train_scaled, y_train,
+                category, gid_train, benign_label, mal_label,
+            )
+
+            train_section = (
+                f"malicious: {int((y_train == mal_label).sum())}, benign: {int((y_train == benign_label).sum())}\n"
+                f"malicious_perturbed: 0, benign_perturbed: 0 (task 0 -- no poisoning yet)\n"
+            )
+            test_section = (
+                f"malicious: {int((y_test == mal_label).sum())}, benign: {int((y_test == benign_label).sum())}\n"
+                f"genuine pockets: N/A (task 0 -- no poisoning yet)\n"
+            )
+            adapt_section = "\n".join(f"{name}: task test acc = {task_acc[name]:.3f}" for name in LINEAGE_NAMES)
+            unlearn_section = "N/A -- task 0 has no prior model to poison against."
+
+            base.write_task_log(log_path, t, [
+                ("Training Data information", train_section),
+                ("Testing Data information", test_section),
+                ("Adaptation step", adapt_section),
+                ("Unlearning step", unlearn_section),
+            ])
+
+            results.append({"task": t, "task_acc": task_acc})
+            torch.save({
+                "task_id": t, "seed": args.seed, "feature_dim": feature_dim, "scaler": scaler,
+                "label_mapping": label_mapping,
+                "lineages": {name: lineages[name].model.state_dict() for name in LINEAGE_NAMES},
+                "baseline_label_buffers": baseline_label_buffers, "baseline_replay_buffer": baseline_replay_buffer,
+                "joint_label_buffers": joint_label_buffers, "joint_replay_buffer": joint_replay_buffer,
+                "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
+                "results": results, "poison_fraction": poison_fraction,
+                "hidden_sizes": hidden_sizes, "per_feature_epsilon": args.per_feature_epsilon,
+            }, checkpoint_path)
+            continue
+
+        # -------------------------------------------------------------
+        # Tasks 1..NUM_TASKS-1: poison -> detect (Reptile meta-model) -> unlearn.
+        # -------------------------------------------------------------
+        X_train_scaled = to_scaled(X_train_raw)
+        X_test_scaled = to_scaled(X_test_raw)
+        replay_X, replay_y = base.flatten_replay(joint_replay_buffer)
+        baseline_replay_X, baseline_replay_y = base.flatten_replay(baseline_replay_buffer)
+
+        # Step 2: clean lineage adapts on clean data only.
+        lineages["clean"].adapt(X_train_scaled, y_train, replay_X=replay_X, replay_y=replay_y,
+                                epochs=base.CLEAN_ADAPT_EPOCHS)
+
+        # Step 3: craft this task's poison (shared across all poisoned lineages).
+        X_train_poisoned, idx_poison_ben, idx_poison_mal, _ = base.craft_task_poison(
+            lineages["clean"], X_train_scaled, y_train, benign_label, mal_label, poison_fraction,
+        )
+        poison_idx = np.concatenate([idx_poison_ben, idx_poison_mal])
+
+        # Step 4: poisoned_baseline adapts on poisoned data ("no fix"), using
+        # its OWN separate replay buffer.
+        lineages["poisoned_baseline"].adapt(X_train_poisoned, y_train,
+                                            replay_X=baseline_replay_X, replay_y=baseline_replay_y,
+                                            epochs=base.ADAPT_EPOCHS)
+        acc_on_forced_labels = (
+            lineages["poisoned_baseline"].score(X_train_poisoned[poison_idx], y_train[poison_idx])
+            if len(poison_idx) else float("nan")
+        )
+
+        # Step 5: craft this task's genuine-pocket test attack, ONCE, against
+        # poisoned_baseline (reference = clean).
+        eps_this_task = base.typical_class_gap(X_test_scaled, y_test, benign_label,
+                                               mal_label) * base.ATTACK_EPS_MULTIPLIER
+        X_test_adv, succ_pocket, norms_pocket = base.adversarial_attack_pocket(
+            lineages["poisoned_baseline"], lineages["clean"], X_test_scaled, y_test,
+            epsilon_max=eps_this_task, per_feature_epsilon=args.per_feature_epsilon,
+        )
+
+        # Step 6: spillover check -- re-attack every PRIOR task's test set.
+        historical_adv = {}
+        for s, (Xs_raw, ys) in task_test_splits.items():
+            Xs_scaled = to_scaled(Xs_raw)
+            eps_s = base.typical_class_gap(Xs_scaled, ys, benign_label, mal_label)
+            eps_s = eps_s * base.ATTACK_EPS_MULTIPLIER if eps_s is not None else eps_this_task
+            Xs_adv, succ_s, norms_s = base.adversarial_attack_pocket(
+                lineages["poisoned_baseline"], lineages["clean"], Xs_scaled, ys, epsilon_max=eps_s,
+                per_feature_epsilon=args.per_feature_epsilon,
+            )
+            historical_adv[s] = (Xs_adv, ys, succ_s, eps_s)
+
+        all_clean_sets = {s: (to_scaled(Xs_raw), ys) for s, (Xs_raw, ys) in task_test_splits.items()}
+        all_clean_sets[t] = (X_test_scaled, y_test)
+        all_test_sets_full = dict(all_clean_sets)
+        for s, (Xs_adv, ys, succ_s, eps_s) in historical_adv.items():
+            all_test_sets_full[f"{s}_adversarial"] = (Xs_adv, ys)
+        all_test_sets_full[f"{t}_adversarial"] = (X_test_adv, y_test)
+
+        pocket_info_by_source = {s: (v[2], v[3]) for s, v in historical_adv.items()}
+        pocket_info_by_source[t] = (succ_pocket, eps_this_task)
+
+        # Step 7: Reptile meta-detector, trained from poisoned_baseline's own
+        # (episodic, oracle-few-shot) poison pool + its own replay buffer.
+        meta_detected_poison_idx, det_metrics = run_meta_detector(
+            lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
+            baseline_replay_X, baseline_replay_y, args.seed,
+            args.meta_outer_episodes, args.meta_inner_steps, args.meta_samples_per_step,
+            args.meta_inner_lr, args.meta_lr, args.meta_knn_k,
+        )
+
+        # Step 8: each fix lineage adapts on poisoned data from ITS OWN prior
+        # weights, snapshot pre-unlearning metrics, then applies its own fix
+        # to the SAME meta_detected_poison_idx.
+        pre_unlearn_metrics = {}
+        for name in FIX_NAMES:
+            lineages[name].adapt(X_train_poisoned, y_train, replay_X=replay_X, replay_y=replay_y,
+                                 epochs=base.ADAPT_EPOCHS)
+            pre_task_acc = lineages[name].score(X_test_scaled, y_test)
+            pre_pooled_acc, pre_mean_acc, _ = base.pooled_and_per_task_accuracy(lineages[name], all_test_sets_full)
+            pre_unlearn_metrics[name] = {
+                "task_acc": pre_task_acc, "pooled_acc": pre_pooled_acc, "mean_acc": pre_mean_acc,
+            }
+        base.apply_dropped_rows(lineages["dropped_rows"], X_train_poisoned, y_train, meta_detected_poison_idx,
+                                replay_X, replay_y)
+        base.apply_amnesiac(lineages["amnesiac"], X_train_poisoned, y_train, meta_detected_poison_idx,
+                            replay_X, replay_y, benign_label, mal_label)
+        base.apply_opposite_class(lineages["opposite_class"], X_train_poisoned, y_train, meta_detected_poison_idx,
+                                  replay_X, replay_y, benign_label, mal_label)
+
+        # Step 9: pooled/mean/per-class accuracy across all clean + adversarial
+        # test sets seen so far, for every lineage.
+        pooled_results, mean_results, per_class_reports, per_task_by_lineage = {}, {}, {}, {}
+        for name in LINEAGE_NAMES:
+            pooled_acc, mean_acc, per_task = base.pooled_and_per_task_accuracy(lineages[name], all_test_sets_full)
+            pooled_results[name] = pooled_acc
+            mean_results[name] = mean_acc
+            per_task_by_lineage[name] = per_task
+            per_class_reports[name] = base._fmt_report(lineages[name], X_test_scaled, y_test)
+
+        still_evades = {}
+        for name in FIX_NAMES:
+            pred = lineages[name].predict(X_test_adv)
+            wrong = (pred != y_test)
+            still_evades[name] = float(wrong[succ_pocket].mean()) if succ_pocket.any() else float("nan")
+
+        # Step 10: update both replay buffers -- only now, after every
+        # lineage's adaptation/unlearning for this task is fully done.
+        category_all = np.where(y_train == benign_label, "benign", "malicious_clean").astype(object)
+        category_all[idx_poison_ben] = "benign_perturbed"
+        category_all[idx_poison_mal] = "malicious_perturbed"
+
+        baseline_replay_buffer = base.update_shared_buffer(
+            lineages["poisoned_baseline"], baseline_label_buffers,
+            X_train_poisoned, y_train, category_all, gid_train, benign_label, mal_label,
+        )
+
+        clean_mask = np.ones(len(X_train_poisoned), dtype=bool)
+        clean_mask[meta_detected_poison_idx] = False
+        joint_replay_buffer = base.update_shared_buffer(
+            lineages["poisoned_baseline"], joint_label_buffers,
+            X_train_poisoned[clean_mask], y_train[clean_mask], category_all[clean_mask], gid_train[clean_mask],
+            benign_label, mal_label,
+        )
+
+        task_test_splits[t] = (X_test_raw, y_test)
+        task_test_gids[t] = gid_test
+
+        # ---------------------------------------------------------------
+        # Logging
+        # ---------------------------------------------------------------
+        n_ben_train = int((y_train == benign_label).sum())
+        n_mal_train = int((y_train == mal_label).sum())
+        train_section = (
+            f"malicious: {n_mal_train}, benign: {n_ben_train}\n"
+            f"malicious_perturbed (oracle): {len(idx_poison_mal)}, "
+            f"benign_perturbed (oracle): {len(idx_poison_ben)}\n"
+            f"meta-detector-flagged: {det_metrics['n_detected']} (of {det_metrics['n_query']} held-out points)\n"
+            f"poison_fraction used: {poison_fraction}\n"
+            f"poisoned_baseline accuracy on poisoned points' forced labels: {acc_on_forced_labels:.3f}"
+            f"{'  <-- LOW, poisoning may not have taken hold' if acc_on_forced_labels < 0.7 else ''}\n"
+        )
+
+        n_ben_test = int((y_test == benign_label).sum())
+        n_mal_test = int((y_test == mal_label).sum())
+        succ_ben = int(succ_pocket[y_test == benign_label].sum())
+        succ_mal = int(succ_pocket[y_test == mal_label].sum())
+        test_section = (
+            f"malicious: {n_mal_test}, benign: {n_ben_test}\n"
+            f"genuine pockets found: {int(succ_pocket.sum())}/{len(y_test)} ({base._fmt_pct(succ_pocket.mean())})\n"
+            f"  benign side: {succ_ben}/{n_ben_test}, malicious side: {succ_mal}/{n_mal_test}\n"
+            f"mean perturbation norm among successes: "
+            f"{norms_pocket[succ_pocket].mean() if succ_pocket.any() else float('nan'):.4f}\n"
+            f"epsilon used this task: {eps_this_task:.4f}\n"
+        )
+
+        baseline_dist = base.buffer_distribution(baseline_label_buffers)
+        adapt_lines = [f"{'lineage':<18} {'task acc':>10} {'pooled acc':>12} {'mean acc':>10}"]
+        for name in ["clean", "poisoned_baseline"]:
+            task_acc_name = lineages[name].score(X_test_scaled, y_test)
+            adapt_lines.append(f"{name:<18} {task_acc_name:>10.3f} {pooled_results[name]:>12.3f} "
+                                f"{mean_results[name]:>10.3f}")
+        adapt_lines.append("")
+        adapt_lines.append(f"poisoned_baseline's OWN replay buffer distribution (post-update, this task): "
+                            f"{baseline_dist}")
+        adapt_lines.append("")
+        for name in ["clean", "poisoned_baseline"]:
+            adapt_lines.append(f"[{name}] classification report (this task's clean test):")
+            adapt_lines.append(per_class_reports[name])
+        adapt_section = "\n".join(adapt_lines)
+
+        joint_dist = base.buffer_distribution(joint_label_buffers)
+        unlearn_lines = [
+            f"detector type: {det_metrics['detector_type']}",
+            f"meta-training: {det_metrics['n_outer_episodes']} episodes x {det_metrics['n_inner_steps']} inner "
+            f"steps x {det_metrics['samples_per_step']} samples/step ({det_metrics['nominal_budget']} nominal, "
+            f"{det_metrics['n_touched']} unique touched)",
+            f"held-out (episode-untouched) vs oracle -- precision={det_metrics['held_out_precision']:.3f} "
+            f"recall={det_metrics['held_out_recall']:.3f} f1={det_metrics['held_out_f1']:.3f} "
+            f"auc={det_metrics['held_out_auc']:.3f} (on {det_metrics['n_query']} held-out points)",
+            f"flagged {det_metrics['n_detected']} as poisoned; oracle poisoned this task = "
+            f"{det_metrics['n_oracle']}",
+            f"JOINT replay buffer distribution (dropped_rows/amnesiac/opposite_class share this one; "
+            f"meta-detector-clean only; post-update, this task): {joint_dist}",
+            "",
+            f"{'lineage':<18} {'task acc':>10} {'pooled acc':>12} {'mean acc':>10}",
+        ]
+        unlearn_lines.append("")
+        unlearn_lines.append("Pre-unlearning (poison-adapted, before any fix) accuracy:")
+        unlearn_lines.append(f"{'lineage':<18} {'task acc':>10} {'pooled acc':>12} {'mean acc':>10}")
+        for name in FIX_NAMES:
+            pre = pre_unlearn_metrics[name]
+            unlearn_lines.append(
+                f"{name:<18} {pre['task_acc']:>10.3f} {pre['pooled_acc']:>12.3f} {pre['mean_acc']:>10.3f}"
+            )
+        unlearn_lines.append("")
+        unlearn_lines.append("Post-unlearning accuracy:")
+        unlearn_lines.append(
+            f"{'lineage':<18} {'task acc':>10} {'pooled acc':>12} {'mean acc':>10} "
+            f"{'adv acc':>10} {'still-evades %':>16}"
+        )
+        for name in FIX_NAMES:
+            task_acc_name = lineages[name].score(X_test_scaled, y_test)
+            adv_acc_name = lineages[name].score(X_test_adv, y_test)
+            unlearn_lines.append(
+                f"{name:<18} {task_acc_name:>10.3f} {pooled_results[name]:>12.3f} {mean_results[name]:>10.3f} "
+                f"{adv_acc_name:>10.3f} {still_evades[name] * 100:>15.1f}%"
+            )
+        unlearn_lines.append("")
+        for name in FIX_NAMES:
+            unlearn_lines.append(f"[{name}] classification report (this task's clean test):")
+            unlearn_lines.append(per_class_reports[name])
+        unlearn_section = "\n".join(unlearn_lines)
+
+        breakdown_lines = [
+            "Genuine-pocket rate per source task's adv-test-set, attacked FRESH this task",
+            "(against THIS task's poisoned_baseline/clean -- not the rate recorded when",
+            "that set was first created at its own task):",
+            "",
+            f"{'source task':<12} {'n':>8} {'genuine pockets':>18} {'rate':>8} {'eps':>8}",
+        ]
+        for s in sorted(pocket_info_by_source.keys()):
+            succ_s, eps_s = pocket_info_by_source[s]
+            n_s = len(succ_s)
+            breakdown_lines.append(
+                f"{s:<12} {n_s:>8} {int(succ_s.sum()):>10}/{n_s:<7} {base._fmt_pct(succ_s.mean()):>8} {eps_s:>8.4f}"
+            )
+        breakdown_lines.append("")
+        breakdown_lines.append(f"Task {t}'s (post-unlearning) classifier accuracy on each source task's adv-test-set:")
+        breakdown_lines.append(f"{'source task':<12} " + "".join(f"{name:>18}" for name in LINEAGE_NAMES))
+        for s in sorted(pocket_info_by_source.keys()):
+            row = f"{s:<12} "
+            for name in LINEAGE_NAMES:
+                acc_s, _n = per_task_by_lineage[name][f"{s}_adversarial"]
+                row += f"{acc_s:>18.3f}"
+            breakdown_lines.append(row)
+
+        breakdown_lines.append("")
+        breakdown_lines.append(f"Task {t}'s (post-unlearning) classifier accuracy on each source task's CLEAN test-set:")
+        breakdown_lines.append(f"{'source task':<12} " + "".join(f"{name:>18}" for name in LINEAGE_NAMES))
+        for s in sorted(pocket_info_by_source.keys()):
+            row = f"{s:<12} "
+            for name in LINEAGE_NAMES:
+                acc_s, _n = per_task_by_lineage[name][s]
+                row += f"{acc_s:>18.3f}"
+            breakdown_lines.append(row)
+
+        breakdown_lines.append("")
+        breakdown_lines.append(
+            f"Task {t}'s (post-unlearning) classifier COMBINED (clean+adversarial, pooled) "
+            f"accuracy on each source task's test-set:"
+        )
+        breakdown_lines.append(f"{'source task':<12} " + "".join(f"{name:>18}" for name in LINEAGE_NAMES))
+        for s in sorted(pocket_info_by_source.keys()):
+            Xs_clean, ys_clean = all_clean_sets[s]
+            Xs_adv, ys_adv = all_test_sets_full[f"{s}_adversarial"]
+            X_comb = np.vstack([Xs_clean, Xs_adv])
+            y_comb = np.concatenate([ys_clean, ys_adv])
+            row = f"{s:<12} "
+            for name in LINEAGE_NAMES:
+                row += f"{lineages[name].score(X_comb, y_comb):>18.3f}"
+            breakdown_lines.append(row)
+        breakdown_section = "\n".join(breakdown_lines)
+
+        base.write_task_log(log_path, t, [
+            ("Training Data information", train_section),
+            ("Testing Data information", test_section),
+            ("Adaptation step", adapt_section),
+            ("Unlearning step", unlearn_section),
+            ("Adversarial test-set breakdown (per source task)", breakdown_section),
+        ])
+
+        spillover_summary = {s: float(v[2].mean()) for s, v in historical_adv.items()}
+        results.append({
+            "task": t, "pooled_acc": pooled_results, "mean_acc": mean_results,
+            "genuine_pocket_rate": float(succ_pocket.mean()), "detector_metrics": det_metrics,
+            "spillover_genuine_pocket_rate_by_prior_task": spillover_summary,
+        })
+
+        torch.save({
+            "task_id": t, "seed": args.seed, "feature_dim": feature_dim, "scaler": scaler,
+            "label_mapping": label_mapping,
+            "lineages": {name: lineages[name].model.state_dict() for name in LINEAGE_NAMES},
+            "baseline_label_buffers": baseline_label_buffers, "baseline_replay_buffer": baseline_replay_buffer,
+            "joint_label_buffers": joint_label_buffers, "joint_replay_buffer": joint_replay_buffer,
+            "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
+            "results": results, "poison_fraction": poison_fraction,
+            "hidden_sizes": hidden_sizes, "per_feature_epsilon": args.per_feature_epsilon,
+        }, checkpoint_path)
+
+        print(f"Task {t} done. Genuine pocket rate: {base._fmt_pct(succ_pocket.mean())}. "
+              f"Log written to {log_path}")
+
+        if t == base.NUM_TASKS - 1:
+            pca_fit = PCA(n_components=2, random_state=args.seed).fit(X_train_scaled)
+            panels = [(name, lineages[name], X_test_scaled, y_test) for name in LINEAGE_NAMES]
+            base.plot_correctness_grid(
+                os.path.join(out_dir, "plots", f"task{t}_correctness.png"), pca_fit, panels)
+
+        if not args.no_breakpoint and t >= base.BREAKPOINT_FROM_TASK:
+            print(f"\n[breakpoint] Task {t} finished -- inspect `results`, `lineages`, "
+                  f"`baseline_label_buffers`, `joint_label_buffers`, or the log at {log_path}. Continue with `c`.")
+            breakpoint()
+
+    print(f"\nDone. Total runtime: {time.perf_counter() - start_time:.1f}s")
+
+
+if __name__ == "__main__":
+    main()
