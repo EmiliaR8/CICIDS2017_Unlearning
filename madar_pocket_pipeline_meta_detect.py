@@ -6,13 +6,26 @@ amnesiac / opposite_class), buffers, and lineage set as
 madar_pocket_pipeline.py -- imported directly from it below, not
 reimplemented. The ONLY thing that changes is HOW `detected_poison_idx` is
 produced each task: instead of one xgboost/logistic classifier trained on a
-balanced oracle-labeled batch (`run_detector`), this uses a Reptile
-meta-learned detector, ported from task8_pipeline-Copy1-withmeta.ipynb's
-"META-LEARNED POISON DETECTOR (checkpoint1 only, episodic Reptile)" cell --
-the notebook's own comment marks this "THE CORRECT IMPLEMENTATION", as
-opposed to an earlier cell in the same notebook explicitly marked "BAD" for
-training across two separate checkpoints using every oracle label at once;
-that earlier cell is not ported.
+balanced oracle-labeled batch (`run_detector`), this uses a meta-feature
+detector originally ported from task8_pipeline-Copy1-withmeta.ipynb's
+"META-LEARNED POISON DETECTOR (checkpoint1 only, episodic Reptile)" cell
+(the notebook's earlier "BAD" oracle-leaking cell is still not ported).
+
+NOTE ON THE DETECTOR CORE: the notebook's own separator was a linear
+logistic model fit via Reptile (inner-loop SGD + meta-parameter blending
+across episodes) -- the first version of this file ported that faithfully.
+That linear separator measurably underperformed (see the per-task recall
+comparison against madar_pocket_pipeline.py's oracle xgboost detector: ~50-
+68% precision vs. ~85-100%, over-flagging clean rows by 1.5-2x every task).
+As a first ablation at improving it, the SEPARATOR was swapped from that
+linear/Reptile-SGD model to a single small xgboost classifier (`base.
+train_detector("xgboost", ...)`, i.e. the SAME XGBOOST_PARAMS as the oracle
+detector: n_estimators=20, max_depth=2) fit ONCE on the episodically-sampled
+touched set. The episodic SAMPLING procedure (budget, oracle-grounded
+poison/clean pools, held-out split) is unchanged -- only the model that
+learns from those samples changed. This is no longer literally "Reptile"
+(there is no per-episode gradient step or meta-parameter blend left), so
+--meta_inner_lr/--meta_lr are accepted for CLI compatibility but are UNUSED.
 
 SAME FIVE lineages as madar_pocket_pipeline.py: clean, poisoned_baseline,
 dropped_rows, amnesiac, opposite_class -- `apply_dropped_rows`/
@@ -27,11 +40,12 @@ against the SAME-NAMED lineages in a madar_pocket_pipeline.py run on one
 plot, you'll need --split-lineage/--rename (see plot_pipeline_metrics.py's
 docstring) to tell the two apart, since the names collide by design.
 
-THE META-DETECTOR ITSELF, faithful to the notebook's scope (deliberately,
-per design discussion -- not an oversight):
+THE META-DETECTOR ITSELF, faithful to the notebook's scope apart from the
+xgboost-separator ablation above (deliberately, per design discussion -- not
+an oversight):
 
-  * SINGLE-TASK episodic Reptile: every outer episode is drawn from THIS
-    task's own poisoned training batch only. There is no cross-task
+  * SINGLE-TASK episodic sampling: every episode's samples are drawn from
+    THIS task's own poisoned training batch only. There is no cross-task
     transfer of a meta-learned initialization between tasks, even though
     this pipeline (unlike the notebook's one-off diagnostic) has 9 poisoned
     tasks it could in principle learn across. That would be a materially
@@ -52,21 +66,20 @@ per design discussion -- not an oversight):
     architecture depth, matching the same generalization pattern already
     used for DEDUCE's GUM.
 
-  * REPTILE META-TRAINING budget matches the notebook exactly: 8 outer
-    episodes x 3 inner steps x 10 samples/step (5 poisoned + 5 clean per
-    step, drawn from the ORACLE poison index -- same as the existing
-    detector's own oracle-labeled training set, just consumed as small
-    episodic draws instead of one flat balanced batch). This is NOT a
+  * EPISODIC SAMPLING budget matches the notebook's original Reptile budget
+    exactly: 8 outer episodes x 3 inner steps x 10 samples/step (5 poisoned +
+    5 clean per step, drawn from the ORACLE poison index -- same as the
+    existing detector's own oracle-labeled training set, just consumed as
+    small episodic draws instead of one flat balanced batch). This is NOT a
     smaller labeled budget than the existing detector's ~240-label
-    convention -- the notebook's own real run touched 236 unique points,
-    essentially the same order -- it is simply spent differently. Pass
-    --meta_outer_episodes/--meta_inner_steps/--meta_samples_per_step to
-    make it smaller if you want that comparison instead.
+    convention -- it touches ~235-240 unique points, essentially the same
+    order. Pass --meta_outer_episodes/--meta_inner_steps/--meta_samples_per_step
+    to make it smaller if you want that comparison instead.
 
   * HELD-OUT EVALUATION: every point NOT touched by any episode is scored
-    by the final meta-parameters with no further fitting -- a genuine
-    few-shot generalization test within the task, not a train/test split
-    of a bigger labeled set.
+    by the xgboost classifier fit on the touched set, with no further
+    fitting on held-out data -- a genuine few-shot generalization test
+    within the task, not a train/test split of a bigger labeled set.
 
 A note on optimizers: as in every other lineage in this project's
 pipelines, dropped_rows/amnesiac/opposite_class/poisoned_baseline/clean all
@@ -119,8 +132,10 @@ def _tlog(msg):
 
 
 # ---------------------------------------------------------------------------
-# Reptile meta-detector -- ported from task8_pipeline-Copy1-withmeta.ipynb's
-# "META-LEARNED POISON DETECTOR (checkpoint1 only, episodic Reptile)" cell.
+# Episodic meta-detector -- feature extraction ported from
+# task8_pipeline-Copy1-withmeta.ipynb's "META-LEARNED POISON DETECTOR
+# (checkpoint1 only, episodic Reptile)" cell; the separator itself is now a
+# small xgboost classifier (see module docstring for the ablation).
 # ---------------------------------------------------------------------------
 def get_latent_features(model, X, batch_size=512):
     """Runs X through `model` and returns the last hidden block's activation
@@ -229,25 +244,20 @@ def extract_meta_features(adaptable_model, X, y, replay_X_np, replay_y_np, k=5):
     ])
 
 
-def _sigmoid(z):
-    return 1 / (1 + np.exp(-np.clip(z, -30, 30)))
-
-
-def _bce_grad(w, b, X, y):
-    z = X @ w + b
-    p = _sigmoid(z)
-    grad_z = (p - y) / len(y)
-    grad_w = X.T @ grad_z
-    grad_b = grad_z.sum()
-    return grad_w, grad_b
-
-
 def run_meta_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
                       replay_X_np, replay_y_np, seed, n_outer_episodes, n_inner_steps,
                       samples_per_step, inner_lr, meta_lr, knn_k):
-    """Faithful port of the notebook's single-task episodic Reptile detector
-    -- every outer episode is drawn from THIS task's own poison pool only
-    (see the module docstring for why that's a deliberate scope choice)."""
+    """Episodic-budget detector: samples a touched set via the same episodic
+    procedure the original Reptile port used (n_outer_episodes x
+    n_inner_steps x samples_per_step draws from the oracle poison/clean
+    pools), then fits ONE small xgboost classifier on that touched set
+    (base.train_detector's "xgboost" path -- same XGBOOST_PARAMS as the
+    oracle detector, n_estimators=20/max_depth=2) instead of the original
+    linear separator trained via Reptile SGD + meta-parameter blending. See
+    the module docstring for why this ablation was made.
+
+    inner_lr/meta_lr are accepted for CLI/backward compatibility but are
+    UNUSED here -- there's no gradient loop left to apply them to."""
     _tlog(f"[run_meta_detector] start, {len(y_train)} rows, {n_outer_episodes} episodes x "
           f"{n_inner_steps} inner steps x {samples_per_step} samples/step")
     poison_idx = np.concatenate([idx_poison_ben, idx_poison_mal])
@@ -262,35 +272,32 @@ def run_meta_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_b
     clean_pool = np.setdiff1d(np.arange(len(y_train)), poison_idx)
 
     rng = np.random.default_rng(seed)
-    w_meta = np.zeros(feats_std.shape[1])
-    b_meta = 0.0
     touched = set()
     n_pos = samples_per_step // 2
     n_neg = samples_per_step - n_pos
 
-    _tlog("[run_meta_detector] starting Reptile episodic training loop")
+    _tlog("[run_meta_detector] sampling episodic touched set")
     for ep in range(n_outer_episodes):
-        w, b = w_meta.copy(), b_meta
         for _ in range(n_inner_steps):
             idx_p = rng.choice(poison_pool, min(n_pos, len(poison_pool)), replace=False)
             idx_c = rng.choice(clean_pool, min(n_neg, len(clean_pool)), replace=False)
             touched.update(idx_p.tolist())
             touched.update(idx_c.tolist())
-            Xb = np.vstack([feats_std[idx_p], feats_std[idx_c]])
-            yb = np.concatenate([np.ones(len(idx_p)), np.zeros(len(idx_c))])
-            gw, gb = _bce_grad(w, b, Xb, yb)
-            w = w - inner_lr * gw
-            b = b - inner_lr * gb
-        w_meta = w_meta + meta_lr * (w - w_meta)
-        b_meta = b_meta + meta_lr * (b - b_meta)
         _tlog(f"  [run_meta_detector] episode {ep + 1}/{n_outer_episodes} done "
               f"({len(touched)} unique touched so far)")
-    _tlog("[run_meta_detector] Reptile training loop done")
+    _tlog("[run_meta_detector] episodic sampling done")
+
+    touched_idx = np.array(sorted(touched))
+    Xb = feats_std[touched_idx]
+    yb = is_poisoned[touched_idx]
+
+    _tlog(f"[run_meta_detector] fitting small xgboost detector on {len(touched_idx)} touched points")
+    clf, detector_type_used = base.train_detector("xgboost", Xb, yb, seed)
 
     query_mask = np.ones(len(is_poisoned), dtype=bool)
-    query_mask[list(touched)] = False
+    query_mask[touched_idx] = False
     Xq, yq = feats_std[query_mask], is_poisoned[query_mask]
-    scores = _sigmoid(Xq @ w_meta + b_meta)
+    scores = clf.predict_proba(Xq)[:, 1]
     preds = (scores > 0.5).astype(int)
 
     _tlog(f"[run_meta_detector] scoring {int(query_mask.sum())} held-out points")
@@ -304,7 +311,7 @@ def run_meta_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_b
     _tlog(f"[run_meta_detector] done, flagged {len(meta_detected_poison_idx)}")
 
     metrics = {
-        "detector_type": "reptile_meta (single-task episodic)",
+        "detector_type": f"episodic_meta ({detector_type_used}, single-task episodic sampling)",
         "n_outer_episodes": n_outer_episodes, "n_inner_steps": n_inner_steps,
         "samples_per_step": samples_per_step,
         "nominal_budget": n_outer_episodes * n_inner_steps * samples_per_step,
@@ -336,16 +343,20 @@ def main():
                      help="Same per-feature (L-infinity) attack cap as madar_pocket_pipeline.py. "
                           "Off by default.")
     ap.add_argument("--meta_outer_episodes", type=int, default=8,
-                     help="Reptile outer-loop episode count (notebook default: 8).")
+                     help="Episodic-sampling outer-loop count (notebook's original Reptile default: 8).")
     ap.add_argument("--meta_inner_steps", type=int, default=3,
-                     help="Inner gradient steps per episode (notebook default: 3).")
+                     help="Sampling steps per episode (notebook's original Reptile default: 3).")
     ap.add_argument("--meta_samples_per_step", type=int, default=10,
-                     help="Samples per inner step, split evenly poisoned/clean (notebook default: "
+                     help="Samples per step, split evenly poisoned/clean (notebook default: "
                           "10 -- 5+5). Total nominal labeled budget = episodes * steps * this value; "
                           "lower this to test the meta-detector at a genuinely SMALLER labeled "
                           "budget than the existing oracle detector's ~240-label convention.")
-    ap.add_argument("--meta_inner_lr", type=float, default=0.5, help="Inner-loop learning rate (notebook: 0.5).")
-    ap.add_argument("--meta_lr", type=float, default=0.3, help="Outer (Reptile) learning rate (notebook: 0.3).")
+    ap.add_argument("--meta_inner_lr", type=float, default=0.5,
+                     help="UNUSED by the current xgboost-separator variant -- kept for CLI "
+                          "compatibility with the original linear/Reptile-SGD separator.")
+    ap.add_argument("--meta_lr", type=float, default=0.3,
+                     help="UNUSED by the current xgboost-separator variant -- kept for CLI "
+                          "compatibility with the original linear/Reptile-SGD separator.")
     ap.add_argument("--meta_knn_k", type=int, default=5,
                      help="k for the replay-buffer same-class nearest-neighbor distance feature.")
     ap.add_argument("--no_breakpoint", action="store_true",
@@ -374,19 +385,20 @@ def main():
 
     with open(log_path, "w") as f:
         f.write(
-            "MADAR POCKET-PIPELINE LOG (Reptile meta-learned detector)\n"
-            "==========================================================\n"
+            "MADAR POCKET-PIPELINE LOG (episodic meta-detector: xgboost separator)\n"
+            "======================================================================\n"
             "5 lineages per task: clean (reference), poisoned_baseline (no fix),\n"
             "dropped_rows, amnesiac, opposite_class. Same poisoning/attack/unlearning\n"
             "mechanics as madar_pocket_pipeline.py -- see that file. The ONLY difference\n"
-            "is the detector: a single-task episodic Reptile meta-learner (ported from\n"
-            "task8_pipeline-Copy1-withmeta.ipynb) in place of the oracle-trained\n"
-            "xgboost/logistic classifier.\n"
+            "is the detector: a single-task episodic sampling procedure (originally ported\n"
+            "from task8_pipeline-Copy1-withmeta.ipynb as a Reptile-trained linear\n"
+            "separator) feeding a small xgboost classifier, in place of the oracle\n"
+            "detector's balanced-batch xgboost/logistic classifier.\n"
             f"Classifier hidden layer sizes: {hidden_sizes}\n"
             f"Per-feature epsilon cap: {args.per_feature_epsilon}\n"
-            f"Reptile: {args.meta_outer_episodes} episodes x {args.meta_inner_steps} inner steps x "
-            f"{args.meta_samples_per_step} samples/step, inner_lr={args.meta_inner_lr}, "
-            f"meta_lr={args.meta_lr}, knn_k={args.meta_knn_k}\n"
+            f"Episodic sampling: {args.meta_outer_episodes} episodes x {args.meta_inner_steps} inner "
+            f"steps x {args.meta_samples_per_step} samples/step, knn_k={args.meta_knn_k} "
+            f"(--meta_inner_lr/--meta_lr are unused by this variant)\n"
         )
 
     print(f"Loading {args.h5_path} and building {base.NUM_TASKS} pooled chronological tasks...")
@@ -505,7 +517,7 @@ def main():
             continue
 
         # -------------------------------------------------------------
-        # Tasks 1..NUM_TASKS-1: poison -> detect (Reptile meta-model) -> unlearn.
+        # Tasks 1..NUM_TASKS-1: poison -> detect (episodic meta-detector) -> unlearn.
         # -------------------------------------------------------------
         X_train_scaled = to_scaled(X_train_raw)
         X_test_scaled = to_scaled(X_test_raw)
@@ -572,9 +584,9 @@ def main():
         pocket_info_by_source = {s: (v[2], v[3]) for s, v in historical_adv.items()}
         pocket_info_by_source[t] = (succ_pocket, eps_this_task)
 
-        # Step 7: Reptile meta-detector, trained from poisoned_baseline's own
+        # Step 7: episodic meta-detector, trained from poisoned_baseline's own
         # (episodic, oracle-few-shot) poison pool + its own replay buffer.
-        _tlog(f"Task {t}: step 7 -- running Reptile meta-detector")
+        _tlog(f"Task {t}: step 7 -- running episodic meta-detector")
         meta_detected_poison_idx, det_metrics = run_meta_detector(
             lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
             baseline_replay_X, baseline_replay_y, args.seed,
@@ -786,6 +798,32 @@ def main():
             breakdown_lines.append(row)
         breakdown_section = "\n".join(breakdown_lines)
 
+        # ---------------------------------------------------------------
+        # Debug: pocket send/recovery summary -- how many test points were
+        # sent into a genuine pocket this task, and how many of those are no
+        # longer evading (recovered) after each fix. Always printed+logged;
+        # followed by an interactive breakpoint() unless --no_breakpoint.
+        # ---------------------------------------------------------------
+        n_pocketed = int(succ_pocket.sum())
+        pocket_lines = [
+            f"Sent into pockets (genuine pockets found, this task's test set): "
+            f"{n_pocketed}/{len(y_test)} ({base._fmt_pct(succ_pocket.mean())})",
+            f"  benign side: {succ_ben}/{n_ben_test}, malicious side: {succ_mal}/{n_mal_test}",
+            "",
+            f"Recovered after unlearning (of the {n_pocketed} pocketed points, no longer "
+            f"evading post-fix):",
+        ]
+        for name in FIX_NAMES:
+            pred_name = lineages[name].predict(X_test_adv)
+            still_evading_mask = (pred_name != y_test) & succ_pocket
+            n_recovered = n_pocketed - int(still_evading_mask.sum())
+            pct_recovered = base._fmt_pct(n_recovered / n_pocketed) if n_pocketed else "N/A"
+            pocket_lines.append(f"  {name:<18}: {n_recovered}/{n_pocketed} recovered ({pct_recovered})")
+        pocket_summary = "\n".join(pocket_lines)
+
+        print(f"\n--- Task {t}: pocket recovery summary ---\n{pocket_summary}")
+        _tlog(f"Task {t}: pocket recovery summary\n{pocket_summary}")
+
         _tlog(f"Task {t}: writing pipeline_log.txt")
         base.write_task_log(log_path, t, [
             ("Training Data information", train_section),
@@ -793,7 +831,13 @@ def main():
             ("Adaptation step", adapt_section),
             ("Unlearning step", unlearn_section),
             ("Adversarial test-set breakdown (per source task)", breakdown_section),
+            ("Pocket recovery summary (debug)", pocket_summary),
         ])
+
+        if not args.no_breakpoint:
+            print(f"\n[breakpoint] Task {t}: pocket recovery summary above -- inspect `succ_pocket`, "
+                  f"`still_evading_mask`, `X_test_adv`, `y_test`, `lineages`. Continue with `c`.")
+            breakpoint()
 
         spillover_summary = {s: float(v[2].mean()) for s, v in historical_adv.items()}
         results.append({
