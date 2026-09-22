@@ -330,6 +330,54 @@ def run_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_ben, i
     return detected_poison_idx, detected_by_class, metrics, detector
 
 
+class RandomDetector:
+    """Stand-in for a trained detector's .predict(), used only by
+    run_random_detector() and by the --joint_buffer_purge_after_fill ablation
+    when combined with --detector_type random: flags each row independently
+    at a fixed rate, ignoring X entirely (there is no learned signal here)."""
+
+    def __init__(self, flagged_rate, seed):
+        self.flagged_rate = flagged_rate
+        self.seed = seed
+
+    def predict(self, X):
+        rng = np.random.default_rng(self.seed)
+        return (rng.random(len(X)) < self.flagged_rate).astype(int)
+
+
+def run_random_detector(X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
+                         benign_label, mal_label, seed):
+    """Same interface/return shape as run_detector(), but the forget-set is
+    chosen uniformly at random per class (same DETECTOR_N_PER_GROUP budget as
+    the trained detector) instead of via a trained classifier -- ablation for
+    --detector_type random."""
+    rng = np.random.default_rng(seed)
+    detected_by_class = {}
+    class_metrics = {}
+    for cls, true_poison_this_class in [(benign_label, idx_poison_ben), (mal_label, idx_poison_mal)]:
+        class_indices = np.where(y_train == cls)[0]
+        n_flag = min(DETECTOR_N_PER_GROUP, len(class_indices))
+        flagged = rng.choice(class_indices, size=n_flag, replace=False)
+        detected_by_class[cls] = flagged
+        tp = len(np.intersect1d(flagged, true_poison_this_class))
+        precision = tp / max(len(flagged), 1)
+        recall = tp / max(len(true_poison_this_class), 1)
+        class_metrics[cls] = {"n_flagged": len(flagged), "tp": tp, "precision": precision, "recall": recall}
+
+    detected_poison_idx = np.concatenate([detected_by_class[benign_label], detected_by_class[mal_label]])
+    flagged_rate = len(detected_poison_idx) / max(len(X_train_poisoned), 1)
+    metrics = {
+        "detector_type": "random",
+        "train_accuracy": float("nan"),
+        "composition": {"random_benign": len(detected_by_class[benign_label]),
+                         "random_malicious": len(detected_by_class[mal_label])},
+        "class_metrics": class_metrics,
+        "n_detected": len(detected_poison_idx),
+        "n_oracle": len(idx_poison_ben) + len(idx_poison_mal),
+    }
+    return detected_poison_idx, detected_by_class, metrics, RandomDetector(flagged_rate, seed)
+
+
 # ---------------------------------------------------------------------------
 # Unlearning variants (notebook cell 18)
 # ---------------------------------------------------------------------------
@@ -602,7 +650,11 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log_name", type=str, default="madar_pocket_pipeline_run")
     ap.add_argument("--h5-path", type=str, default=H5_DATASET_PATH)
-    ap.add_argument("--detector_type", type=str, default="xgboost", choices=["xgboost", "logistic"])
+    ap.add_argument("--detector_type", type=str, default="xgboost",
+                     choices=["xgboost", "logistic", "random"],
+                     help="'random' is an ablation: skips classifier training and picks the "
+                          "forget-set uniformly at random per class instead (same DETECTOR_N_PER_GROUP "
+                          "budget), to isolate how much the classifier's selection signal matters.")
     ap.add_argument("--poison_fraction", type=float, default=POISON_FRACTION)
     ap.add_argument("--no_breakpoint", action="store_true",
                      help="Disable the interactive breakpoint() pause at the end of tasks >= "
@@ -855,11 +907,17 @@ def main():
         pocket_info_by_source = {s: (v[2], v[3]) for s, v in historical_adv.items()}
         pocket_info_by_source[t] = (succ_pocket, eps_this_task)
 
-        # Step 7: ONE shared detector per task, trained from poisoned_baseline.
-        detected_poison_idx, detected_by_class, det_metrics, detector = run_detector(
-            lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
-            benign_label, mal_label, args.detector_type, SEED,
-        )
+        # Step 7: ONE shared detector per task, trained from poisoned_baseline
+        # (or, for the --detector_type random ablation, no training at all).
+        if args.detector_type == "random":
+            detected_poison_idx, detected_by_class, det_metrics, detector = run_random_detector(
+                X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal, benign_label, mal_label, SEED,
+            )
+        else:
+            detected_poison_idx, detected_by_class, det_metrics, detector = run_detector(
+                lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
+                benign_label, mal_label, args.detector_type, SEED,
+            )
 
         # Step 8: each fix lineage adapts on poisoned data from ITS OWN prior
         # weights first (this lineage's own "just got poisoned" state) --
