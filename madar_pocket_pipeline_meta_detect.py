@@ -359,6 +359,10 @@ def main():
                           "compatibility with the original linear/Reptile-SGD separator.")
     ap.add_argument("--meta_knn_k", type=int, default=5,
                      help="k for the replay-buffer same-class nearest-neighbor distance feature.")
+    ap.add_argument("--adapt_epochs", type=int, default=base.ADAPT_EPOCHS,
+                     help="Epochs each lineage trains for when adapting to poisoned data (step 4) "
+                          f"and again when applying its fix (step 8). Base default: {base.ADAPT_EPOCHS}. "
+                          "Overrides base.ADAPT_EPOCHS for this run only.")
     ap.add_argument("--no_breakpoint", action="store_true",
                      help="Disable the interactive breakpoint() pause at the end of tasks "
                           f">= {base.BREAKPOINT_FROM_TASK}.")
@@ -366,6 +370,7 @@ def main():
     hidden_sizes = tuple(int(h) for h in args.hidden_sizes.split(","))
 
     base.SEED = args.seed  # update_shared_buffer reads this module-level global
+    base.ADAPT_EPOCHS = args.adapt_epochs
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     poison_fraction = args.poison_fraction
@@ -399,6 +404,7 @@ def main():
             f"Episodic sampling: {args.meta_outer_episodes} episodes x {args.meta_inner_steps} inner "
             f"steps x {args.meta_samples_per_step} samples/step, knn_k={args.meta_knn_k} "
             f"(--meta_inner_lr/--meta_lr are unused by this variant)\n"
+            f"Adapt epochs (per-task fix/poison training): {args.adapt_epochs}\n"
         )
 
     print(f"Loading {args.h5_path} and building {base.NUM_TASKS} pooled chronological tasks...")
