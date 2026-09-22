@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import datetime
 import os
 import time
 
@@ -96,6 +97,26 @@ import madar_pocket_pipeline as base
 LINEAGE_NAMES = ["clean", "poisoned_baseline", "dropped_rows", "amnesiac", "opposite_class"]
 FIX_NAMES = ["dropped_rows", "amnesiac", "opposite_class"]
 
+# ---------------------------------------------------------------------------
+# Timestamped step-by-step timing log ("meta_log.txt"), separate from the
+# human-readable pipeline_log.txt -- for diagnosing which step of a real run
+# is actually slow. Module-level so every helper function below can log
+# without threading a logger through every call signature. main() points
+# these at <out_dir>/logs/meta_log.txt before the task loop starts.
+# ---------------------------------------------------------------------------
+_META_LOG_PATH = None
+_META_LOG_T0 = None
+
+
+def _tlog(msg):
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    elapsed = time.perf_counter() - _META_LOG_T0 if _META_LOG_T0 is not None else 0.0
+    line = f"[{now} | +{elapsed:8.1f}s] {msg}"
+    print(line)
+    if _META_LOG_PATH is not None:
+        with open(_META_LOG_PATH, "a") as f:
+            f.write(line + "\n")
+
 
 # ---------------------------------------------------------------------------
 # Reptile meta-detector -- ported from task8_pipeline-Copy1-withmeta.ipynb's
@@ -106,6 +127,7 @@ def get_latent_features(model, X, batch_size=512):
     (post-BN, pre-ReLU captured via a forward hook, ReLU applied manually --
     matches the real forward pass exactly). Hooks model.bns[-1] rather than
     a hardcoded layer name, so this works for any --hidden_sizes depth."""
+    _tlog(f"  [get_latent_features] start, {len(X)} rows, batch_size={batch_size}")
     model.eval()
     captured = {}
 
@@ -120,7 +142,9 @@ def get_latent_features(model, X, batch_size=512):
             _ = model(Xt[i:i + batch_size])
             latents.append(torch.relu(captured["z"]).numpy())
     handle.remove()
-    return np.concatenate(latents, axis=0)
+    out = np.concatenate(latents, axis=0)
+    _tlog(f"  [get_latent_features] done, latent_dim={out.shape[1]}")
+    return out
 
 
 def replay_knn_distance(X, y, replay_X_np, replay_y_np, k=5):
@@ -128,6 +152,7 @@ def replay_knn_distance(X, y, replay_X_np, replay_y_np, k=5):
     same-class neighbors in the replay buffer -- poisoned points, shifted
     toward the opposite class, should sit unusually far from their own
     class's established prior-task samples."""
+    _tlog(f"  [replay_knn_distance] start, {len(X)} rows vs replay buffer of {len(replay_X_np)}")
     dist = np.full(len(X), np.nan)
     for c in np.unique(y):
         mask = y == c
@@ -138,6 +163,9 @@ def replay_knn_distance(X, y, replay_X_np, replay_y_np, k=5):
         nn_ = NearestNeighbors(n_neighbors=kk).fit(replay_X_np[replay_mask])
         d, _ = nn_.kneighbors(X[mask])
         dist[mask] = d.mean(axis=1)
+        _tlog(f"    [replay_knn_distance] class {c} done ({int(mask.sum())} rows vs "
+              f"{int(replay_mask.sum())} replay points)")
+    _tlog("  [replay_knn_distance] done")
     return dist
 
 
@@ -146,9 +174,12 @@ def fit_density_ratio_model(X_current, replay_X_np):
     from the current task's points ('new', label 1). p/(1-p) is the density
     ratio: values >> 1 mean a point looks much more like the current task
     than like anything in the established prior-task distribution."""
+    _tlog(f"  [fit_density_ratio_model] start, {len(replay_X_np)} replay + {len(X_current)} current rows")
     Xd = np.vstack([replay_X_np, X_current])
     yd = np.concatenate([np.zeros(len(replay_X_np)), np.ones(len(X_current))])
-    return LogisticRegression(max_iter=1000, class_weight="balanced", random_state=0).fit(Xd, yd)
+    clf = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=0).fit(Xd, yd)
+    _tlog("  [fit_density_ratio_model] done")
+    return clf
 
 
 def density_ratio_score(clf, X):
@@ -160,6 +191,7 @@ def extract_meta_features(adaptable_model, X, y, replay_X_np, replay_y_np, k=5):
     """Builds the 7-dim per-sample feature table, fitting fresh
     IsolationForests + density-ratio discriminator on this task's own
     unlabeled data + replay buffer (no oracle labels used in this step)."""
+    _tlog(f"[extract_meta_features] start, {len(X)} rows, feature_dim={X.shape[1]}")
     net = adaptable_model.model
     net.eval()
     Xt = torch.as_tensor(np.asarray(X), dtype=torch.float32)
@@ -167,13 +199,17 @@ def extract_meta_features(adaptable_model, X, y, replay_X_np, replay_y_np, k=5):
 
     latent = get_latent_features(net, X)
 
+    _tlog(f"[extract_meta_features] fitting raw-space IsolationForest ({len(X)} rows, dim={X.shape[1]})")
     iso_raw = IsolationForest(n_estimators=200, contamination="auto", random_state=0).fit(X)
+    _tlog(f"[extract_meta_features] fitting latent-space IsolationForest (dim={latent.shape[1]})")
     iso_latent = IsolationForest(n_estimators=200, contamination="auto", random_state=0).fit(latent)
     density_clf = fit_density_ratio_model(X, replay_X_np)
+    _tlog("[extract_meta_features] scoring IsolationForests + density-ratio model")
     iso_raw_score = -iso_raw.score_samples(X)
     iso_latent_score = -iso_latent.score_samples(latent)
     density_ratio = density_ratio_score(density_clf, X)
 
+    _tlog("[extract_meta_features] forward pass for loss/entropy/margin")
     with torch.no_grad():
         logits = net(Xt)
         proba = torch.softmax(logits, dim=1)
@@ -186,6 +222,7 @@ def extract_meta_features(adaptable_model, X, y, replay_X_np, replay_y_np, k=5):
 
     dist_to_replay = replay_knn_distance(X, y, replay_X_np, replay_y_np, k=k)
 
+    _tlog("[extract_meta_features] done")
     return np.column_stack([
         iso_raw_score, iso_latent_score, per_sample_loss, entropy, top2_margin,
         density_ratio, dist_to_replay,
@@ -211,6 +248,8 @@ def run_meta_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_b
     """Faithful port of the notebook's single-task episodic Reptile detector
     -- every outer episode is drawn from THIS task's own poison pool only
     (see the module docstring for why that's a deliberate scope choice)."""
+    _tlog(f"[run_meta_detector] start, {len(y_train)} rows, {n_outer_episodes} episodes x "
+          f"{n_inner_steps} inner steps x {samples_per_step} samples/step")
     poison_idx = np.concatenate([idx_poison_ben, idx_poison_mal])
     feats = extract_meta_features(poisoned_baseline, X_train_poisoned, y_train,
                                   replay_X_np, replay_y_np, k=knn_k)
@@ -229,7 +268,8 @@ def run_meta_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_b
     n_pos = samples_per_step // 2
     n_neg = samples_per_step - n_pos
 
-    for _ in range(n_outer_episodes):
+    _tlog("[run_meta_detector] starting Reptile episodic training loop")
+    for ep in range(n_outer_episodes):
         w, b = w_meta.copy(), b_meta
         for _ in range(n_inner_steps):
             idx_p = rng.choice(poison_pool, min(n_pos, len(poison_pool)), replace=False)
@@ -243,6 +283,9 @@ def run_meta_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_b
             b = b - inner_lr * gb
         w_meta = w_meta + meta_lr * (w - w_meta)
         b_meta = b_meta + meta_lr * (b - b_meta)
+        _tlog(f"  [run_meta_detector] episode {ep + 1}/{n_outer_episodes} done "
+              f"({len(touched)} unique touched so far)")
+    _tlog("[run_meta_detector] Reptile training loop done")
 
     query_mask = np.ones(len(is_poisoned), dtype=bool)
     query_mask[list(touched)] = False
@@ -250,6 +293,7 @@ def run_meta_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_b
     scores = _sigmoid(Xq @ w_meta + b_meta)
     preds = (scores > 0.5).astype(int)
 
+    _tlog(f"[run_meta_detector] scoring {int(query_mask.sum())} held-out points")
     if len(np.unique(yq)) > 1:
         prec, rec, f1, _ = precision_recall_fscore_support(yq, preds, average="binary", zero_division=0)
         auc = roc_auc_score(yq, scores)
@@ -257,6 +301,7 @@ def run_meta_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_b
         prec = rec = f1 = auc = float("nan")
 
     meta_detected_poison_idx = np.where(query_mask)[0][preds == 1]
+    _tlog(f"[run_meta_detector] done, flagged {len(meta_detected_poison_idx)}")
 
     metrics = {
         "detector_type": "reptile_meta (single-task episodic)",
@@ -275,7 +320,9 @@ def run_meta_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_b
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    global _META_LOG_PATH, _META_LOG_T0
     start_time = time.perf_counter()
+    _META_LOG_T0 = start_time
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log_name", type=str, default="madar_pocket_meta_detect_run")
@@ -316,7 +363,14 @@ def main():
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
     log_path = os.path.join(out_dir, "logs", "pipeline_log.txt")
+    meta_log_path = os.path.join(out_dir, "logs", "meta_log.txt")
     checkpoint_path = os.path.join(out_dir, "logs", "classifier_checkpoint.pt")
+
+    _META_LOG_PATH = meta_log_path
+    with open(meta_log_path, "w") as f:
+        f.write(f"META-DETECT TIMING LOG -- run started {datetime.datetime.now().isoformat()}\n"
+                f"args: {vars(args)}\n\n")
+    _tlog("Run starting")
 
     with open(log_path, "w") as f:
         f.write(
@@ -358,6 +412,7 @@ def main():
 
     for t in range(base.NUM_TASKS):
         print(f"\n{'#' * 60}\n# TASK {t}\n{'#' * 60}")
+        _tlog(f"=== Task {t}: start ===")
         task = tasks[t]
         X_raw = np.clip(task["features"].astype(np.float32), 0.0, 1.0)
         y_all = task["labels"].astype(np.int64)
@@ -366,6 +421,7 @@ def main():
         X_train_raw, X_test_raw, y_train, y_test, gid_train, gid_test = train_test_split(
             X_raw, y_all, gid_all, test_size=base.TASK_TEST_FRAC, random_state=args.seed, stratify=y_all,
         )
+        _tlog(f"Task {t}: train/test split done (train={len(y_train)}, test={len(y_test)})")
 
         # -------------------------------------------------------------
         # Task 0: plain supervised pretraining only, no poisoning yet.
@@ -382,7 +438,8 @@ def main():
             loss_fn0 = nn.CrossEntropyLoss()
             base_model.train()
             n = len(Xt)
-            for _ in range(base.TASK0_EPOCHS):
+            _tlog(f"Task 0: pretraining for {base.TASK0_EPOCHS} epochs on {n} rows")
+            for epoch in range(base.TASK0_EPOCHS):
                 perm = torch.randperm(n)
                 for i in range(0, n, base.TASK0_BATCH_SIZE):
                     idx = perm[i:i + base.TASK0_BATCH_SIZE]
@@ -392,7 +449,9 @@ def main():
                     loss = loss_fn0(base_model(Xt[idx]), yt[idx])
                     loss.backward()
                     opt0.step()
+                _tlog(f"  Task 0: pretraining epoch {epoch + 1}/{base.TASK0_EPOCHS} done")
             base_model.eval()
+            _tlog("Task 0: pretraining done")
 
             for name in LINEAGE_NAMES:
                 lineages[name] = base.AdaptableClassifier(copy.deepcopy(base_model))
@@ -411,6 +470,7 @@ def main():
                 lineages["poisoned_baseline"], joint_label_buffers, X_train_scaled, y_train,
                 category, gid_train, benign_label, mal_label,
             )
+            _tlog("Task 0: replay buffers filled")
 
             train_section = (
                 f"malicious: {int((y_train == mal_label).sum())}, benign: {int((y_train == benign_label).sum())}\n"
@@ -441,6 +501,7 @@ def main():
                 "results": results, "poison_fraction": poison_fraction,
                 "hidden_sizes": hidden_sizes, "per_feature_epsilon": args.per_feature_epsilon,
             }, checkpoint_path)
+            _tlog(f"=== Task {t}: done (log + checkpoint written) ===")
             continue
 
         # -------------------------------------------------------------
@@ -452,17 +513,21 @@ def main():
         baseline_replay_X, baseline_replay_y = base.flatten_replay(baseline_replay_buffer)
 
         # Step 2: clean lineage adapts on clean data only.
+        _tlog(f"Task {t}: step 2 -- adapting clean lineage")
         lineages["clean"].adapt(X_train_scaled, y_train, replay_X=replay_X, replay_y=replay_y,
                                 epochs=base.CLEAN_ADAPT_EPOCHS)
 
         # Step 3: craft this task's poison (shared across all poisoned lineages).
+        _tlog(f"Task {t}: step 3 -- crafting poison (poison_fraction={poison_fraction})")
         X_train_poisoned, idx_poison_ben, idx_poison_mal, _ = base.craft_task_poison(
             lineages["clean"], X_train_scaled, y_train, benign_label, mal_label, poison_fraction,
         )
         poison_idx = np.concatenate([idx_poison_ben, idx_poison_mal])
+        _tlog(f"Task {t}: step 3 done ({len(poison_idx)} poisoned rows)")
 
         # Step 4: poisoned_baseline adapts on poisoned data ("no fix"), using
         # its OWN separate replay buffer.
+        _tlog(f"Task {t}: step 4 -- adapting poisoned_baseline")
         lineages["poisoned_baseline"].adapt(X_train_poisoned, y_train,
                                             replay_X=baseline_replay_X, replay_y=baseline_replay_y,
                                             epochs=base.ADAPT_EPOCHS)
@@ -473,14 +538,17 @@ def main():
 
         # Step 5: craft this task's genuine-pocket test attack, ONCE, against
         # poisoned_baseline (reference = clean).
+        _tlog(f"Task {t}: step 5 -- crafting this task's adversarial test attack")
         eps_this_task = base.typical_class_gap(X_test_scaled, y_test, benign_label,
                                                mal_label) * base.ATTACK_EPS_MULTIPLIER
         X_test_adv, succ_pocket, norms_pocket = base.adversarial_attack_pocket(
             lineages["poisoned_baseline"], lineages["clean"], X_test_scaled, y_test,
             epsilon_max=eps_this_task, per_feature_epsilon=args.per_feature_epsilon,
         )
+        _tlog(f"Task {t}: step 5 done (genuine pocket rate {base._fmt_pct(succ_pocket.mean())})")
 
         # Step 6: spillover check -- re-attack every PRIOR task's test set.
+        _tlog(f"Task {t}: step 6 -- spillover re-attack over {len(task_test_splits)} prior task(s)")
         historical_adv = {}
         for s, (Xs_raw, ys) in task_test_splits.items():
             Xs_scaled = to_scaled(Xs_raw)
@@ -491,6 +559,8 @@ def main():
                 per_feature_epsilon=args.per_feature_epsilon,
             )
             historical_adv[s] = (Xs_adv, ys, succ_s, eps_s)
+            _tlog(f"  Task {t}: step 6 -- re-attacked source task {s} ({len(ys)} rows)")
+        _tlog(f"Task {t}: step 6 done")
 
         all_clean_sets = {s: (to_scaled(Xs_raw), ys) for s, (Xs_raw, ys) in task_test_splits.items()}
         all_clean_sets[t] = (X_test_scaled, y_test)
@@ -504,16 +574,20 @@ def main():
 
         # Step 7: Reptile meta-detector, trained from poisoned_baseline's own
         # (episodic, oracle-few-shot) poison pool + its own replay buffer.
+        _tlog(f"Task {t}: step 7 -- running Reptile meta-detector")
         meta_detected_poison_idx, det_metrics = run_meta_detector(
             lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
             baseline_replay_X, baseline_replay_y, args.seed,
             args.meta_outer_episodes, args.meta_inner_steps, args.meta_samples_per_step,
             args.meta_inner_lr, args.meta_lr, args.meta_knn_k,
         )
+        _tlog(f"Task {t}: step 7 done (flagged {det_metrics['n_detected']}, "
+              f"oracle={det_metrics['n_oracle']})")
 
         # Step 8: each fix lineage adapts on poisoned data from ITS OWN prior
         # weights, snapshot pre-unlearning metrics, then applies its own fix
         # to the SAME meta_detected_poison_idx.
+        _tlog(f"Task {t}: step 8 -- adapting fix lineages + snapshotting pre-unlearning metrics")
         pre_unlearn_metrics = {}
         for name in FIX_NAMES:
             lineages[name].adapt(X_train_poisoned, y_train, replay_X=replay_X, replay_y=replay_y,
@@ -523,15 +597,19 @@ def main():
             pre_unlearn_metrics[name] = {
                 "task_acc": pre_task_acc, "pooled_acc": pre_pooled_acc, "mean_acc": pre_mean_acc,
             }
+            _tlog(f"  Task {t}: step 8 -- {name} pre-unlearning snapshot done")
+        _tlog(f"Task {t}: step 8 -- applying fixes (dropped_rows/amnesiac/opposite_class)")
         base.apply_dropped_rows(lineages["dropped_rows"], X_train_poisoned, y_train, meta_detected_poison_idx,
                                 replay_X, replay_y)
         base.apply_amnesiac(lineages["amnesiac"], X_train_poisoned, y_train, meta_detected_poison_idx,
                             replay_X, replay_y, benign_label, mal_label)
         base.apply_opposite_class(lineages["opposite_class"], X_train_poisoned, y_train, meta_detected_poison_idx,
                                   replay_X, replay_y, benign_label, mal_label)
+        _tlog(f"Task {t}: step 8 done")
 
         # Step 9: pooled/mean/per-class accuracy across all clean + adversarial
         # test sets seen so far, for every lineage.
+        _tlog(f"Task {t}: step 9 -- computing pooled/mean/per-class accuracy for all lineages")
         pooled_results, mean_results, per_class_reports, per_task_by_lineage = {}, {}, {}, {}
         for name in LINEAGE_NAMES:
             pooled_acc, mean_acc, per_task = base.pooled_and_per_task_accuracy(lineages[name], all_test_sets_full)
@@ -539,15 +617,18 @@ def main():
             mean_results[name] = mean_acc
             per_task_by_lineage[name] = per_task
             per_class_reports[name] = base._fmt_report(lineages[name], X_test_scaled, y_test)
+            _tlog(f"  Task {t}: step 9 -- {name} done")
 
         still_evades = {}
         for name in FIX_NAMES:
             pred = lineages[name].predict(X_test_adv)
             wrong = (pred != y_test)
             still_evades[name] = float(wrong[succ_pocket].mean()) if succ_pocket.any() else float("nan")
+        _tlog(f"Task {t}: step 9 done")
 
         # Step 10: update both replay buffers -- only now, after every
         # lineage's adaptation/unlearning for this task is fully done.
+        _tlog(f"Task {t}: step 10 -- updating replay buffers")
         category_all = np.where(y_train == benign_label, "benign", "malicious_clean").astype(object)
         category_all[idx_poison_ben] = "benign_perturbed"
         category_all[idx_poison_mal] = "malicious_perturbed"
@@ -564,6 +645,7 @@ def main():
             X_train_poisoned[clean_mask], y_train[clean_mask], category_all[clean_mask], gid_train[clean_mask],
             benign_label, mal_label,
         )
+        _tlog(f"Task {t}: step 10 done")
 
         task_test_splits[t] = (X_test_raw, y_test)
         task_test_gids[t] = gid_test
@@ -704,6 +786,7 @@ def main():
             breakdown_lines.append(row)
         breakdown_section = "\n".join(breakdown_lines)
 
+        _tlog(f"Task {t}: writing pipeline_log.txt")
         base.write_task_log(log_path, t, [
             ("Training Data information", train_section),
             ("Testing Data information", test_section),
@@ -729,21 +812,26 @@ def main():
             "results": results, "poison_fraction": poison_fraction,
             "hidden_sizes": hidden_sizes, "per_feature_epsilon": args.per_feature_epsilon,
         }, checkpoint_path)
+        _tlog(f"Task {t}: checkpoint saved")
 
         print(f"Task {t} done. Genuine pocket rate: {base._fmt_pct(succ_pocket.mean())}. "
               f"Log written to {log_path}")
+        _tlog(f"=== Task {t}: done (genuine pocket rate {base._fmt_pct(succ_pocket.mean())}) ===")
 
         if t == base.NUM_TASKS - 1:
+            _tlog(f"Task {t}: rendering final PCA correctness-grid plot")
             pca_fit = PCA(n_components=2, random_state=args.seed).fit(X_train_scaled)
             panels = [(name, lineages[name], X_test_scaled, y_test) for name in LINEAGE_NAMES]
             base.plot_correctness_grid(
                 os.path.join(out_dir, "plots", f"task{t}_correctness.png"), pca_fit, panels)
+            _tlog(f"Task {t}: plot saved")
 
         if not args.no_breakpoint and t >= base.BREAKPOINT_FROM_TASK:
             print(f"\n[breakpoint] Task {t} finished -- inspect `results`, `lineages`, "
                   f"`baseline_label_buffers`, `joint_label_buffers`, or the log at {log_path}. Continue with `c`.")
             breakpoint()
 
+    _tlog(f"Run done. Total runtime: {time.perf_counter() - start_time:.1f}s")
     print(f"\nDone. Total runtime: {time.perf_counter() - start_time:.1f}s")
 
 
