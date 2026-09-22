@@ -800,9 +800,13 @@ def main():
 
         # ---------------------------------------------------------------
         # Debug: pocket send/recovery summary -- how many test points were
-        # sent into a genuine pocket this task, and how many of those are no
-        # longer evading (recovered) after each fix. Always printed+logged;
-        # followed by an interactive breakpoint() unless --no_breakpoint.
+        # sent into a genuine pocket this task, how many of those are no
+        # longer evading (recovered) after each fix, how healthy each fix
+        # looks on ordinary (non-attacked) traffic right now, and whether
+        # fixing THIS task accidentally reopened any EARLIER task's pockets.
+        # Always printed+logged; followed by an interactive breakpoint()
+        # unless --no_breakpoint. Written in plain language on purpose --
+        # this is meant to be read live, task by task, not computed from.
         # ---------------------------------------------------------------
         n_pocketed = int(succ_pocket.sum())
         pocket_lines = [
@@ -813,12 +817,48 @@ def main():
             f"Recovered after unlearning (of the {n_pocketed} pocketed points, no longer "
             f"evading post-fix):",
         ]
+        fix_still_evading = {}
         for name in FIX_NAMES:
             pred_name = lineages[name].predict(X_test_adv)
             still_evading_mask = (pred_name != y_test) & succ_pocket
+            fix_still_evading[name] = still_evading_mask
             n_recovered = n_pocketed - int(still_evading_mask.sum())
             pct_recovered = base._fmt_pct(n_recovered / n_pocketed) if n_pocketed else "N/A"
             pocket_lines.append(f"  {name:<18}: {n_recovered}/{n_pocketed} recovered ({pct_recovered})")
+
+        pocket_lines.append("")
+        pocket_lines.append("How well each fix reads NORMAL (non-attacked) traffic right now:")
+        for name in FIX_NAMES:
+            pred_clean = lineages[name].predict(X_test_scaled)
+            catch_ben = (pred_clean[y_test == benign_label] == benign_label).mean() if n_ben_test else float("nan")
+            catch_mal = (pred_clean[y_test == mal_label] == mal_label).mean() if n_mal_test else float("nan")
+            pocket_lines.append(
+                f"  {name:<18}: catches {base._fmt_pct(catch_ben)} of benign, "
+                f"{base._fmt_pct(catch_mal)} of malicious"
+            )
+
+        pocket_lines.append("")
+        pockets_to_check = [
+            (s, historical_adv[s]) for s in sorted(historical_adv.keys()) if int(historical_adv[s][2].sum()) > 0
+        ]
+        if pockets_to_check:
+            pocket_lines.append(
+                "Checking back on earlier tasks' pockets (did fixing THIS task "
+                "accidentally reopen any of them?):"
+            )
+            for s, (Xs_adv, ys, succ_s, eps_s) in pockets_to_check:
+                n_pocketed_s = int(succ_s.sum())
+                pocket_lines.append(f"  Task {s}'s pockets ({n_pocketed_s} total):")
+                for name in FIX_NAMES:
+                    pred_s = lineages[name].predict(Xs_adv)
+                    n_still_closed = int((succ_s & (pred_s == ys)).sum())
+                    pocket_lines.append(
+                        f"    {name:<18}: {n_still_closed}/{n_pocketed_s} still closed "
+                        f"({base._fmt_pct(n_still_closed / n_pocketed_s)})"
+                    )
+        else:
+            pocket_lines.append("No earlier tasks with pockets to check yet.")
+
         pocket_summary = "\n".join(pocket_lines)
 
         print(f"\n--- Task {t}: pocket recovery summary ---\n{pocket_summary}")
@@ -836,7 +876,7 @@ def main():
 
         if not args.no_breakpoint:
             print(f"\n[breakpoint] Task {t}: pocket recovery summary above -- inspect `succ_pocket`, "
-                  f"`still_evading_mask`, `X_test_adv`, `y_test`, `lineages`. Continue with `c`.")
+                  f"`fix_still_evading`, `X_test_adv`, `y_test`, `lineages`. Continue with `c`.")
             breakpoint()
 
         spillover_summary = {s: float(v[2].mean()) for s, v in historical_adv.items()}
