@@ -302,10 +302,13 @@ def run_meta_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_b
 
     _tlog(f"[run_meta_detector] scoring {int(query_mask.sum())} held-out points")
     if len(np.unique(yq)) > 1:
-        prec, rec, f1, _ = precision_recall_fscore_support(yq, preds, average="binary", zero_division=0)
+        # average=None, labels=[0,1] -- per-class (clean vs perturbed) precision/recall,
+        # not just the perturbed/positive-class numbers "binary" would give.
+        (prec_clean, prec_pert), (rec_clean, rec_pert), (f1_clean, f1_pert), _ = \
+            precision_recall_fscore_support(yq, preds, average=None, labels=[0, 1], zero_division=0)
         auc = roc_auc_score(yq, scores)
     else:
-        prec = rec = f1 = auc = float("nan")
+        prec_clean = prec_pert = rec_clean = rec_pert = f1_clean = f1_pert = auc = float("nan")
 
     meta_detected_poison_idx = np.where(query_mask)[0][preds == 1]
     _tlog(f"[run_meta_detector] done, flagged {len(meta_detected_poison_idx)}")
@@ -316,8 +319,9 @@ def run_meta_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_b
         "samples_per_step": samples_per_step,
         "nominal_budget": n_outer_episodes * n_inner_steps * samples_per_step,
         "n_touched": len(touched), "n_query": int(query_mask.sum()),
-        "held_out_precision": float(prec), "held_out_recall": float(rec),
-        "held_out_f1": float(f1), "held_out_auc": float(auc),
+        "held_out_precision_clean": float(prec_clean), "held_out_recall_clean": float(rec_clean),
+        "held_out_precision_perturbed": float(prec_pert), "held_out_recall_perturbed": float(rec_pert),
+        "held_out_f1": float(f1_pert), "held_out_auc": float(auc),
         "n_detected": len(meta_detected_poison_idx), "n_oracle": len(poison_idx),
     }
     return meta_detected_poison_idx, metrics
@@ -719,9 +723,11 @@ def main():
             f"meta-training: {det_metrics['n_outer_episodes']} episodes x {det_metrics['n_inner_steps']} inner "
             f"steps x {det_metrics['samples_per_step']} samples/step ({det_metrics['nominal_budget']} nominal, "
             f"{det_metrics['n_touched']} unique touched)",
-            f"held-out (episode-untouched) vs oracle -- precision={det_metrics['held_out_precision']:.3f} "
-            f"recall={det_metrics['held_out_recall']:.3f} f1={det_metrics['held_out_f1']:.3f} "
-            f"auc={det_metrics['held_out_auc']:.3f} (on {det_metrics['n_query']} held-out points)",
+            f"held-out (episode-untouched) vs oracle -- clean: P={det_metrics['held_out_precision_clean']:.3f} "
+            f"R={det_metrics['held_out_recall_clean']:.3f}, perturbed: "
+            f"P={det_metrics['held_out_precision_perturbed']:.3f} "
+            f"R={det_metrics['held_out_recall_perturbed']:.3f} (f1={det_metrics['held_out_f1']:.3f} "
+            f"auc={det_metrics['held_out_auc']:.3f}, on {det_metrics['n_query']} held-out points)",
             f"flagged {det_metrics['n_detected']} as poisoned; oracle poisoned this task = "
             f"{det_metrics['n_oracle']}",
             f"JOINT replay buffer distribution (dropped_rows/amnesiac/opposite_class share this one; "
