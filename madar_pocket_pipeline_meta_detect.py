@@ -370,46 +370,86 @@ def main():
     ap.add_argument("--no_breakpoint", action="store_true",
                      help="Disable the interactive breakpoint() pause at the end of tasks "
                           f">= {base.BREAKPOINT_FROM_TASK}.")
+    ap.add_argument("--resume_from", type=str, default=None,
+                     help="Path to a per-task checkpoint (classifier_checkpoint_task<t>.pt) to resume "
+                          "from. Restores lineage weights, both replay buffers, task_test_splits, and "
+                          "results, then continues from the task AFTER the checkpoint's own task_id. "
+                          "--seed/--hidden_sizes/--poison_fraction/--per_feature_epsilon are restored "
+                          "from the checkpoint itself (a mismatch with what you passed is a warning, "
+                          "not an error) since they're baked into the saved weights/history; "
+                          "--adapt_epochs and the --meta_* flags are still taken fresh from the command "
+                          "line, since they only affect tasks not yet run.")
     args = ap.parse_args()
     hidden_sizes = tuple(int(h) for h in args.hidden_sizes.split(","))
+
+    resume_ckpt = None
+    if args.resume_from:
+        resume_ckpt = torch.load(args.resume_from, map_location=base.DEVICE, weights_only=False)
+        if tuple(resume_ckpt["hidden_sizes"]) != hidden_sizes:
+            print(f"[resume] --hidden_sizes {hidden_sizes} ignored -- using checkpoint's "
+                  f"{tuple(resume_ckpt['hidden_sizes'])} instead (weights were trained with it).")
+        hidden_sizes = tuple(resume_ckpt["hidden_sizes"])
+        if resume_ckpt["seed"] != args.seed:
+            print(f"[resume] --seed {args.seed} ignored -- using checkpoint's {resume_ckpt['seed']} instead.")
+        args.seed = resume_ckpt["seed"]
+        if resume_ckpt["poison_fraction"] != args.poison_fraction:
+            print(f"[resume] --poison_fraction {args.poison_fraction} ignored -- using checkpoint's "
+                  f"{resume_ckpt['poison_fraction']} instead.")
+        poison_fraction = resume_ckpt["poison_fraction"]
+        if resume_ckpt["per_feature_epsilon"] != args.per_feature_epsilon:
+            print(f"[resume] --per_feature_epsilon {args.per_feature_epsilon} ignored -- using "
+                  f"checkpoint's {resume_ckpt['per_feature_epsilon']} instead.")
+        args.per_feature_epsilon = resume_ckpt["per_feature_epsilon"]
+    else:
+        poison_fraction = args.poison_fraction
 
     base.SEED = args.seed  # update_shared_buffer reads this module-level global
     base.ADAPT_EPOCHS = args.adapt_epochs
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    poison_fraction = args.poison_fraction
 
     out_dir = os.path.join(base.RUNS_BASE_DIR, "madar_pocket_meta_detect", args.log_name)
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
     log_path = os.path.join(out_dir, "logs", "pipeline_log.txt")
     meta_log_path = os.path.join(out_dir, "logs", "meta_log.txt")
-    checkpoint_path = os.path.join(out_dir, "logs", "classifier_checkpoint.pt")
+
+    def checkpoint_path_for(task_id):
+        return os.path.join(out_dir, "logs", f"classifier_checkpoint_task{task_id}.pt")
 
     _META_LOG_PATH = meta_log_path
-    with open(meta_log_path, "w") as f:
-        f.write(f"META-DETECT TIMING LOG -- run started {datetime.datetime.now().isoformat()}\n"
-                f"args: {vars(args)}\n\n")
-    _tlog("Run starting")
+    resuming_same_log = bool(resume_ckpt) and os.path.exists(meta_log_path)
+    with open(meta_log_path, "a" if resuming_same_log else "w") as f:
+        if resuming_same_log:
+            f.write(f"\n--- RESUMED from {args.resume_from} (after task {resume_ckpt['task_id']}) "
+                    f"at {datetime.datetime.now().isoformat()} -- args: {vars(args)}\n\n")
+        else:
+            f.write(f"META-DETECT TIMING LOG -- run started {datetime.datetime.now().isoformat()}\n"
+                    f"args: {vars(args)}\n\n")
+    _tlog("Run starting" if not resume_ckpt else f"Run resuming from {args.resume_from}")
 
-    with open(log_path, "w") as f:
-        f.write(
-            "MADAR POCKET-PIPELINE LOG (episodic meta-detector: xgboost separator)\n"
-            "======================================================================\n"
-            "5 lineages per task: clean (reference), poisoned_baseline (no fix),\n"
-            "dropped_rows, amnesiac, opposite_class. Same poisoning/attack/unlearning\n"
-            "mechanics as madar_pocket_pipeline.py -- see that file. The ONLY difference\n"
-            "is the detector: a single-task episodic sampling procedure (originally ported\n"
-            "from task8_pipeline-Copy1-withmeta.ipynb as a Reptile-trained linear\n"
-            "separator) feeding a small xgboost classifier, in place of the oracle\n"
-            "detector's balanced-batch xgboost/logistic classifier.\n"
-            f"Classifier hidden layer sizes: {hidden_sizes}\n"
-            f"Per-feature epsilon cap: {args.per_feature_epsilon}\n"
-            f"Episodic sampling: {args.meta_outer_episodes} episodes x {args.meta_inner_steps} inner "
-            f"steps x {args.meta_samples_per_step} samples/step, knn_k={args.meta_knn_k} "
-            f"(--meta_inner_lr/--meta_lr are unused by this variant)\n"
-            f"Adapt epochs (per-task fix/poison training): {args.adapt_epochs}\n"
-        )
+    with open(log_path, "a" if resuming_same_log else "w") as f:
+        if resuming_same_log:
+            f.write(f"\n--- RESUMED from {args.resume_from} (after task {resume_ckpt['task_id']}) "
+                    f"at {datetime.datetime.now().isoformat()} ---\n")
+        else:
+            f.write(
+                "MADAR POCKET-PIPELINE LOG (episodic meta-detector: xgboost separator)\n"
+                "======================================================================\n"
+                "5 lineages per task: clean (reference), poisoned_baseline (no fix),\n"
+                "dropped_rows, amnesiac, opposite_class. Same poisoning/attack/unlearning\n"
+                "mechanics as madar_pocket_pipeline.py -- see that file. The ONLY difference\n"
+                "is the detector: a single-task episodic sampling procedure (originally ported\n"
+                "from task8_pipeline-Copy1-withmeta.ipynb as a Reptile-trained linear\n"
+                "separator) feeding a small xgboost classifier, in place of the oracle\n"
+                "detector's balanced-batch xgboost/logistic classifier.\n"
+                f"Classifier hidden layer sizes: {hidden_sizes}\n"
+                f"Per-feature epsilon cap: {args.per_feature_epsilon}\n"
+                f"Episodic sampling: {args.meta_outer_episodes} episodes x {args.meta_inner_steps} inner "
+                f"steps x {args.meta_samples_per_step} samples/step, knn_k={args.meta_knn_k} "
+                f"(--meta_inner_lr/--meta_lr are unused by this variant)\n"
+                f"Adapt epochs (per-task fix/poison training): {args.adapt_epochs}\n"
+            )
 
     print(f"Loading {args.h5_path} and building {base.NUM_TASKS} pooled chronological tasks...")
     tasks, day_mapping, label_mapping = base.load_pooled_chronological_tasks(args.h5_path, base.TASK_FRACTIONS)
@@ -421,18 +461,40 @@ def main():
 
     task_offsets = np.concatenate([[0], np.cumsum([len(t["labels"]) for t in tasks])[:-1]])
 
-    scaler = None
-    lineages = {}
-    baseline_label_buffers, baseline_replay_buffer = {}, []
-    joint_label_buffers, joint_replay_buffer = {}, []
-    task_test_splits, task_test_gids = {}, {}
-    results = []
+    if resume_ckpt:
+        if resume_ckpt["feature_dim"] != feature_dim:
+            raise ValueError(f"Checkpoint's feature_dim ({resume_ckpt['feature_dim']}) doesn't match "
+                              f"this --h5-path's feature_dim ({feature_dim}) -- wrong dataset?")
+        scaler = resume_ckpt["scaler"]
+        lineages = {}
+        for name in LINEAGE_NAMES:
+            m = base.ClassifierNN(feature_dim, 2, hidden_sizes=hidden_sizes).to(base.DEVICE)
+            m.load_state_dict(resume_ckpt["lineages"][name])
+            lineages[name] = base.AdaptableClassifier(m)
+        baseline_label_buffers = resume_ckpt["baseline_label_buffers"]
+        baseline_replay_buffer = resume_ckpt["baseline_replay_buffer"]
+        joint_label_buffers = resume_ckpt["joint_label_buffers"]
+        joint_replay_buffer = resume_ckpt["joint_replay_buffer"]
+        task_test_splits = resume_ckpt["task_test_splits"]
+        task_test_gids = resume_ckpt["task_test_gids"]
+        results = resume_ckpt["results"]
+        start_task = resume_ckpt["task_id"] + 1
+        _tlog(f"Resumed: restored 5 lineages + both buffers from task {resume_ckpt['task_id']}, "
+              f"continuing at task {start_task}")
+    else:
+        scaler = None
+        lineages = {}
+        baseline_label_buffers, baseline_replay_buffer = {}, []
+        joint_label_buffers, joint_replay_buffer = {}, []
+        task_test_splits, task_test_gids = {}, {}
+        results = []
+        start_task = 0
 
     def to_scaled(X_raw):
         return np.clip(scaler.transform(X_raw.astype(np.float32)), -base.FEATURE_CLIP,
                        base.FEATURE_CLIP).astype(np.float32)
 
-    for t in range(base.NUM_TASKS):
+    for t in range(start_task, base.NUM_TASKS):
         print(f"\n{'#' * 60}\n# TASK {t}\n{'#' * 60}")
         _tlog(f"=== Task {t}: start ===")
         task = tasks[t]
@@ -522,7 +584,7 @@ def main():
                 "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
                 "results": results, "poison_fraction": poison_fraction,
                 "hidden_sizes": hidden_sizes, "per_feature_epsilon": args.per_feature_epsilon,
-            }, checkpoint_path)
+            }, checkpoint_path_for(t))
             _tlog(f"=== Task {t}: done (log + checkpoint written) ===")
             continue
 
@@ -911,7 +973,7 @@ def main():
             "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
             "results": results, "poison_fraction": poison_fraction,
             "hidden_sizes": hidden_sizes, "per_feature_epsilon": args.per_feature_epsilon,
-        }, checkpoint_path)
+        }, checkpoint_path_for(t))
         _tlog(f"Task {t}: checkpoint saved")
 
         print(f"Task {t} done. Genuine pocket rate: {base._fmt_pct(succ_pocket.mean())}. "
