@@ -104,6 +104,17 @@ REFERENCE BUGS FIXED IN THE PORT (none change SSF's intended behavior):
     are tracked by chunk index here, which is also what makes the
     poison-vs-label-source diagnostics below possible.
 
+LOGGING/CHECKPOINTS match madar_pocket_pipeline_meta_detect.py: a
+timestamped step-by-step timing log (logs/meta_log.txt, also printed),
+classification reports on each task's ADVERSARIAL test set alongside the
+clean one, a plain-language "Pocket recovery summary (debug)" section every
+task (printed + logged, then a breakpoint() unless --no_breakpoint), and one
+checkpoint per task (logs/classifier_checkpoint_task<t>.pt) with replay
+buffers/ssf memory stored as ids/labels only and test splits as row ids
+only. --resume_from is NOT ported: meta_detect resumes with EMPTY buffers,
+and ssf's memory IS its training set, so an empty-memory resume would not be
+the same method.
+
 DIAGNOSTICS SPECIFIC TO THIS FILE (logged under "Continual-learning
 baselines step"): drift decision + KS p-value per round, how many chunk rows
 were true-labeled vs. pseudo-labeled, how many of each were oracle-poisoned,
@@ -116,6 +127,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import datetime
 import math
 import os
 import time
@@ -143,6 +155,40 @@ SSF_OLD_INIT = "0.5-1"
 SSF_NEW_INIT = "0-0.5"
 SSF_MASK_BINS = 10
 SSF_MASK_STEPS = 100
+
+
+def _buffer_ids_only(label_buffers):
+    """Drops each replay-buffer entry's feature row (index 0), keeping only
+    (label, category, sample_id) -- used ONLY when writing checkpoints, since
+    MEM_SIZE-scale feature rows dominate checkpoint file size. Same helper as
+    madar_pocket_pipeline_meta_detect.py's."""
+    return {lbl: [tuple(e[1:]) for e in entries] for lbl, entries in label_buffers.items()}
+
+
+def _replay_ids_only(replay_buffer):
+    """Same as _buffer_ids_only, for the flattened list form."""
+    return [tuple(e[1:]) for e in replay_buffer]
+
+
+# ---------------------------------------------------------------------------
+# Timestamped step-by-step timing log ("meta_log.txt"), separate from the
+# human-readable pipeline_log.txt -- same mechanism and file name as
+# madar_pocket_pipeline_meta_detect.py's, for diagnosing which step of a real
+# run is actually slow. main() points these at <out_dir>/logs/meta_log.txt
+# before the task loop starts.
+# ---------------------------------------------------------------------------
+_META_LOG_PATH = None
+_META_LOG_T0 = None
+
+
+def _tlog(msg):
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    elapsed = time.perf_counter() - _META_LOG_T0 if _META_LOG_T0 is not None else 0.0
+    line = f"[{now} | +{elapsed:8.1f}s] {msg}"
+    print(line)
+    if _META_LOG_PATH is not None:
+        with open(_META_LOG_PATH, "a") as f:
+            f.write(line + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -495,15 +541,23 @@ def ssf_round(lineage, memory, X_chunk, y_chunk, gid_chunk, cat_chunk, args, con
               memory_size, rng):
     """One SSF round on one chunk: drift check -> masks -> select/forget ->
     retrain on memory. Returns this round's diagnostics dict."""
+    _tlog(f"  [ssf_round] start, memory={len(memory)} rows, chunk={len(y_chunk)} rows")
     mem_out = lineage.malicious_proba(memory.X)
     chunk_out = lineage.malicious_proba(X_chunk)
     drift, p_value = detect_drift(chunk_out, mem_out, SSF_DRIFT_THRESHOLD)
+    _tlog(f"  [ssf_round] drift check done (drift={drift}, KS p={p_value:.3g})")
 
     M_c = optimize_old_mask(mem_out, chunk_out, SSF_OLD_INIT, args.ssf_opt_old_lr)
+    _tlog(f"  [ssf_round] memory mask M_c optimized ({int((M_c.numpy() >= 0.5).sum())}/{len(M_c)} "
+          f"representative)")
     M_t = optimize_new_mask(mem_out, chunk_out, M_c, SSF_NEW_INIT, args.ssf_opt_new_lr)
+    _tlog(f"  [ssf_round] chunk mask M_t optimized ({int((M_t.numpy() >= 0.5).sum())}/{len(M_t)} "
+          f"representative)")
 
     keep_idx, labeled_idx, pseudo_idx = ssf_select(
         M_c, M_t, args.ssf_num_labeled, drift, memory_size, rng)
+    _tlog(f"  [ssf_round] selection done (kept {len(keep_idx)}/{len(memory)} memory rows, "
+          f"labeled {len(labeled_idx)}, pseudo-labeled {len(pseudo_idx)})")
 
     # Pseudo-labels come from the model as it stands BEFORE this round's
     # training, exactly as in the reference.
@@ -530,6 +584,8 @@ def ssf_round(lineage, memory, X_chunk, y_chunk, gid_chunk, cat_chunk, args, con
               batch_size=SSF_BATCH_SIZE, contrastive=contrastive,
               new_sample_weight=args.ssf_new_sample_weight,
               teacher=None if drift else teacher, lwf_lambda=SSF_LWF_LAMBDA)
+    _tlog(f"  [ssf_round] trained {args.ssf_epochs} epoch(s) on memory ({len(memory)} rows, "
+          f"LwF {'off -- drift' if drift else 'on'})")
 
     is_poisoned = np.char.endswith(cat_chunk.astype(str), "_perturbed")
     pseudo_correct = (pseudo_y == y_chunk[pseudo_idx]) if len(pseudo_idx) else np.array([], dtype=bool)
@@ -597,7 +653,9 @@ def _fmt_rounds(rounds):
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    global _META_LOG_PATH, _META_LOG_T0
     start_time = time.perf_counter()
+    _META_LOG_T0 = start_time
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log_name", type=str, default="madar_pocket_ssf_run")
@@ -632,8 +690,9 @@ def main():
                      help="Split each task's poisoned training batch into this many SSF rounds "
                           "(chunks). Each round gets its own --ssf_num_labeled label budget.")
     ap.add_argument("--no_breakpoint", action="store_true",
-                     help="Disable the interactive breakpoint() pause at the end of tasks "
-                          f">= {base.BREAKPOINT_FROM_TASK}.")
+                     help="Disable the interactive breakpoint() pauses: after every task's pocket "
+                          "recovery summary, and at the end of tasks "
+                          f">= {base.BREAKPOINT_FROM_TASK}. Needed for a non-interactive/headless run.")
     args = ap.parse_args()
     hidden_sizes = tuple(int(h) for h in args.hidden_sizes.split(","))
     if not 0 < args.ssf_buffer_percent <= 1:
@@ -652,7 +711,16 @@ def main():
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
     log_path = os.path.join(out_dir, "logs", "pipeline_log.txt")
-    checkpoint_path = os.path.join(out_dir, "logs", "classifier_checkpoint.pt")
+    meta_log_path = os.path.join(out_dir, "logs", "meta_log.txt")
+
+    def checkpoint_path_for(task_id):
+        return os.path.join(out_dir, "logs", f"classifier_checkpoint_task{task_id}.pt")
+
+    _META_LOG_PATH = meta_log_path
+    with open(meta_log_path, "w") as f:
+        f.write(f"SSF TIMING LOG -- run started {datetime.datetime.now().isoformat()}\n"
+                f"args: {vars(args)}\n\n")
+    _tlog("Run starting")
 
     print(f"Loading {args.h5_path} and building {base.NUM_TASKS} pooled chronological tasks...")
     tasks, day_mapping, label_mapping = base.load_pooled_chronological_tasks(
@@ -685,7 +753,7 @@ def main():
     if memory_size < memory_size_requested:
         memory_note += (f"  <-- CAPPED: requested {memory_size_requested} exceeds task 0's training "
                         f"split, so memory starts as ALL of task 0")
-    print(memory_note)
+    _tlog(memory_note)
 
     with open(log_path, "w") as f:
         f.write(
@@ -726,10 +794,12 @@ def main():
         y_all = task["labels"].astype(np.int64)
         gid_all = task_offsets[t] + np.arange(len(y_all), dtype=np.int64)
 
+        _tlog(f"=== Task {t}: start ===")
         X_train_raw, X_test_raw, y_train, y_test, gid_train, gid_test = train_test_split(
             X_raw, y_all, gid_all, test_size=base.TASK_TEST_FRAC, random_state=args.seed,
             stratify=y_all,
         )
+        _tlog(f"Task {t}: train/test split done (train={len(y_train)}, test={len(y_test)})")
 
         # -------------------------------------------------------------
         # Task 0: plain supervised pretraining only, no poisoning yet.
@@ -746,7 +816,8 @@ def main():
             loss_fn0 = nn.CrossEntropyLoss()
             base_model.train()
             n = len(Xt)
-            for _ in range(base.TASK0_EPOCHS):
+            _tlog(f"Task 0: pretraining shared ClassifierNN for {base.TASK0_EPOCHS} epochs on {n} rows")
+            for epoch in range(base.TASK0_EPOCHS):
                 perm = torch.randperm(n)
                 for i in range(0, n, base.TASK0_BATCH_SIZE):
                     idx = perm[i:i + base.TASK0_BATCH_SIZE]
@@ -756,16 +827,20 @@ def main():
                     loss = loss_fn0(base_model(Xt[idx]), yt[idx])
                     loss.backward()
                     opt0.step()
+                _tlog(f"  Task 0: pretraining epoch {epoch + 1}/{base.TASK0_EPOCHS} done")
             base_model.eval()
+            _tlog("Task 0: shared ClassifierNN pretraining done")
 
             for name in ["clean", "poisoned_baseline"]:
                 lineages[name] = base.AdaptableClassifier(copy.deepcopy(base_model))
 
             # ssf: its OWN model, pretrained with its OWN loss on the same data.
+            _tlog(f"Task 0: pretraining ssf's AE_classifier for {base.TASK0_EPOCHS} epochs on {n} rows")
             ssf_model = ssf_pretrain(feature_dim, X_train_scaled, y_train, contrastive,
                                      epochs=base.TASK0_EPOCHS, batch_size=SSF_BATCH_SIZE, lr=base.TASK0_LR)
             lineages["ssf"] = SSFLineage(ssf_model, lr=base.ADAPT_LR, weight_decay=base.ADAPT_WEIGHT_DECAY)
             ssf_teacher = copy.deepcopy(ssf_model).eval()
+            _tlog("Task 0: ssf pretraining done")
 
             category = np.where(y_train == benign_label, "benign", "malicious_clean").astype(object)
             mem_idx = ssf_rng.choice(len(y_train), size=memory_size, replace=False)
@@ -785,6 +860,7 @@ def main():
                 lineages["poisoned_baseline"], baseline_label_buffers, X_train_scaled, y_train,
                 category, gid_train, benign_label, mal_label,
             )
+            _tlog("Task 0: replay buffers + ssf memory filled")
 
             train_section = (
                 f"malicious: {int((y_train == mal_label).sum())}, benign: {int((y_train == benign_label).sum())}\n"
@@ -813,17 +889,22 @@ def main():
                 "task_id": t, "seed": args.seed, "feature_dim": feature_dim, "scaler": scaler,
                 "label_mapping": label_mapping,
                 "lineages": {name: lineages[name].model.state_dict() for name in LINEAGE_NAMES},
-                "clean_label_buffers": clean_label_buffers, "clean_replay_buffer": clean_replay_buffer,
-                "baseline_label_buffers": baseline_label_buffers,
-                "baseline_replay_buffer": baseline_replay_buffer,
-                # Feature rows not persisted (memory can be 20% of the dataset) -- ids/labels only.
+                # Feature rows intentionally NOT persisted (they dominate checkpoint file size) --
+                # only each entry's (label, category, sample_id) survives; see _buffer_ids_only.
+                "clean_label_buffers": _buffer_ids_only(clean_label_buffers),
+                "clean_replay_buffer": _replay_ids_only(clean_replay_buffer),
+                "baseline_label_buffers": _buffer_ids_only(baseline_label_buffers),
+                "baseline_replay_buffer": _replay_ids_only(baseline_replay_buffer),
                 "ssf_memory": {"gid": ssf_memory.gid, "y": ssf_memory.y, "category": ssf_memory.category,
                                "label_source": ssf_memory.label_source},
-                "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
+                # task_test_splits (X_test_raw, y_test per task) intentionally NOT persisted, same
+                # reason -- task_test_gids (just the row IDs) still is.
+                "task_test_gids": task_test_gids,
                 "results": results, "poison_fraction": poison_fraction,
                 "hidden_sizes": hidden_sizes, "per_feature_epsilon": args.per_feature_epsilon,
                 "ssf_args": {k: v for k, v in vars(args).items() if k.startswith("ssf_")},
-            }, checkpoint_path)
+            }, checkpoint_path_for(t))
+            _tlog(f"=== Task {t}: done (log + checkpoint written) ===")
             continue
 
         # -------------------------------------------------------------
@@ -835,10 +916,12 @@ def main():
         baseline_replay_X, baseline_replay_y = base.flatten_replay(baseline_replay_buffer)
 
         # Step 2: clean lineage adapts on clean data + its own clean buffer.
+        _tlog(f"Task {t}: step 2 -- adapting clean lineage")
         lineages["clean"].adapt(X_train_scaled, y_train, replay_X=clean_replay_X,
                                 replay_y=clean_replay_y, epochs=base.CLEAN_ADAPT_EPOCHS)
 
         # Step 3: craft this task's poison, shared by poisoned_baseline/ssf.
+        _tlog(f"Task {t}: step 3 -- crafting poison (poison_fraction={poison_fraction})")
         X_train_poisoned, idx_poison_ben, idx_poison_mal, _ = base.craft_task_poison(
             lineages["clean"], X_train_scaled, y_train, benign_label, mal_label, poison_fraction,
         )
@@ -846,9 +929,11 @@ def main():
         category_all = np.where(y_train == benign_label, "benign", "malicious_clean").astype(object)
         category_all[idx_poison_ben] = "benign_perturbed"
         category_all[idx_poison_mal] = "malicious_perturbed"
+        _tlog(f"Task {t}: step 3 done ({len(poison_idx)} poisoned rows)")
 
         # Step 4: poisoned_baseline adapts on poisoned data ("no fix"),
         # identical to madar_pocket_pipeline.py.
+        _tlog(f"Task {t}: step 4 -- adapting poisoned_baseline")
         lineages["poisoned_baseline"].adapt(X_train_poisoned, y_train,
                                             replay_X=baseline_replay_X, replay_y=baseline_replay_y,
                                             epochs=base.ADAPT_EPOCHS)
@@ -861,28 +946,34 @@ def main():
         # --ssf_rounds_per_task unlabeled chunks (true labels only reach it
         # through its per-round label budget). Teacher = the model at the
         # end of the previous round, updated after every round (reference).
+        _tlog(f"Task {t}: step 5 -- ssf adapting ({args.ssf_rounds_per_task} round(s))")
         chunk_order = ssf_rng.permutation(len(y_train))
         ssf_rounds = []
-        for chunk in np.array_split(chunk_order, args.ssf_rounds_per_task):
+        for r_i, chunk in enumerate(np.array_split(chunk_order, args.ssf_rounds_per_task)):
             if len(chunk) == 0:
                 continue
+            _tlog(f"  Task {t}: step 5 -- ssf round {r_i + 1}/{args.ssf_rounds_per_task}")
             ssf_rounds.append(ssf_round(
                 lineages["ssf"], ssf_memory, X_train_poisoned[chunk], y_train[chunk], gid_train[chunk],
                 category_all[chunk], args, contrastive, ssf_teacher, memory_size, ssf_rng,
             ))
             ssf_teacher = copy.deepcopy(lineages["ssf"].model).eval()
+        _tlog(f"Task {t}: step 5 done")
 
         # Step 6: craft this task's genuine-pocket test attack, ONCE, against
         # poisoned_baseline (reference = clean) -- same points re-scored under
         # every lineage below.
+        _tlog(f"Task {t}: step 6 -- crafting this task's adversarial test attack")
         eps_this_task = base.typical_class_gap(X_test_scaled, y_test, benign_label,
                                                mal_label) * base.ATTACK_EPS_MULTIPLIER
         X_test_adv, succ_pocket, norms_pocket = base.adversarial_attack_pocket(
             lineages["poisoned_baseline"], lineages["clean"], X_test_scaled, y_test,
             epsilon_max=eps_this_task, per_feature_epsilon=args.per_feature_epsilon,
         )
+        _tlog(f"Task {t}: step 6 done (genuine pocket rate {base._fmt_pct(succ_pocket.mean())})")
 
         # Step 7: spillover check -- re-attack every PRIOR task's test set.
+        _tlog(f"Task {t}: step 7 -- spillover re-attack over {len(task_test_splits)} prior task(s)")
         historical_adv = {}
         for s, (Xs_raw, ys) in task_test_splits.items():
             Xs_scaled = to_scaled(Xs_raw)
@@ -893,6 +984,8 @@ def main():
                 per_feature_epsilon=args.per_feature_epsilon,
             )
             historical_adv[s] = (Xs_adv, ys, succ_s, eps_s)
+            _tlog(f"  Task {t}: step 7 -- re-attacked source task {s} ({len(ys)} rows)")
+        _tlog(f"Task {t}: step 7 done")
 
         all_clean_sets = {s: (to_scaled(Xs_raw), ys) for s, (Xs_raw, ys) in task_test_splits.items()}
         all_clean_sets[t] = (X_test_scaled, y_test)
@@ -904,6 +997,7 @@ def main():
         pocket_info_by_source = {s: (v[2], v[3]) for s, v in historical_adv.items()}
         pocket_info_by_source[t] = (succ_pocket, eps_this_task)
 
+        _tlog(f"Task {t}: computing pooled/mean/per-class accuracy for all lineages")
         pooled_results, mean_results, per_class_reports, per_task_by_lineage = {}, {}, {}, {}
         for name in LINEAGE_NAMES:
             pooled_acc, mean_acc, per_task = base.pooled_and_per_task_accuracy(
@@ -912,6 +1006,7 @@ def main():
             mean_results[name] = mean_acc
             per_task_by_lineage[name] = per_task
             per_class_reports[name] = base._fmt_report(lineages[name], X_test_scaled, y_test)
+            _tlog(f"  Task {t}: accuracy -- {name} done")
 
         still_evades = {}
         for name in BASELINE_NAMES:
@@ -923,6 +1018,7 @@ def main():
         # lineage's adaptation this task is fully done. ssf's memory was
         # already updated inside its own rounds (SSF curates memory BEFORE
         # training on it, by design).
+        _tlog(f"Task {t}: step 8 -- updating replay buffers")
         clean_category = np.where(y_train == benign_label, "benign", "malicious_clean")
         clean_replay_buffer = base.update_shared_buffer(
             lineages["clean"], clean_label_buffers, X_train_scaled, y_train, clean_category, gid_train,
@@ -933,6 +1029,7 @@ def main():
             category_all, gid_train, benign_label, mal_label,
         )
 
+        _tlog(f"Task {t}: step 8 done")
         task_test_splits[t] = (X_test_raw, y_test)
         task_test_gids[t] = gid_test
 
@@ -978,6 +1075,8 @@ def main():
         for name in ["clean", "poisoned_baseline"]:
             adapt_lines.append(f"[{name}] classification report (this task's clean test):")
             adapt_lines.append(per_class_reports[name])
+            adapt_lines.append(f"[{name}] classification report (this task's adversarial test):")
+            adapt_lines.append(base._fmt_report(lineages[name], X_test_adv, y_test))
         adapt_section = "\n".join(adapt_lines)
 
         cl_lines = [
@@ -1001,6 +1100,8 @@ def main():
         for name in BASELINE_NAMES:
             cl_lines.append(f"[{name}] classification report (this task's clean test):")
             cl_lines.append(per_class_reports[name])
+            cl_lines.append(f"[{name}] classification report (this task's adversarial test):")
+            cl_lines.append(base._fmt_report(lineages[name], X_test_adv, y_test))
         cl_section = "\n".join(cl_lines)
 
         breakdown_lines = [
@@ -1053,13 +1154,82 @@ def main():
             breakdown_lines.append(row)
         breakdown_section = "\n".join(breakdown_lines)
 
+        # ---------------------------------------------------------------
+        # Debug: pocket send/recovery summary -- same block as
+        # madar_pocket_pipeline_meta_detect.py's, for ssf (the lineage under
+        # test) instead of the fix variants: how many test points were sent
+        # into a genuine pocket this task, how many of those ssf does NOT
+        # fall for, how healthy ssf looks on ordinary (non-attacked) traffic
+        # right now, and whether this task's adaptation reopened any EARLIER
+        # task's pockets. Always printed+logged; followed by an interactive
+        # breakpoint() unless --no_breakpoint. Written in plain language on
+        # purpose -- this is meant to be read live, task by task.
+        # ---------------------------------------------------------------
+        n_pocketed = int(succ_pocket.sum())
+        pocket_lines = [
+            f"Sent into pockets (genuine pockets found, this task's test set): "
+            f"{n_pocketed}/{len(y_test)} ({base._fmt_pct(succ_pocket.mean())})",
+            f"  benign side: {succ_ben}/{n_ben_test}, malicious side: {succ_mal}/{n_mal_test}",
+            "",
+            f"Recovered after adaptation (of the {n_pocketed} pocketed points, no longer evading):",
+        ]
+        lineage_still_evading = {}
+        for name in BASELINE_NAMES:
+            pred_name = lineages[name].predict(X_test_adv)
+            still_evading_mask = (pred_name != y_test) & succ_pocket
+            lineage_still_evading[name] = still_evading_mask
+            n_recovered = n_pocketed - int(still_evading_mask.sum())
+            pct_recovered = base._fmt_pct(n_recovered / n_pocketed) if n_pocketed else "N/A"
+            pocket_lines.append(f"  {name:<18}: {n_recovered}/{n_pocketed} recovered ({pct_recovered})")
+        pocket_lines.append("")
+        pocket_lines.append("How well each lineage under test reads NORMAL (non-attacked) traffic right now:")
+        for name in BASELINE_NAMES:
+            pred_clean = lineages[name].predict(X_test_scaled)
+            catch_ben = (pred_clean[y_test == benign_label] == benign_label).mean() if n_ben_test else float("nan")
+            catch_mal = (pred_clean[y_test == mal_label] == mal_label).mean() if n_mal_test else float("nan")
+            pocket_lines.append(
+                f"  {name:<18}: catches {base._fmt_pct(catch_ben)} of benign, "
+                f"{base._fmt_pct(catch_mal)} of malicious"
+            )
+        pocket_lines.append("")
+        pockets_to_check = [
+            (s, historical_adv[s]) for s in sorted(historical_adv.keys()) if int(historical_adv[s][2].sum()) > 0
+        ]
+        if pockets_to_check:
+            pocket_lines.append(
+                "Checking back on earlier tasks' pockets (did adapting to THIS task "
+                "accidentally reopen any of them?):"
+            )
+            for s, (Xs_adv, ys, succ_s, eps_s) in pockets_to_check:
+                n_pocketed_s = int(succ_s.sum())
+                pocket_lines.append(f"  Task {s}'s pockets ({n_pocketed_s} total):")
+                for name in BASELINE_NAMES:
+                    pred_s = lineages[name].predict(Xs_adv)
+                    n_still_closed = int((succ_s & (pred_s == ys)).sum())
+                    pocket_lines.append(
+                        f"    {name:<18}: {n_still_closed}/{n_pocketed_s} still closed "
+                        f"({base._fmt_pct(n_still_closed / n_pocketed_s)})"
+                    )
+        else:
+            pocket_lines.append("No earlier tasks with pockets to check yet.")
+        pocket_summary = "\n".join(pocket_lines)
+        print(f"\n--- Task {t}: pocket recovery summary ---\n{pocket_summary}")
+        _tlog(f"Task {t}: pocket recovery summary\n{pocket_summary}")
+
+        _tlog(f"Task {t}: writing pipeline_log.txt")
         base.write_task_log(log_path, t, [
             ("Training Data information", train_section),
             ("Testing Data information", test_section),
             ("Adaptation step", adapt_section),
             ("Continual-learning baselines step", cl_section),
             ("Adversarial test-set breakdown (per source task)", breakdown_section),
+            ("Pocket recovery summary (debug)", pocket_summary),
         ])
+
+        if not args.no_breakpoint:
+            print(f"\n[breakpoint] Task {t}: pocket recovery summary above -- inspect `succ_pocket`, "
+                  f"`lineage_still_evading`, `X_test_adv`, `y_test`, `lineages`. Continue with `c`.")
+            breakpoint()
 
         spillover_summary = {s: float(v[2].mean()) for s, v in historical_adv.items()}
         results.append({
@@ -1073,31 +1243,41 @@ def main():
             "task_id": t, "seed": args.seed, "feature_dim": feature_dim, "scaler": scaler,
             "label_mapping": label_mapping,
             "lineages": {name: lineages[name].model.state_dict() for name in LINEAGE_NAMES},
-            "clean_label_buffers": clean_label_buffers, "clean_replay_buffer": clean_replay_buffer,
-            "baseline_label_buffers": baseline_label_buffers,
-            "baseline_replay_buffer": baseline_replay_buffer,
+            # Feature rows intentionally NOT persisted (they dominate checkpoint file size) --
+            # only each entry's (label, category, sample_id) survives; see _buffer_ids_only.
+            "clean_label_buffers": _buffer_ids_only(clean_label_buffers),
+            "clean_replay_buffer": _replay_ids_only(clean_replay_buffer),
+            "baseline_label_buffers": _buffer_ids_only(baseline_label_buffers),
+            "baseline_replay_buffer": _replay_ids_only(baseline_replay_buffer),
             "ssf_memory": {"gid": ssf_memory.gid, "y": ssf_memory.y, "category": ssf_memory.category,
                            "label_source": ssf_memory.label_source},
-            "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
+            # task_test_splits (X_test_raw, y_test per task) intentionally NOT persisted, same
+            # reason -- task_test_gids (just the row IDs) still is.
+            "task_test_gids": task_test_gids,
             "results": results, "poison_fraction": poison_fraction,
             "hidden_sizes": hidden_sizes, "per_feature_epsilon": args.per_feature_epsilon,
             "ssf_args": {k: v for k, v in vars(args).items() if k.startswith("ssf_")},
-        }, checkpoint_path)
+        }, checkpoint_path_for(t))
+        _tlog(f"Task {t}: checkpoint saved")
 
         print(f"Task {t} done. Genuine pocket rate: {base._fmt_pct(succ_pocket.mean())}. "
               f"Log written to {log_path}")
+        _tlog(f"=== Task {t}: done (genuine pocket rate {base._fmt_pct(succ_pocket.mean())}) ===")
 
         if t == base.NUM_TASKS - 1:
+            _tlog(f"Task {t}: rendering final PCA correctness-grid plot")
             pca_fit = PCA(n_components=2, random_state=args.seed).fit(X_train_scaled)
             panels = [(name, lineages[name], X_test_scaled, y_test) for name in LINEAGE_NAMES]
             base.plot_correctness_grid(
                 os.path.join(out_dir, "plots", f"task{t}_correctness.png"), pca_fit, panels)
+            _tlog(f"Task {t}: plot saved")
 
         if not args.no_breakpoint and t >= base.BREAKPOINT_FROM_TASK:
             print(f"\n[breakpoint] Task {t} finished -- inspect `results`, `lineages`, "
                   f"`ssf_memory`, or the log at {log_path}. Continue with `c`.")
             breakpoint()
 
+    _tlog(f"Run done. Total runtime: {time.perf_counter() - start_time:.1f}s")
     print(f"\nDone. Total runtime: {time.perf_counter() - start_time:.1f}s")
 
 
