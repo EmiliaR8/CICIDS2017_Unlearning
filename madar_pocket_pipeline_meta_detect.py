@@ -110,6 +110,22 @@ import madar_pocket_pipeline as base
 LINEAGE_NAMES = ["clean", "poisoned_baseline", "dropped_rows", "amnesiac", "opposite_class"]
 FIX_NAMES = ["dropped_rows", "amnesiac", "opposite_class"]
 
+
+def _buffer_ids_only(label_buffers):
+    """Drops each replay-buffer entry's feature row (index 0), keeping only
+    (label, category, sample_id) -- used ONLY when writing checkpoints, since
+    MEM_SIZE-scale feature rows dominate checkpoint file size. NOT used at
+    runtime: flatten_replay()/update_shared_buffer() need the real feature
+    rows, so this only ever touches the serialized copy going into the
+    checkpoint dict, never the live in-memory buffers."""
+    return {lbl: [tuple(e[1:]) for e in entries] for lbl, entries in label_buffers.items()}
+
+
+def _replay_ids_only(replay_buffer):
+    """Same as _buffer_ids_only, for the flattened list form."""
+    return [tuple(e[1:]) for e in replay_buffer]
+
+
 # ---------------------------------------------------------------------------
 # Timestamped step-by-step timing log ("meta_log.txt"), separate from the
 # human-readable pipeline_log.txt -- for diagnosing which step of a real run
@@ -167,6 +183,14 @@ def replay_knn_distance(X, y, replay_X_np, replay_y_np, k=5):
     same-class neighbors in the replay buffer -- poisoned points, shifted
     toward the opposite class, should sit unusually far from their own
     class's established prior-task samples."""
+    if replay_X_np is None or len(replay_X_np) == 0:
+        # No replay buffer yet (e.g. right after --resume_from, which starts
+        # both buffers fresh rather than persisting their feature rows) --
+        # leave this feature NaN for every row; xgboost treats NaN as a
+        # missing value natively, so this column is just uninformative
+        # rather than a crash.
+        _tlog("  [replay_knn_distance] skipped -- no replay buffer yet")
+        return np.full(len(X), np.nan)
     _tlog(f"  [replay_knn_distance] start, {len(X)} rows vs replay buffer of {len(replay_X_np)}")
     dist = np.full(len(X), np.nan)
     for c in np.unique(y):
@@ -189,6 +213,11 @@ def fit_density_ratio_model(X_current, replay_X_np):
     from the current task's points ('new', label 1). p/(1-p) is the density
     ratio: values >> 1 mean a point looks much more like the current task
     than like anything in the established prior-task distribution."""
+    if replay_X_np is None or len(replay_X_np) == 0:
+        # No replay buffer yet (see replay_knn_distance's same guard) --
+        # nothing to discriminate against; density_ratio_score handles clf=None.
+        _tlog("  [fit_density_ratio_model] skipped -- no replay buffer yet")
+        return None
     _tlog(f"  [fit_density_ratio_model] start, {len(replay_X_np)} replay + {len(X_current)} current rows")
     Xd = np.vstack([replay_X_np, X_current])
     yd = np.concatenate([np.zeros(len(replay_X_np)), np.ones(len(X_current))])
@@ -198,6 +227,8 @@ def fit_density_ratio_model(X_current, replay_X_np):
 
 
 def density_ratio_score(clf, X):
+    if clf is None:
+        return np.full(len(X), np.nan)
     p = np.clip(clf.predict_proba(X)[:, 1], 1e-6, 1 - 1e-6)
     return p / (1 - p)
 
@@ -372,8 +403,13 @@ def main():
                           f">= {base.BREAKPOINT_FROM_TASK}.")
     ap.add_argument("--resume_from", type=str, default=None,
                      help="Path to a per-task checkpoint (classifier_checkpoint_task<t>.pt) to resume "
-                          "from. Restores lineage weights, both replay buffers, task_test_splits, and "
-                          "results, then continues from the task AFTER the checkpoint's own task_id. "
+                          "from. Restores lineage weights and results, then continues from the task "
+                          "AFTER the checkpoint's own task_id. Both replay buffers start FRESH/empty "
+                          "(refilling naturally over the next few tasks) and task_test_splits starts "
+                          "empty too (so the 'Adversarial test-set breakdown' table won't show spillover "
+                          "rows for tasks before the resume point) -- neither's feature rows are "
+                          "persisted in the checkpoint (only each entry's label/category/sample_id is, "
+                          "to keep checkpoint files small), so there's nothing to restore them from. "
                           "--seed/--hidden_sizes/--poison_fraction/--per_feature_epsilon are restored "
                           "from the checkpoint itself (a mismatch with what you passed is a warning, "
                           "not an error) since they're baked into the saved weights/history; "
@@ -471,16 +507,24 @@ def main():
             m = base.ClassifierNN(feature_dim, 2, hidden_sizes=hidden_sizes).to(base.DEVICE)
             m.load_state_dict(resume_ckpt["lineages"][name])
             lineages[name] = base.AdaptableClassifier(m)
-        baseline_label_buffers = resume_ckpt["baseline_label_buffers"]
-        baseline_replay_buffer = resume_ckpt["baseline_replay_buffer"]
-        joint_label_buffers = resume_ckpt["joint_label_buffers"]
-        joint_replay_buffer = resume_ckpt["joint_replay_buffer"]
-        task_test_splits = resume_ckpt["task_test_splits"]
+        # Replay buffers and task_test_splits are NOT restored from the
+        # checkpoint -- their feature rows are the expensive part and are
+        # intentionally not persisted (see _buffer_ids_only/_replay_ids_only
+        # on the save side). Both start fresh: the replay buffers refill
+        # naturally over the next few tasks via update_shared_buffer(), same
+        # as a brand-new run's task 0; task_test_splits simply won't have
+        # entries for tasks before the resume point, so the "Adversarial
+        # test-set breakdown" table's spillover rows for those tasks are
+        # silently absent going forward rather than reconstructed.
+        baseline_label_buffers, baseline_replay_buffer = {}, []
+        joint_label_buffers, joint_replay_buffer = {}, []
+        task_test_splits = {}
         task_test_gids = resume_ckpt["task_test_gids"]
         results = resume_ckpt["results"]
         start_task = resume_ckpt["task_id"] + 1
-        _tlog(f"Resumed: restored 5 lineages + both buffers from task {resume_ckpt['task_id']}, "
-              f"continuing at task {start_task}")
+        _tlog(f"Resumed: restored 5 lineages from task {resume_ckpt['task_id']} (replay buffers and "
+              f"task_test_splits start fresh -- not persisted in checkpoints), continuing at task "
+              f"{start_task}")
     else:
         scaler = None
         lineages = {}
@@ -579,9 +623,15 @@ def main():
                 "task_id": t, "seed": args.seed, "feature_dim": feature_dim, "scaler": scaler,
                 "label_mapping": label_mapping,
                 "lineages": {name: lineages[name].model.state_dict() for name in LINEAGE_NAMES},
-                "baseline_label_buffers": baseline_label_buffers, "baseline_replay_buffer": baseline_replay_buffer,
-                "joint_label_buffers": joint_label_buffers, "joint_replay_buffer": joint_replay_buffer,
-                "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
+                # Feature rows intentionally NOT persisted (they dominate checkpoint file size) --
+                # only each entry's (label, category, sample_id) survives; see _buffer_ids_only.
+                "baseline_label_buffers": _buffer_ids_only(baseline_label_buffers),
+                "baseline_replay_buffer": _replay_ids_only(baseline_replay_buffer),
+                "joint_label_buffers": _buffer_ids_only(joint_label_buffers),
+                "joint_replay_buffer": _replay_ids_only(joint_replay_buffer),
+                # task_test_splits (X_test_raw, y_test per task) intentionally NOT persisted, same
+                # reason -- task_test_gids (just the row IDs) still is.
+                "task_test_gids": task_test_gids,
                 "results": results, "poison_fraction": poison_fraction,
                 "hidden_sizes": hidden_sizes, "per_feature_epsilon": args.per_feature_epsilon,
             }, checkpoint_path_for(t))
@@ -968,9 +1018,15 @@ def main():
             "task_id": t, "seed": args.seed, "feature_dim": feature_dim, "scaler": scaler,
             "label_mapping": label_mapping,
             "lineages": {name: lineages[name].model.state_dict() for name in LINEAGE_NAMES},
-            "baseline_label_buffers": baseline_label_buffers, "baseline_replay_buffer": baseline_replay_buffer,
-            "joint_label_buffers": joint_label_buffers, "joint_replay_buffer": joint_replay_buffer,
-            "task_test_splits": task_test_splits, "task_test_gids": task_test_gids,
+            # Feature rows intentionally NOT persisted (they dominate checkpoint file size) --
+            # only each entry's (label, category, sample_id) survives; see _buffer_ids_only.
+            "baseline_label_buffers": _buffer_ids_only(baseline_label_buffers),
+            "baseline_replay_buffer": _replay_ids_only(baseline_replay_buffer),
+            "joint_label_buffers": _buffer_ids_only(joint_label_buffers),
+            "joint_replay_buffer": _replay_ids_only(joint_replay_buffer),
+            # task_test_splits (X_test_raw, y_test per task) intentionally NOT persisted, same
+            # reason -- task_test_gids (just the row IDs) still is.
+            "task_test_gids": task_test_gids,
             "results": results, "poison_fraction": poison_fraction,
             "hidden_sizes": hidden_sizes, "per_feature_epsilon": args.per_feature_epsilon,
         }, checkpoint_path_for(t))
