@@ -709,6 +709,8 @@ def main():
         for name in ["clean", "poisoned_baseline"]:
             adapt_lines.append(f"[{name}] classification report (this task's clean test):")
             adapt_lines.append(per_class_reports[name])
+            adapt_lines.append(f"[{name}] classification report (this task's adversarial test):")
+            adapt_lines.append(base._fmt_report(lineages[name], X_test_adv, y_test))
         adapt_section = "\n".join(adapt_lines)
 
         joint_dist = base.buffer_distribution(joint_label_buffers)
@@ -752,6 +754,8 @@ def main():
         for name in FIX_NAMES:
             unlearn_lines.append(f"[{name}] classification report (this task's clean test):")
             unlearn_lines.append(per_class_reports[name])
+            unlearn_lines.append(f"[{name}] classification report (this task's adversarial test):")
+            unlearn_lines.append(base._fmt_report(lineages[name], X_test_adv, y_test))
         unlearn_section = "\n".join(unlearn_lines)
 
         breakdown_lines = [
