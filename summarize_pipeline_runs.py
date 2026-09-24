@@ -1,14 +1,22 @@
 """
 summarize_pipeline_runs.py
 
-Aggregates N runs of madar_pocket_pipeline.py's pipeline_log.txt (e.g. the
-same config run under different seeds) into one mean +/- std table per
+Aggregates N runs of any of this project's "pocket" pipelines' (e.g.
+madar_pocket_pipeline.py's 5 lineages, or madar_pocket_pipeline_si_agem.py's
+4 -- any pipeline following the same log shape) pipeline_log.txt files (e.g.
+the same config run under different seeds) into one mean +/- std table per
 lineage, at the FINAL task of each log:
 
   method | mean acc @ task N | pooled acc @ task N | task R acc @ task N |
   task N acc | precision (macro) | recall (macro) | F1 (macro)
 
 N = each log's own final task; R = --reference-task (default 1).
+
+Lineage names are auto-detected per log from its own tables -- not
+hardcoded -- so old and new logs both work, and the table's rows are the
+union of every lineage seen across all input logs (a lineage missing from
+some logs just gets fewer samples in its mean +/- std, same as any other
+missing-data cell).
 
 "task R acc @ task N" and "task N acc" are COMBINED (clean + adversarial)
 accuracy for that one task's data specifically -- not the pooled/mean
@@ -30,25 +38,30 @@ import argparse
 import re
 import statistics
 
-LINEAGE_NAMES = ["clean", "poisoned_baseline", "dropped_rows", "amnesiac", "opposite_class"]
-LINEAGE_ALT = "clean|poisoned_baseline|dropped_rows|amnesiac|opposite_class"
 NUM = r"(?:[\d.]+|nan)"  # tolerates the literal "nan" the log prints for undefined still-evades %
 
+# Lineage names are captured generically -- see plot_pipeline_metrics.py for
+# the rationale. NAME requires a leading letter/underscore (never a bare
+# digit): the per-source-task breakdown tables have rows shaped "<source
+# task index> <NUM> <NUM> ...", and a pipeline with exactly 3 lineages
+# produces exactly 3 numeric columns there -- indistinguishable from an
+# Adaptation-step row's shape if the name could be a plain integer.
+NAME = r"[A-Za-z_]\w*"
 TASK_HEADER_RE = re.compile(r"^=+\n=== Task (\d+) ===\n=+\n", re.MULTILINE)
-ADAPT_TABLE_RE = re.compile(rf"^(clean|poisoned_baseline)\s+({NUM})\s+({NUM})\s+({NUM})\s*$", re.MULTILINE)
-POST_UNLEARN_RE = re.compile(
-    rf"^(dropped_rows|amnesiac|opposite_class)\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})%\s*$",
+ADAPT_TABLE_RE = re.compile(rf"^({NAME})\s+({NUM})\s+({NUM})\s+({NUM})\s*$", re.MULTILINE)
+POST_FIX_RE = re.compile(
+    rf"^({NAME})\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})%\s*$",
     re.MULTILINE,
 )
-CLASS_MARKER_RE = re.compile(rf"\[({LINEAGE_ALT})\] classification report")
+CLASS_MARKER_RE = re.compile(rf"\[({NAME})\] classification report \(this task's clean test\)")
 MACRO_ROW_RE = re.compile(rf"^\s*macro avg\s+({NUM})\s+({NUM})\s+({NUM})\s+\d+\s*$", re.MULTILINE)
+# The parenthesized phrase varies by pipeline ("post-unlearning" vs "post-adaptation").
 ADV_BREAKDOWN_HEADER_RE = re.compile(
-    r"Task \d+'s \(post-unlearning\) classifier accuracy on each source task's adv-test-set:"
+    r"Task \d+'s \([\w -]+\) classifier accuracy on each source task's adv-test-set:"
 )
 CLEAN_BREAKDOWN_HEADER_RE = re.compile(
-    r"Task \d+'s \(post-unlearning\) classifier accuracy on each source task's CLEAN test-set:"
+    r"Task \d+'s \([\w -]+\) classifier accuracy on each source task's CLEAN test-set:"
 )
-BREAKDOWN_ROW_RE = re.compile(rf"^(\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})\s*$", re.MULTILINE)
 
 
 def _split_last_task(log_text):
@@ -61,14 +74,14 @@ def _split_last_task(log_text):
 
 def _final_task_table_metrics(chunk):
     """{lineage: {task_acc, pooled_acc, mean_acc, adv_acc}} from the final
-    task's Adaptation-step (clean/poisoned_baseline, no adv_acc there) and
-    Post-unlearning (3 fix variants, has adv_acc) tables."""
+    task's Adaptation-step (reference lineages, no adv_acc there) and
+    post-fix/post-adaptation (under-test lineages, has adv_acc) tables."""
     out = {}
     for m in ADAPT_TABLE_RE.finditer(chunk):
         name = m.group(1)
         task_acc, pooled_acc, mean_acc = (float(x) for x in m.groups()[1:])
         out[name] = dict(task_acc=task_acc, pooled_acc=pooled_acc, mean_acc=mean_acc, adv_acc=None)
-    for m in POST_UNLEARN_RE.finditer(chunk):
+    for m in POST_FIX_RE.finditer(chunk):
         name = m.group(1)
         task_acc, pooled_acc, mean_acc, adv_acc, _still_evades = (float(x) for x in m.groups()[1:])
         out[name] = dict(task_acc=task_acc, pooled_acc=pooled_acc, mean_acc=mean_acc, adv_acc=adv_acc)
@@ -81,7 +94,12 @@ def _final_task_macro_prf1(chunk):
     out = {}
     for m in CLASS_MARKER_RE.finditer(chunk):
         name = m.group(1)
-        window = chunk[m.end():m.end() + 700]
+        # Bounded at the next "classification report" (e.g. this same lineage's
+        # adversarial-test report, added right after the clean one) so its own
+        # "macro avg" row can't be found instead of the clean-test one.
+        next_report = chunk.find("classification report", m.end())
+        window_end = next_report if next_report != -1 else m.end() + 700
+        window = chunk[m.end():window_end]
         row = MACRO_ROW_RE.search(window)
         if row:
             out[name] = tuple(float(x) for x in row.groups())
@@ -90,22 +108,37 @@ def _final_task_macro_prf1(chunk):
 
 def _breakdown_row(chunk, header_re, source_task):
     """{lineage: accuracy} for one source-task row of either breakdown
-    table (adv or clean). Window is bounded to end right before the NEXT
-    "Task N's..." header (the other breakdown table), since both tables
-    share an identical row format and would otherwise bleed into each
-    other whenever `source_task` isn't present in the first table."""
+    table (adv or clean). Column names come from that table's own header
+    line, not a hardcoded list. Window is bounded to end right before the
+    NEXT "Task N's..." header (the other breakdown table), since both
+    tables share an identical row format and would otherwise bleed into
+    each other whenever `source_task` isn't present in the first table."""
     header = header_re.search(chunk)
     if not header:
         return None
-    next_boundary = chunk.find("\nTask ", header.end())
-    window = chunk[header.end(): next_boundary if next_boundary != -1 else len(chunk)]
-    for m in BREAKDOWN_ROW_RE.finditer(window):
+    header_line_start = chunk.find("\n", header.end()) + 1
+    if header_line_start == 0:
+        return None
+    header_line_end = chunk.find("\n", header_line_start)
+    header_line = chunk[header_line_start: header_line_end if header_line_end != -1 else len(chunk)]
+    tokens = header_line.split()
+    if len(tokens) < 3 or tokens[0] != "source" or tokens[1] != "task":
+        return None
+    names = tokens[2:]
+
+    row_re = re.compile(rf"^(\d+)\s+" + r"\s+".join(f"({NUM})" for _ in names) + r"\s*$", re.MULTILINE)
+    body_start = header_line_end + 1 if header_line_end != -1 else len(chunk)
+    next_boundary = chunk.find("\nTask ", body_start)
+    window = chunk[body_start: next_boundary if next_boundary != -1 else len(chunk)]
+    for m in row_re.finditer(window):
         if int(m.group(1)) == source_task:
-            return dict(zip(LINEAGE_NAMES, (float(x) for x in m.groups()[1:])))
+            return dict(zip(names, (float(x) for x in m.groups()[1:])))
     return None
 
 
 def parse_run(log_text, reference_task):
+    """Returns (final_task, per_lineage, missing_clean_breakdown, lineage_order)
+    where lineage_order lists this run's own lineages in first-seen order."""
     final_task, chunk = _split_last_task(log_text)
     table_metrics = _final_task_table_metrics(chunk)
     prf1 = _final_task_macro_prf1(chunk)
@@ -114,16 +147,23 @@ def parse_run(log_text, reference_task):
     adv_final_row = _breakdown_row(chunk, ADV_BREAKDOWN_HEADER_RE, final_task)
     missing_clean_breakdown = clean_ref_row is None
 
+    lineage_order = []
+    for names in (table_metrics.keys(), prf1.keys(),
+                  (adv_ref_row or {}).keys(), (adv_final_row or {}).keys()):
+        for name in names:
+            if name not in lineage_order:
+                lineage_order.append(name)
+
     per_lineage = {}
-    for name in LINEAGE_NAMES:
+    for name in lineage_order:
         m = table_metrics.get(name, {})
         task_acc = m.get("task_acc")
         adv_acc = m.get("adv_acc")
         if adv_acc is None and adv_final_row is not None:
-            adv_acc = adv_final_row.get(name)  # clean/poisoned_baseline: only logged in the breakdown table
+            adv_acc = adv_final_row.get(name)  # reference lineages: only logged in the breakdown table
         final_combined = (task_acc + adv_acc) / 2 if task_acc is not None and adv_acc is not None else float("nan")
 
-        if clean_ref_row is not None and adv_ref_row is not None:
+        if clean_ref_row is not None and adv_ref_row is not None and name in clean_ref_row and name in adv_ref_row:
             ref_combined = (clean_ref_row[name] + adv_ref_row[name]) / 2
         else:
             ref_combined = float("nan")
@@ -136,7 +176,7 @@ def parse_run(log_text, reference_task):
             final_task_acc_combined=final_combined,
             precision=p, recall=r, f1=f1,
         )
-    return final_task, per_lineage, missing_clean_breakdown
+    return final_task, per_lineage, missing_clean_breakdown, lineage_order
 
 
 def _fmt(vals):
@@ -157,19 +197,25 @@ def main():
     args = ap.parse_args()
 
     missing_clean_breakdown = []
-    per_lineage_runs = {name: {"mean_acc": [], "pooled_acc": [], "ref_task_acc_combined": [],
-                                "final_task_acc_combined": [], "precision": [], "recall": [], "f1": []}
-                         for name in LINEAGE_NAMES}
     final_tasks = set()
+    lineage_order = []
+    per_lineage_runs = {}
+
+    def _ensure(name):
+        if name not in per_lineage_runs:
+            lineage_order.append(name)
+            per_lineage_runs[name] = {"mean_acc": [], "pooled_acc": [], "ref_task_acc_combined": [],
+                                       "final_task_acc_combined": [], "precision": [], "recall": [], "f1": []}
 
     for path in args.logs:
         with open(path) as f:
             log_text = f.read()
-        final_task, per_lineage, missing_clean = parse_run(log_text, args.reference_task)
+        final_task, per_lineage, missing_clean, order = parse_run(log_text, args.reference_task)
         final_tasks.add(final_task)
         if missing_clean:
             missing_clean_breakdown.append(path)
-        for name in LINEAGE_NAMES:
+        for name in order:
+            _ensure(name)
             for k, v in per_lineage[name].items():
                 per_lineage_runs[name][k].append(v)
 
@@ -195,7 +241,7 @@ def main():
         "F1 (macro)",
     ]
     rows = []
-    for name in LINEAGE_NAMES:
+    for name in lineage_order:
         d = per_lineage_runs[name]
         rows.append([
             name,
