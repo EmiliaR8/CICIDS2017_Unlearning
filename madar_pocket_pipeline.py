@@ -346,17 +346,26 @@ class RandomDetector:
 
 
 def run_random_detector(X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
-                         benign_label, mal_label, seed):
+                         benign_label, mal_label, seed, n_flag_by_class=None, matched_to=None):
     """Same interface/return shape as run_detector(), but the forget-set is
-    chosen uniformly at random per class (same DETECTOR_N_PER_GROUP budget as
-    the trained detector) instead of via a trained classifier -- ablation for
-    --detector_type random."""
+    chosen uniformly at random per class instead of via a trained classifier
+    -- ablation for --detector_type random.
+
+    n_flag_by_class ({label: count}) sets how many rows to flag per class. The
+    default ablation (--random_forget_size matched) passes the per-class
+    counts the trained detector (`matched_to`) flagged on this same task, so
+    random and trained forget-sets are the SAME SIZE and differ only in WHICH
+    rows are chosen. None falls back to the original sizing
+    (--random_forget_size budget): min(DETECTOR_N_PER_GROUP, class size) per
+    class, i.e. matched to the detector's LABELING budget, which makes the
+    random forget-set far smaller than the trained detector's."""
     rng = np.random.default_rng(seed)
     detected_by_class = {}
     class_metrics = {}
     for cls, true_poison_this_class in [(benign_label, idx_poison_ben), (mal_label, idx_poison_mal)]:
         class_indices = np.where(y_train == cls)[0]
-        n_flag = min(DETECTOR_N_PER_GROUP, len(class_indices))
+        n_target = DETECTOR_N_PER_GROUP if n_flag_by_class is None else n_flag_by_class[cls]
+        n_flag = min(n_target, len(class_indices))
         flagged = rng.choice(class_indices, size=n_flag, replace=False)
         detected_by_class[cls] = flagged
         tp = len(np.intersect1d(flagged, true_poison_this_class))
@@ -367,10 +376,14 @@ def run_random_detector(X_train_poisoned, y_train, idx_poison_ben, idx_poison_ma
     detected_poison_idx = np.concatenate([detected_by_class[benign_label], detected_by_class[mal_label]])
     flagged_rate = len(detected_poison_idx) / max(len(X_train_poisoned), 1)
     metrics = {
-        "detector_type": "random",
+        "detector_type": ("random (budget-sized: DETECTOR_N_PER_GROUP per class)" if matched_to is None
+                          else f"random (size-matched to {matched_to} detector's forget-set)"),
         "train_accuracy": float("nan"),
         "composition": {"random_benign": len(detected_by_class[benign_label]),
-                         "random_malicious": len(detected_by_class[mal_label])},
+                         "random_malicious": len(detected_by_class[mal_label]),
+                         **({f"{matched_to}_flagged_benign": int(n_flag_by_class[benign_label]),
+                             f"{matched_to}_flagged_malicious": int(n_flag_by_class[mal_label])}
+                            if n_flag_by_class is not None else {})},
         "class_metrics": class_metrics,
         "n_detected": len(detected_poison_idx),
         "n_oracle": len(idx_poison_ben) + len(idx_poison_mal),
@@ -652,9 +665,22 @@ def main():
     ap.add_argument("--h5-path", type=str, default=H5_DATASET_PATH)
     ap.add_argument("--detector_type", type=str, default="xgboost",
                      choices=["xgboost", "logistic", "random"],
-                     help="'random' is an ablation: skips classifier training and picks the "
-                          "forget-set uniformly at random per class instead (same DETECTOR_N_PER_GROUP "
-                          "budget), to isolate how much the classifier's selection signal matters.")
+                     help="'random' is an ablation: picks the forget-set uniformly at random per "
+                          "class instead of using the trained detector's flags, to isolate how much "
+                          "the classifier's selection signal matters. Its size per class is set by "
+                          "--random_forget_size.")
+    ap.add_argument("--random_forget_size", type=str, default="matched", choices=["matched", "budget"],
+                     help="Only used with --detector_type random. 'matched' (default): each task, "
+                          "first train the --random_match_detector detector exactly as a normal run "
+                          "would and count how many rows it flags per class, then flag that SAME "
+                          "number per class at random -- random and trained forget-sets are the same "
+                          "size, differing only in which rows. 'budget': the original sizing, "
+                          f"min({DETECTOR_N_PER_GROUP}, class size) per class (matches the detector's "
+                          "labeling budget, NOT its forget-set size; kept to reproduce older runs).")
+    ap.add_argument("--random_match_detector", type=str, default="xgboost", choices=["xgboost", "logistic"],
+                     help="Which trained detector's per-class forget-set size the random ablation "
+                          "matches under --random_forget_size matched. Its flags are used ONLY for "
+                          "the counts, never for which rows are forgotten.")
     ap.add_argument("--poison_fraction", type=float, default=POISON_FRACTION)
     ap.add_argument("--no_breakpoint", action="store_true",
                      help="Disable the interactive breakpoint() pause at the end of tasks >= "
@@ -711,6 +737,11 @@ def main():
             "training only -- no poisoning/detection/unlearning yet.\n"
             f"Classifier hidden layer sizes: {hidden_sizes}\n"
             f"Per-feature epsilon cap: {args.per_feature_epsilon}\n"
+            f"Detector: {args.detector_type}"
+            + (f" (random_forget_size={args.random_forget_size}"
+               + (f", size-matched to {args.random_match_detector}" if args.random_forget_size == "matched" else "")
+               + ")" if args.detector_type == "random" else "")
+            + "\n"
         )
 
     print(f"Loading {args.h5_path} and building {NUM_TASKS} pooled chronological tasks...")
@@ -908,10 +939,22 @@ def main():
         pocket_info_by_source[t] = (succ_pocket, eps_this_task)
 
         # Step 7: ONE shared detector per task, trained from poisoned_baseline
-        # (or, for the --detector_type random ablation, no training at all).
+        # (or, for the --detector_type random ablation, a random forget-set --
+        # size-matched per class to the trained detector's by default).
         if args.detector_type == "random":
+            n_flag_by_class, matched_to = None, None
+            if args.random_forget_size == "matched":
+                # Trained detector run ONLY to size the random forget-set --
+                # its flagged rows are discarded, only the counts are kept.
+                _, sizing_by_class, sizing_metrics, _ = run_detector(
+                    lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
+                    benign_label, mal_label, args.random_match_detector, SEED,
+                )
+                n_flag_by_class = {cls: len(v) for cls, v in sizing_by_class.items()}
+                matched_to = sizing_metrics["detector_type"]  # actual type (xgboost may fall back)
             detected_poison_idx, detected_by_class, det_metrics, detector = run_random_detector(
                 X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal, benign_label, mal_label, SEED,
+                n_flag_by_class=n_flag_by_class, matched_to=matched_to,
             )
         else:
             detected_poison_idx, detected_by_class, det_metrics, detector = run_detector(
