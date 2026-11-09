@@ -72,11 +72,26 @@ comparability. The reference's `[:, :active_count]` masking (needed because
 its class-incremental classifier head grows) is dropped throughout: this
 project's classifier always outputs exactly 2 logits, so there is nothing to
 mask.
+
+INFORMED DEDUCE (ICLR 2027 rebuttal; opt-in, every default is unchanged).
+--load_stream DIR replaces this file's own data split, task-0 pretraining,
+poison crafting and test-attack crafting with the arrays
+madar_pocket_pipeline.py --dump_stream wrote for the same --seed (sha256
+checked), so DEDUCE, informed DEDUCE and the L2U fixes train and are scored
+on identical rows, poison, U_t and adversarial test sets. --informed_forget
+hands deduce the detector's flagged set U_t (same detector, same
+DETECTOR_N_PER_GROUP annotated budget as L2U): LUM ascends on each batch's
+flagged rows, those rows are excluded from the CE descent, and they are
+filtered out of deduce's memory and Fisher estimate (L2U's buffer filtering).
+The interference detector and the conflict-triggered LUM still run on the
+unflagged rows; GUM is unchanged. This is a hybrid for the rebuttal ablation,
+NOT published DEDUCE -- see deduce_adapt's docstring for the exact step order.
 """
 from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 import os
 import time
@@ -90,6 +105,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 import madar_pocket_pipeline as base
+import rebuttal_stream as rs
 from madar_pocket_pipeline_si_agem import ReservoirBuffer
 
 LINEAGE_NAMES = ["clean", "poisoned_baseline", "deduce"]
@@ -382,17 +398,37 @@ def fisher_update(fisher, model, memory, X_task, y_task, device, batch_size, max
 
 
 def deduce_adapt(lineage, memory, fisher, lum, gum, prev_task_params, X, y, epochs, batch_size,
-                 detect_every, epsilon, k, beta):
+                 detect_every, epsilon, k, beta, flagged=None, lum_steps=1):
     """DEDUCE's detect / decide / unlearn wrapper (LUM + GUM), layered
     directly on plain cross-entropy adaptation -- no STAR, no X-DER (see
     module docstring). `memory` supplies the reference batch for detection
     only; it is NEVER concatenated into the training batch, same convention
     as A-GEM's memory. GUM's hooks are attached for the duration of this
     call only, so other forward passes elsewhere in the pipeline (scoring,
-    breakdown tables) never trip its activation recorder."""
+    breakdown tables) never trip its activation recorder.
+
+    INFORMED FORGET (rebuttal; only when `flagged` is given). `flagged` is a
+    bool mask over the rows of X -- the shared detector's U_t, the SAME set
+    L2U's fixes are handed. Per batch, with F = the batch's flagged rows and
+    R = the rest:
+      1. interference detection runs on R only (unchanged otherwise);
+      2. if |F| >= 2 and the Fisher exists: `lum_steps` LUM ascent steps on F
+         (the published LUM update, Eq. 9-10, just aimed at F);
+      3. the original conflict-triggered LUM, on R;
+      4. the CE (+ Fisher-quadratic) descent step on R only -- F is never
+         descended on, so it is not re-learned;
+      5. GUM, unchanged.
+    A batch with |F| == 1 skips step 2 (BatchNorm cannot run a 1-row batch in
+    train mode) but still excludes that row from step 4. A batch with |R| < 2
+    skips steps 1, 3, 4 and 5 and does not advance the step counter.
+    flagged=None and lum_steps=1 reproduce the original method exactly.
+    """
     Xt = torch.as_tensor(np.asarray(X), dtype=torch.float32)
     yt = torch.as_tensor(np.asarray(y), dtype=torch.long)
     n = len(Xt)
+    ft = torch.as_tensor(np.asarray(flagged), dtype=torch.bool) if flagged is not None else None
+    if ft is not None and len(ft) != n:
+        raise ValueError(f"flagged mask has {len(ft)} rows, X has {n}")
     ce = nn.CrossEntropyLoss()
     model = lineage.model
     model.train()
@@ -401,6 +437,8 @@ def deduce_adapt(lineage, memory, fisher, lum, gum, prev_task_params, X, y, epoc
     step = 0
     conflict = 0.0
     n_detected = n_lum_fired = 0
+    n_informed_fired = n_informed_rows = n_informed_skipped_single = n_excluded_rows = 0
+    n_informed_no_fisher = 0
     gum_resets = 0.0
     try:
         for _ in range(epochs):
@@ -410,17 +448,39 @@ def deduce_adapt(lineage, memory, fisher, lum, gum, prev_task_params, X, y, epoc
                 if len(idx) < 2:
                     continue
                 xb, yb = Xt[idx], yt[idx]
+                if ft is not None:
+                    fb = ft[idx]
+                    xf, yf = xb[fb], yb[fb]
+                    xb, yb = xb[~fb], yb[~fb]
+                    n_excluded_rows += int(fb.sum())
+                else:
+                    xf = None
                 gum.arm()
 
-                if step % detect_every == 0 and not memory.is_empty():
+                if len(xb) >= 2 and step % detect_every == 0 and not memory.is_empty():
                     mx, my = memory.sample(batch_size)
                     if mx is not None:
                         out = gradient_conflict(model, (xb, yb), (mx, my), epsilon)
                         conflict = out["conflict"]
                         n_detected += 1
 
+                if xf is not None and len(xf) >= 2:
+                    if fisher.is_empty():
+                        n_informed_no_fisher += 1
+                    else:
+                        for _s in range(lum_steps):
+                            lum.step(model, xf, yf, fisher=fisher, anchor=anchor)
+                        n_informed_fired += 1
+                        n_informed_rows += len(xf)
+                elif xf is not None and len(xf) == 1:
+                    n_informed_skipped_single += 1
+
+                if len(xb) < 2:
+                    continue
+
                 if conflict and not fisher.is_empty():
-                    lum.step(model, xb, yb, fisher=fisher, anchor=anchor)
+                    for _s in range(lum_steps):
+                        lum.step(model, xb, yb, fisher=fisher, anchor=anchor)
                     n_lum_fired += 1
 
                 step += 1
@@ -443,8 +503,39 @@ def deduce_adapt(lineage, memory, fisher, lum, gum, prev_task_params, X, y, epoc
     finally:
         gum.detach()
     model.eval()
-    return {"n_steps": step, "n_detections": n_detected, "n_lum_fired": n_lum_fired,
+    info = {"n_steps": step, "n_detections": n_detected, "n_lum_fired": n_lum_fired,
             "lum_fire_rate": n_lum_fired / max(1, step), "gum_resets": gum_resets}
+    if ft is not None:
+        info.update({"informed_lum_batches": n_informed_fired, "informed_lum_rows": n_informed_rows,
+                     "informed_single_row_batches_skipped": n_informed_skipped_single,
+                     "informed_no_fisher_batches": n_informed_no_fisher,
+                     "flagged_rows_excluded_from_descent": n_excluded_rows,
+                     "n_flagged": int(ft.sum())})
+    return info
+
+
+def _pretrain_task0(feature_dim, hidden_sizes, X_train_scaled, y_train):
+    """Task-0 plain supervised pretraining -- the original inline code,
+    moved verbatim into a function (same ops, same RNG consumption order)."""
+    base_model = base.ClassifierNN(feature_dim, 2, hidden_sizes=hidden_sizes).to(base.DEVICE)
+    Xt = torch.tensor(X_train_scaled, dtype=torch.float32)
+    yt = torch.tensor(y_train, dtype=torch.long)
+    opt0 = torch.optim.Adam(base_model.parameters(), lr=base.TASK0_LR)
+    loss_fn0 = nn.CrossEntropyLoss()
+    base_model.train()
+    n = len(Xt)
+    for _ in range(base.TASK0_EPOCHS):
+        perm = torch.randperm(n)
+        for i in range(0, n, base.TASK0_BATCH_SIZE):
+            idx = perm[i:i + base.TASK0_BATCH_SIZE]
+            if len(idx) < 2:
+                continue
+            opt0.zero_grad()
+            loss = loss_fn0(base_model(Xt[idx]), yt[idx])
+            loss.backward()
+            opt0.step()
+    base_model.eval()
+    return base_model
 
 
 # ---------------------------------------------------------------------------
@@ -502,15 +593,68 @@ def main():
     ap.add_argument("--no_breakpoint", action="store_true",
                      help="Disable the interactive breakpoint() pause at the end of tasks "
                           f">= {base.BREAKPOINT_FROM_TASK}.")
+    # --- Rebuttal (informed-DEDUCE comparison) options; all default to the
+    # original DEDUCE port's behavior. See rebuttal_stream.py. ---
+    ap.add_argument("--load_stream", type=str, default=None,
+                     help="Directory written by madar_pocket_pipeline.py --dump_stream. Uses that "
+                          "run's scaler, task-0 model, (subsampled) training rows, poison, detector "
+                          "flags U_t and clean/adversarial test sets for this --seed instead of "
+                          "building its own, so scores are on identical data. --h5-path, "
+                          "--poison_fraction and --per_feature_epsilon are then ignored (taken from "
+                          "the stream). Every loaded array is sha256-checked against the dump.")
+    ap.add_argument("--informed_forget", action="store_true",
+                     help="Informed DEDUCE: give deduce the detector's flagged set U_t (the SAME set "
+                          "L2U's fixes use; from --load_stream, else base.run_detector with "
+                          "DETECTOR_N_PER_GROUP per (class x poison-status) group). LUM ascends on "
+                          "the flagged rows of each batch, they are excluded from the CE descent, and "
+                          "they are filtered out of deduce's memory and Fisher estimate. Default off "
+                          "= original DEDUCE.")
+    ap.add_argument("--deduce_lum_steps", type=int, default=1,
+                     help="LUM ascent steps per firing (published method: 1). Applies to both the "
+                          "conflict-triggered and the informed LUM.")
+    ap.add_argument("--val_fraction", type=float, default=0.0,
+                     help="Sanity-check mode: hold out this stratified fraction of every poisoned "
+                          "task's TRAINING rows (fixed --val_seed) as a validation split, never "
+                          "trained on by any lineage; logs clean-val accuracy and accuracy on the "
+                          "poisoned val rows' (true) labels. Default 0 = off. Test sets untouched.")
+    ap.add_argument("--val_seed", type=int, default=0,
+                     help="Fixed RNG seed for --val_fraction's split.")
+    ap.add_argument("--num_tasks", type=int, default=base.NUM_TASKS,
+                     help=f"Stop after this many tasks (default {base.NUM_TASKS}). With --load_stream, "
+                          f"capped at the number of tasks in the stream.")
+    ap.add_argument("--runs_dir", type=str, default=base.RUNS_BASE_DIR,
+                     help=f"Root output directory (default {base.RUNS_BASE_DIR}).")
     args = ap.parse_args()
     hidden_sizes = tuple(int(h) for h in args.hidden_sizes.split(","))
+    if args.deduce_lum_steps < 1:
+        ap.error("--deduce_lum_steps must be >= 1")
+    if not 0.0 <= args.val_fraction < 1.0:
+        ap.error("--val_fraction must be in [0, 1)")
+    if args.val_fraction > 0 and not args.load_stream:
+        ap.error("--val_fraction requires --load_stream (the split is carved from the shared stream's "
+                 "training rows so every config holds out the same rows)")
+
+    reader = None
+    if args.load_stream:
+        reader = rs.StreamReader(args.load_stream, args.seed)
+        meta = reader.meta
+        if tuple(meta["hidden_sizes"]) != hidden_sizes:
+            ap.error(f"--hidden_sizes {hidden_sizes} != stream's {tuple(meta['hidden_sizes'])} "
+                     f"(the task-0 model is loaded from the stream)")
+        args.poison_fraction = meta["poison_fraction"]
+        args.per_feature_epsilon = meta["per_feature_epsilon"]
+        if args.num_tasks > reader.num_tasks:
+            print(f"--num_tasks {args.num_tasks} capped at the stream's {reader.num_tasks} task(s)")
+            args.num_tasks = reader.num_tasks
+    if not 1 <= args.num_tasks <= base.NUM_TASKS:
+        ap.error(f"--num_tasks must be in [1, {base.NUM_TASKS}]")
 
     base.SEED = args.seed  # update_shared_buffer reads this module-level global
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     poison_fraction = args.poison_fraction
 
-    out_dir = os.path.join(base.RUNS_BASE_DIR, "madar_pocket_deduce", args.log_name)
+    out_dir = os.path.join(args.runs_dir, "madar_pocket_deduce", args.log_name)
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
     log_path = os.path.join(out_dir, "logs", "pipeline_log.txt")
@@ -533,18 +677,36 @@ def main():
             f"fim_damping={args.deduce_fim_damping}, fim_batches={args.deduce_fim_batches}\n"
             f"eta={args.deduce_eta}, phi={args.deduce_phi}, maturity={args.deduce_maturity}, "
             f"grad_clip={args.grad_clip}\n"
+            f"informed_forget={args.informed_forget}, lum_steps={args.deduce_lum_steps}, "
+            f"load_stream={args.load_stream}, val_fraction={args.val_fraction} "
+            f"(val_seed {args.val_seed}), num_tasks={args.num_tasks}\n"
+            + (f"stream meta: {json.dumps(reader.meta, sort_keys=True)}\n" if reader is not None else "")
         )
 
-    print(f"Loading {args.h5_path} and building {base.NUM_TASKS} pooled chronological tasks...")
-    tasks, day_mapping, label_mapping = base.load_pooled_chronological_tasks(
-        args.h5_path, base.TASK_FRACTIONS)
-    benign_label = label_mapping["Benign"]
-    mal_label = 1 - benign_label
-    feature_dim = tasks[0]["features"].shape[1]
-    print(f"day_mapping={day_mapping}, feature_dim={feature_dim}, "
-          f"task sizes={[len(t['labels']) for t in tasks]}")
+    if reader is None:
+        print(f"Loading {args.h5_path} and building {base.NUM_TASKS} pooled chronological tasks...")
+        tasks, day_mapping, label_mapping = base.load_pooled_chronological_tasks(
+            args.h5_path, base.TASK_FRACTIONS)
+        benign_label = label_mapping["Benign"]
+        mal_label = 1 - benign_label
+        feature_dim = tasks[0]["features"].shape[1]
+        print(f"day_mapping={day_mapping}, feature_dim={feature_dim}, "
+              f"task sizes={[len(t['labels']) for t in tasks]}")
+        task_offsets = np.concatenate([[0], np.cumsum([len(t["labels"]) for t in tasks])[:-1]])
+    else:
+        print(f"Loading shared stream {reader.dir} ({reader.num_tasks} task(s))...")
+        benign_label, mal_label = int(reader.meta["benign_label"]), int(reader.meta["mal_label"])
+        label_mapping = {"Benign": benign_label}
+        feature_dim = int(reader.meta["feature_dim"])
 
-    task_offsets = np.concatenate([[0], np.cumsum([len(t["labels"]) for t in tasks])[:-1]])
+    metrics_log = rs.MetricsLog(os.path.join(out_dir, "logs", "rebuttal_metrics.json"), config={
+        "pipeline": "madar_pocket_pipeline_deduce.py", "seed": args.seed,
+        "informed_forget": args.informed_forget, "deduce_delta": args.deduce_delta,
+        "deduce_alpha": args.deduce_alpha, "deduce_lum_steps": args.deduce_lum_steps,
+        "load_stream": args.load_stream, "val_fraction": args.val_fraction,
+        "num_tasks": args.num_tasks,
+        "stream_meta": reader.meta if reader is not None else None,
+    })
 
     scaler = None
     lineages = {}
@@ -562,44 +724,51 @@ def main():
         return np.clip(scaler.transform(X_raw.astype(np.float32)), -base.FEATURE_CLIP,
                        base.FEATURE_CLIP).astype(np.float32)
 
-    for t in range(base.NUM_TASKS):
-        print(f"\n{'#' * 60}\n# TASK {t}\n{'#' * 60}")
-        task = tasks[t]
-        X_raw = np.clip(task["features"].astype(np.float32), 0.0, 1.0)
-        y_all = task["labels"].astype(np.int64)
-        gid_all = task_offsets[t] + np.arange(len(y_all), dtype=np.int64)
+    val_summary = []  # --val_fraction: one dict per poisoned task
 
-        X_train_raw, X_test_raw, y_train, y_test, gid_train, gid_test = train_test_split(
-            X_raw, y_all, gid_all, test_size=base.TASK_TEST_FRAC, random_state=args.seed,
-            stratify=y_all,
-        )
+    for t in range(args.num_tasks):
+        print(f"\n{'#' * 60}\n# TASK {t}\n{'#' * 60}")
+        if reader is None:
+            task = tasks[t]
+            X_raw = np.clip(task["features"].astype(np.float32), 0.0, 1.0)
+            y_all = task["labels"].astype(np.int64)
+            gid_all = task_offsets[t] + np.arange(len(y_all), dtype=np.int64)
+
+            X_train_raw, X_test_raw, y_train, y_test, gid_train, gid_test = train_test_split(
+                X_raw, y_all, gid_all, test_size=base.TASK_TEST_FRAC, random_state=args.seed,
+                stratify=y_all,
+            )
+            stream_task, stream_hashes = None, None
+        else:
+            # Shared stream: training rows (already --data_fraction-subsampled
+            # and scaled by the producer), raw clean test split, and -- for
+            # t >= 1 -- poison, U_t and adversarial test sets. sha256-checked.
+            stream_task, stream_hashes = reader.load_task(t)
+            y_train, gid_train = stream_task["y_train"], stream_task["gid_train"]
+            X_test_raw, y_test, gid_test = (stream_task["X_test_raw"], stream_task["y_test"],
+                                            stream_task["gid_test"])
+            print(f"  stream task {t}: {len(y_train)} train rows, {len(y_test)} test rows, "
+                  f"sha256 verified for {len(stream_hashes)} arrays")
 
         # -------------------------------------------------------------
         # Task 0: plain supervised pretraining only, no poisoning yet.
         # -------------------------------------------------------------
-        if t == 0:
-            scaler = StandardScaler().fit(X_train_raw)
-            X_train_scaled = to_scaled(X_train_raw)
+        if t == 0 and reader is not None:
+            # Same scaler and the SAME task-0 model as the producer run, so
+            # every config starts task 1 from identical weights.
+            extras = reader.load_task0_extras()
+            scaler = extras["scaler"]
+            X_train_scaled = stream_task["X_train_scaled"]
             X_test_scaled = to_scaled(X_test_raw)
-
             base_model = base.ClassifierNN(feature_dim, 2, hidden_sizes=hidden_sizes).to(base.DEVICE)
-            Xt = torch.tensor(X_train_scaled, dtype=torch.float32)
-            yt = torch.tensor(y_train, dtype=torch.long)
-            opt0 = torch.optim.Adam(base_model.parameters(), lr=base.TASK0_LR)
-            loss_fn0 = nn.CrossEntropyLoss()
-            base_model.train()
-            n = len(Xt)
-            for _ in range(base.TASK0_EPOCHS):
-                perm = torch.randperm(n)
-                for i in range(0, n, base.TASK0_BATCH_SIZE):
-                    idx = perm[i:i + base.TASK0_BATCH_SIZE]
-                    if len(idx) < 2:
-                        continue
-                    opt0.zero_grad()
-                    loss = loss_fn0(base_model(Xt[idx]), yt[idx])
-                    loss.backward()
-                    opt0.step()
+            base_model.load_state_dict(extras["model_state_dict"])
             base_model.eval()
+        if t == 0:
+            if reader is None:
+                scaler = StandardScaler().fit(X_train_raw)
+                X_train_scaled = to_scaled(X_train_raw)
+                X_test_scaled = to_scaled(X_test_raw)
+                base_model = _pretrain_task0(feature_dim, hidden_sizes, X_train_scaled, y_train)
 
             for name in LINEAGE_NAMES:
                 lineages[name] = base.AdaptableClassifier(copy.deepcopy(base_model))
@@ -675,19 +844,62 @@ def main():
         # -------------------------------------------------------------
         # Tasks 1..NUM_TASKS-1: poison -> attack, every task.
         # -------------------------------------------------------------
-        X_train_scaled = to_scaled(X_train_raw)
+        if reader is None:
+            X_train_scaled = to_scaled(X_train_raw)
+        else:
+            X_train_scaled = stream_task["X_train_scaled"]
         X_test_scaled = to_scaled(X_test_raw)
         clean_replay_X, clean_replay_y = base.flatten_replay(clean_replay_buffer)
         baseline_replay_X, baseline_replay_y = base.flatten_replay(baseline_replay_buffer)
+
+        if reader is not None:
+            # Shared poison + detector output from the producer run (Steps 3
+            # and the detector are NOT re-run here).
+            X_train_poisoned = stream_task["X_train_poisoned"]
+            idx_poison_ben = stream_task["idx_poison_ben"]
+            idx_poison_mal = stream_task["idx_poison_mal"]
+            stream_U_t = stream_task["detected_poison_idx"]
+            stream_check = {
+                "sha256_U_t": rs.hash_array(stream_U_t),
+                "sha256_poison_ben": rs.hash_array(idx_poison_ben),
+                "sha256_poison_mal": rs.hash_array(idx_poison_mal),
+                "sha256_X_train_poisoned": rs.hash_array(X_train_poisoned),
+            }
+            print(f"  stream U_t |{len(stream_U_t)}| sha256={stream_check['sha256_U_t'][:16]}..., "
+                  f"poison ben/mal {len(idx_poison_ben)}/{len(idx_poison_mal)}")
+
+            # --val_fraction: hold out a stratified slice of THIS task's
+            # training rows from every lineage; poison / U_t indices are
+            # remapped to the kept rows.
+            val_pack = None
+            if args.val_fraction > 0:
+                tr_pos, va_pos = rs.stratified_holdout(y_train, args.val_fraction, [args.val_seed, t])
+                pois_full = np.zeros(len(y_train), dtype=bool)
+                pois_full[idx_poison_ben] = True
+                pois_full[idx_poison_mal] = True
+                val_pack = (X_train_poisoned[va_pos], y_train[va_pos], pois_full[va_pos])
+                remap = -np.ones(len(y_train), dtype=np.int64)
+                remap[tr_pos] = np.arange(len(tr_pos))
+
+                def _remap(ix):
+                    r = remap[np.asarray(ix, dtype=np.int64)]
+                    return r[r >= 0]
+                idx_poison_ben, idx_poison_mal = _remap(idx_poison_ben), _remap(idx_poison_mal)
+                stream_U_t = _remap(stream_U_t)
+                X_train_scaled, X_train_poisoned = X_train_scaled[tr_pos], X_train_poisoned[tr_pos]
+                y_train, gid_train = y_train[tr_pos], gid_train[tr_pos]
+                print(f"  --val_fraction {args.val_fraction}: {len(tr_pos)} train / {len(va_pos)} val rows "
+                      f"({int(val_pack[2].sum())} poisoned val rows)")
 
         # Step 2: clean lineage adapts on clean data + its own clean buffer.
         lineages["clean"].adapt(X_train_scaled, y_train, replay_X=clean_replay_X,
                                 replay_y=clean_replay_y, epochs=base.CLEAN_ADAPT_EPOCHS)
 
         # Step 3: craft this task's poison, shared by poisoned_baseline/deduce.
-        X_train_poisoned, idx_poison_ben, idx_poison_mal, _ = base.craft_task_poison(
-            lineages["clean"], X_train_scaled, y_train, benign_label, mal_label, poison_fraction,
-        )
+        if reader is None:
+            X_train_poisoned, idx_poison_ben, idx_poison_mal, _ = base.craft_task_poison(
+                lineages["clean"], X_train_scaled, y_train, benign_label, mal_label, poison_fraction,
+            )
         poison_idx = np.concatenate([idx_poison_ben, idx_poison_mal])
 
         # Step 4: poisoned_baseline adapts on poisoned data ("no fix"),
@@ -700,35 +912,60 @@ def main():
             if len(poison_idx) else float("nan")
         )
 
-        # Step 5: deduce adapts on poisoned data via detect/LUM/GUM.
+        # Informed forget: U_t = the shared detector's flagged set (stream),
+        # or -- without a stream -- base.run_detector on this file's own
+        # poisoned_baseline, exactly as madar_pocket_pipeline.py does.
+        flagged = None
+        U_t = None
+        if args.informed_forget or reader is not None:
+            if reader is not None:
+                U_t = stream_U_t
+            else:
+                U_t, _by_cls, _det_metrics, _det = base.run_detector(
+                    lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben,
+                    idx_poison_mal, benign_label, mal_label, "xgboost", args.seed,
+                )
+        if args.informed_forget:
+            flagged = np.zeros(len(y_train), dtype=bool)
+            flagged[U_t] = True
+
+        # Step 5: deduce adapts on poisoned data via detect/LUM/GUM
+        # (+ informed LUM on U_t with --informed_forget).
         deduce_info = deduce_adapt(
             lineages["deduce"], deduce_memory, fisher, lum, gum, prev_task_params,
             X_train_poisoned, y_train, epochs=base.ADAPT_EPOCHS, batch_size=base.ADAPT_BATCH_SIZE,
             detect_every=args.deduce_detect_every, epsilon=args.deduce_epsilon, k=args.deduce_k,
-            beta=args.deduce_beta,
+            beta=args.deduce_beta, flagged=flagged, lum_steps=args.deduce_lum_steps,
         )
 
-        # Step 6: craft this task's genuine-pocket test attack, ONCE, against
-        # poisoned_baseline (reference = clean) -- same points re-scored under
-        # every lineage below.
-        eps_this_task = base.typical_class_gap(X_test_scaled, y_test, benign_label,
-                                               mal_label) * base.ATTACK_EPS_MULTIPLIER
-        X_test_adv, succ_pocket, norms_pocket = base.adversarial_attack_pocket(
-            lineages["poisoned_baseline"], lineages["clean"], X_test_scaled, y_test,
-            epsilon_max=eps_this_task, per_feature_epsilon=args.per_feature_epsilon,
-        )
-
-        # Step 7: spillover check -- re-attack every PRIOR task's test set.
-        historical_adv = {}
-        for s, (Xs_raw, ys) in task_test_splits.items():
-            Xs_scaled = to_scaled(Xs_raw)
-            eps_s = base.typical_class_gap(Xs_scaled, ys, benign_label, mal_label)
-            eps_s = eps_s * base.ATTACK_EPS_MULTIPLIER if eps_s is not None else eps_this_task
-            Xs_adv, succ_s, norms_s = base.adversarial_attack_pocket(
-                lineages["poisoned_baseline"], lineages["clean"], Xs_scaled, ys, epsilon_max=eps_s,
-                per_feature_epsilon=args.per_feature_epsilon,
+        if reader is None:
+            # Step 6: craft this task's genuine-pocket test attack, ONCE, against
+            # poisoned_baseline (reference = clean) -- same points re-scored under
+            # every lineage below.
+            eps_this_task = base.typical_class_gap(X_test_scaled, y_test, benign_label,
+                                                   mal_label) * base.ATTACK_EPS_MULTIPLIER
+            X_test_adv, succ_pocket, norms_pocket = base.adversarial_attack_pocket(
+                lineages["poisoned_baseline"], lineages["clean"], X_test_scaled, y_test,
+                epsilon_max=eps_this_task, per_feature_epsilon=args.per_feature_epsilon,
             )
-            historical_adv[s] = (Xs_adv, ys, succ_s, eps_s)
+
+            # Step 7: spillover check -- re-attack every PRIOR task's test set.
+            historical_adv = {}
+            for s, (Xs_raw, ys) in task_test_splits.items():
+                Xs_scaled = to_scaled(Xs_raw)
+                eps_s = base.typical_class_gap(Xs_scaled, ys, benign_label, mal_label)
+                eps_s = eps_s * base.ATTACK_EPS_MULTIPLIER if eps_s is not None else eps_this_task
+                Xs_adv, succ_s, norms_s = base.adversarial_attack_pocket(
+                    lineages["poisoned_baseline"], lineages["clean"], Xs_scaled, ys, epsilon_max=eps_s,
+                    per_feature_epsilon=args.per_feature_epsilon,
+                )
+                historical_adv[s] = (Xs_adv, ys, succ_s, eps_s)
+        else:
+            # Steps 6-7 from the stream: the producer's adversarial test sets
+            # (this task's + re-attacked historical ones), so every config is
+            # scored on the same points.
+            historical_adv, X_test_adv, succ_pocket, norms_pocket, eps_this_task = \
+                rs.unpack_eval_sets(stream_task)
 
         all_clean_sets = {s: (to_scaled(Xs_raw), ys) for s, (Xs_raw, ys) in task_test_splits.items()}
         all_clean_sets[t] = (X_test_scaled, y_test)
@@ -770,13 +1007,46 @@ def main():
             lineages["poisoned_baseline"], baseline_label_buffers, X_train_poisoned, y_train,
             category_all, gid_train, benign_label, mal_label,
         )
-        deduce_mem_update = deduce_memory.add_stream(X_train_poisoned, y_train)
+        # Informed forget: the same detector-based filtering L2U applies to its
+        # replay buffer -- flagged rows never enter deduce's memory or the
+        # Fisher estimate. (deduce's memory is only used for interference
+        # detection + Fisher, never trained on -- see module docstring.)
+        keep = ~flagged if flagged is not None else np.ones(len(y_train), dtype=bool)
+        deduce_mem_update = deduce_memory.add_stream(X_train_poisoned[keep], y_train[keep])
         fisher_info = fisher_update(fisher, lineages["deduce"].model, deduce_memory,
-                                    X_train_poisoned, y_train, base.DEVICE,
+                                    X_train_poisoned[keep], y_train[keep], base.DEVICE,
                                     base.ADAPT_BATCH_SIZE, args.deduce_fim_batches)
         prev_task_params = {n: p.detach().clone()
                            for n, p in lineages["deduce"].model.named_parameters()
                            if p.requires_grad}
+
+        # Rebuttal metrics (read-only).
+        val_entry = None
+        if reader is not None and val_pack is not None:
+            Xv, yv, pv = val_pack
+            val_entry = {}
+            for name in LINEAGE_NAMES:
+                m = lineages[name]
+                val_entry[name] = {
+                    "clean_val_acc": float(m.score(Xv[~pv], yv[~pv])) if (~pv).any() else float("nan"),
+                    "poisoned_val_acc_true_label": float(m.score(Xv[pv], yv[pv])) if pv.any() else float("nan"),
+                    "n_clean_val": int((~pv).sum()), "n_poisoned_val": int(pv.sum()),
+                }
+            val_summary.append({"task": t, **{n: v for n, v in val_entry.items()}})
+        metrics_log.add_task({
+            "task": t,
+            "U_t_size": int(len(U_t)) if U_t is not None else None,
+            "oracle_poison_size": int(len(poison_idx)),
+            "U_t_true_positives": int(len(np.intersect1d(U_t, poison_idx))) if U_t is not None else None,
+            "informed_forget": bool(args.informed_forget),
+            "stream_check": stream_check if reader is not None else None,
+            "deduce_info": deduce_info,
+            "val": val_entry,
+            "lineages": {name: rs.lineage_metrics(
+                lineages[name], t, all_clean_sets, all_test_sets_full, X_test_scaled, y_test,
+                X_test_adv, succ_pocket, benign_label, mal_label,
+                mean_results[name], pooled_results[name]) for name in LINEAGE_NAMES},
+        })
 
         task_test_splits[t] = (X_test_raw, y_test)
         task_test_gids[t] = gid_test
@@ -831,6 +1101,13 @@ def main():
             f"({deduce_info['lum_fire_rate'] * 100:.1f}%) -- near 0% means the detector never found "
             f"interference and this row is plain fine-tuning with idle machinery",
             f"deduce GUM resets this task: {deduce_info['gum_resets']:.0f}",
+            *([f"INFORMED forget: |U_t|={deduce_info['n_flagged']} flagged rows; informed LUM fired on "
+               f"{deduce_info['informed_lum_batches']} batches ({deduce_info['informed_lum_rows']} row-visits, "
+               f"x{args.deduce_lum_steps} step(s), delta={args.deduce_delta}); "
+               f"{deduce_info['flagged_rows_excluded_from_descent']} flagged row-visits excluded from descent; "
+               f"{deduce_info['informed_single_row_batches_skipped']} single-flagged-row batches skipped LUM; "
+               f"{deduce_info['informed_no_fisher_batches']} batches without Fisher; "
+               f"memory/Fisher filtered of flagged rows"] if 'n_flagged' in deduce_info else []),
             f"deduce memory (post-update, this task): size={deduce_mem_update['size']} "
             f"n_seen={deduce_mem_update['n_seen']} admitted={deduce_mem_update['admitted']} "
             f"replaced={deduce_mem_update['replaced']}",
@@ -938,7 +1215,7 @@ def main():
         print(f"Task {t} done. Genuine pocket rate: {base._fmt_pct(succ_pocket.mean())}. "
               f"Log written to {log_path}")
 
-        if t == base.NUM_TASKS - 1:
+        if t == args.num_tasks - 1:
             pca_fit = PCA(n_components=2, random_state=args.seed).fit(X_train_scaled)
             panels = [(name, lineages[name], X_test_scaled, y_test) for name in LINEAGE_NAMES]
             base.plot_correctness_grid(
@@ -948,6 +1225,23 @@ def main():
             print(f"\n[breakpoint] Task {t} finished -- inspect `results`, `lineages`, "
                   f"`fisher`, `gum`, `deduce_memory`, or the log at {log_path}. Continue with `c`.")
             breakpoint()
+
+    if val_summary:
+        lines = ["", "VALIDATION SUMMARY (--val_fraction; held-out TRAINING rows, not test):",
+                 f"{'task':<6} {'lineage':<18} {'clean val acc':>14} {'poisoned val acc (true lbl)':>28}"]
+        for row in val_summary:
+            for name in LINEAGE_NAMES:
+                v = row[name]
+                lines.append(f"{row['task']:<6} {name:<18} {v['clean_val_acc']:>14.4f} "
+                             f"{v['poisoned_val_acc_true_label']:>28.4f}")
+        for name in LINEAGE_NAMES:
+            cv = np.nanmean([r[name]["clean_val_acc"] for r in val_summary])
+            pv = np.nanmean([r[name]["poisoned_val_acc_true_label"] for r in val_summary])
+            lines.append(f"{'mean':<6} {name:<18} {cv:>14.4f} {pv:>28.4f}")
+        text = "\n".join(lines)
+        print(text)
+        with open(log_path, "a") as f:
+            f.write(text + "\n")
 
     print(f"\nDone. Total runtime: {time.perf_counter() - start_time:.1f}s")
 
