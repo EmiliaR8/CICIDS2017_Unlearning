@@ -61,6 +61,7 @@ except ModuleNotFoundError:
     _XGBOOST_AVAILABLE = False
 
 from h5_data_loader import load_pooled_chronological_tasks
+import rebuttal_stream as rs
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -713,15 +714,38 @@ def main():
                           "convention (its action space was Box(-epsilon, epsilon, shape=(feature_dim,))). "
                           "Off by default (None) -- existing behavior (L2 budget only) is unchanged unless "
                           "you pass this, e.g. --per_feature_epsilon 0.25.")
+    # --- Rebuttal (informed-DEDUCE comparison) options; all default to the
+    # existing behavior. See rebuttal_stream.py's module docstring. ---
+    ap.add_argument("--data_fraction", type=float, default=1.0,
+                     help="Keep this fraction of EVERY task's training split (task 0 included, so "
+                          "the scaler/task-0 model see the subset too), stratified by label, drawn "
+                          "with --data_subset_seed (independent of --seed), kept in timestamp order. "
+                          "Applied before poisoning and before --dump_stream. Test splits are "
+                          "unchanged. Default 1.0 = no subsampling.")
+    ap.add_argument("--data_subset_seed", type=int, default=0,
+                     help="Fixed RNG seed for --data_fraction's row choice.")
+    ap.add_argument("--dump_stream", type=str, default=None,
+                     help="Directory: save, per task, the scaler + task-0 model, clean/poisoned "
+                          "training arrays, ground-truth poisoned indices, the detector's flagged "
+                          "set U_t, and every clean/adversarial test set, to <dir>/seed<seed>/ -- "
+                          "consumed by madar_pocket_pipeline_deduce.py --load_stream so both files "
+                          "train and score on identical data.")
+    ap.add_argument("--num_tasks", type=int, default=NUM_TASKS,
+                     help=f"Stop after this many tasks (default {NUM_TASKS} = all). Task boundaries "
+                          f"are unchanged -- this only truncates the run (e.g. 2 for a smoke test).")
+    ap.add_argument("--runs_dir", type=str, default=RUNS_BASE_DIR,
+                     help=f"Root output directory (default {RUNS_BASE_DIR}).")
     args = ap.parse_args()
     hidden_sizes = tuple(int(h) for h in args.hidden_sizes.split(","))
+    if not 1 <= args.num_tasks <= NUM_TASKS:
+        ap.error(f"--num_tasks must be in [1, {NUM_TASKS}]")
 
     SEED = args.seed
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     poison_fraction = args.poison_fraction
 
-    out_dir = os.path.join(RUNS_BASE_DIR, "madar_pocket_pipeline", args.log_name)
+    out_dir = os.path.join(args.runs_dir, "madar_pocket_pipeline", args.log_name)
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
     log_path = os.path.join(out_dir, "logs", "pipeline_log.txt")
@@ -742,6 +766,8 @@ def main():
                + (f", size-matched to {args.random_match_detector}" if args.random_forget_size == "matched" else "")
                + ")" if args.detector_type == "random" else "")
             + "\n"
+            + f"data_fraction={args.data_fraction} (subset seed {args.data_subset_seed}), "
+              f"num_tasks={args.num_tasks}, dump_stream={args.dump_stream}\n"
         )
 
     print(f"Loading {args.h5_path} and building {NUM_TASKS} pooled chronological tasks...")
@@ -776,7 +802,25 @@ def main():
     LINEAGE_NAMES = ["clean", "poisoned_baseline", "dropped_rows", "amnesiac", "opposite_class"]
     FIX_NAMES = ["dropped_rows", "amnesiac", "opposite_class"]
 
-    for t in range(NUM_TASKS):
+    stream = None
+    if args.dump_stream:
+        stream = rs.StreamWriter(args.dump_stream, SEED, meta={
+            "producer": "madar_pocket_pipeline.py", "data_fraction": args.data_fraction,
+            "data_subset_seed": args.data_subset_seed, "poison_fraction": poison_fraction,
+            "detector_type": args.detector_type, "detector_n_per_group": DETECTOR_N_PER_GROUP,
+            "hidden_sizes": list(hidden_sizes), "per_feature_epsilon": args.per_feature_epsilon,
+            "num_tasks": args.num_tasks, "feature_dim": int(feature_dim),
+            "benign_label": int(benign_label), "mal_label": int(mal_label),
+            "joint_buffer_allow_perturbed": args.joint_buffer_allow_perturbed,
+            "joint_buffer_purge_after_fill": args.joint_buffer_purge_after_fill,
+        })
+    metrics_log = rs.MetricsLog(os.path.join(out_dir, "logs", "rebuttal_metrics.json"), config={
+        "pipeline": "madar_pocket_pipeline.py", "seed": SEED, "data_fraction": args.data_fraction,
+        "data_subset_seed": args.data_subset_seed, "num_tasks": args.num_tasks,
+        "detector_type": args.detector_type, "dump_stream": args.dump_stream,
+    })
+
+    for t in range(args.num_tasks):
         print(f"\n{'#' * 60}\n# TASK {t}\n{'#' * 60}")
         task = tasks[t]
         X_raw = np.clip(task["features"].astype(np.float32), 0.0, 1.0)
@@ -786,6 +830,11 @@ def main():
         X_train_raw, X_test_raw, y_train, y_test, gid_train, gid_test = train_test_split(
             X_raw, y_all, gid_all, test_size=TASK_TEST_FRAC, random_state=SEED, stratify=y_all,
         )
+        if args.data_fraction < 1.0:
+            n_before = len(y_train)
+            X_train_raw, y_train, gid_train = rs.subsample_train_split(
+                X_train_raw, y_train, gid_train, args.data_fraction, [args.data_subset_seed, t])
+            print(f"  --data_fraction {args.data_fraction}: train split {n_before} -> {len(y_train)} rows")
 
         # -------------------------------------------------------------
         # Task 0: plain supervised pretraining only, no poisoning yet.
@@ -852,6 +901,12 @@ def main():
             ])
 
             results.append({"task": t, "task_acc": task_acc})
+            if stream is not None:
+                stream.save_task(0, {
+                    "X_train_scaled": X_train_scaled, "y_train": y_train, "gid_train": gid_train,
+                    "X_test_raw": X_test_raw, "y_test": y_test, "gid_test": gid_test,
+                })
+                stream.save_task0_extras(scaler, base_model.state_dict())
             torch.save({
                 "task_id": t, "seed": SEED, "feature_dim": feature_dim, "scaler": scaler,
                 "label_mapping": label_mapping,
@@ -1064,6 +1119,35 @@ def main():
         task_test_splits[t] = (X_test_raw, y_test)
         task_test_gids[t] = gid_test
 
+        # Rebuttal: shared stream dump + machine-readable metrics (no effect on
+        # training -- everything below only reads state).
+        if stream is not None:
+            stream.save_task(t, {
+                "X_train_scaled": X_train_scaled, "X_train_poisoned": X_train_poisoned,
+                "y_train": y_train, "gid_train": gid_train,
+                "idx_poison_ben": idx_poison_ben, "idx_poison_mal": idx_poison_mal,
+                "detected_poison_idx": detected_poison_idx,
+                "X_test_raw": X_test_raw, "y_test": y_test, "gid_test": gid_test,
+                **rs.pack_eval_sets(historical_adv, X_test_adv, succ_pocket, norms_pocket, eps_this_task),
+            })
+        metrics_log.add_task({
+            "task": t, "U_t_size": int(len(detected_poison_idx)),
+            "U_t_by_class": {"benign": int(len(detected_by_class[benign_label])),
+                             "malicious": int(len(detected_by_class[mal_label]))},
+            "oracle_poison_size": int(len(poison_idx)),
+            "U_t_true_positives": int(len(np.intersect1d(detected_poison_idx, poison_idx))),
+            "stream_check": {
+                "sha256_U_t": rs.hash_array(detected_poison_idx),
+                "sha256_poison_ben": rs.hash_array(idx_poison_ben),
+                "sha256_poison_mal": rs.hash_array(idx_poison_mal),
+                "sha256_X_train_poisoned": rs.hash_array(X_train_poisoned),
+            },
+            "lineages": {name: rs.lineage_metrics(
+                lineages[name], t, all_clean_sets, all_test_sets_full, X_test_scaled, y_test,
+                X_test_adv, succ_pocket, benign_label, mal_label,
+                mean_results[name], pooled_results[name]) for name in LINEAGE_NAMES},
+        })
+
         # ---------------------------------------------------------------
         # Logging
         # ---------------------------------------------------------------
@@ -1259,7 +1343,7 @@ def main():
               f"Log written to {log_path}")
 
         # Final task: PCA correctness plots.
-        if t == NUM_TASKS - 1:
+        if t == args.num_tasks - 1:
             pca_fit = PCA(n_components=2, random_state=SEED).fit(X_train_scaled)
             panels = [(name, lineages[name], X_test_scaled, y_test) for name in LINEAGE_NAMES]
             plot_correctness_grid(os.path.join(out_dir, "plots", f"task{t}_correctness.png"), pca_fit, panels)
