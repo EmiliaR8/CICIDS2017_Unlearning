@@ -172,6 +172,15 @@ class StreamReader:
             raise ValueError(f"task {t}: sha256 mismatch vs manifest for {bad}")
         return arrays, got
 
+    def train_sizes(self):
+        """Training-row count of every task in the stream, in task order.
+        Reads only y_train from each npz (no full load / hash check)."""
+        sizes = []
+        for t in range(self.num_tasks):
+            with np.load(os.path.join(self.dir, f"task{t}.npz"), allow_pickle=False) as z:
+                sizes.append(int(z["y_train"].shape[0]))
+        return sizes
+
     def load_task0_extras(self):
         return torch.load(os.path.join(self.dir, "task0_extras.pt"), weights_only=False)
 

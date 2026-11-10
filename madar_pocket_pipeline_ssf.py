@@ -115,6 +115,41 @@ only. --resume_from is NOT ported: meta_detect resumes with EMPTY buffers,
 and ssf's memory IS its training set, so an empty-memory resume would not be
 the same method.
 
+INFORMED SSF (ICLR 2027 rebuttal; opt-in, every default is unchanged --
+verified bit-identical weights with the new flags off).
+--load_stream DIR replaces this file's own data split, poison crafting and
+test-attack crafting with the arrays madar_pocket_pipeline.py --dump_stream
+wrote for the same --seed (sha256 checked; refuses a stream with fewer tasks
+than --num_tasks). clean/poisoned_baseline start from the stream's task-0
+ClassifierNN and scaler; ssf still pretrains its OWN AE_classifier with its own
+loss, on the stream's task-0 training rows (its model family has no shared
+task-0 checkpoint). ssf memory is sized against the stream's training rows
+(so --data_fraction 0.5 halves it).
+--informed_forget hands ssf the detector's flagged set U_t (same detector, same
+annotated set and U_t as L2U). SSF's native forget operation is removal from
+memory = its training set, so informed SSF never true-label queries,
+pseudo-labels or admits a flagged row to memory: the label query takes the
+next-ranked UNFLAGGED representative rows (keeping the --ssf_num_labeled
+budget), and the pseudo-label refill and every random fallback draw from
+unflagged rows. Because flagged rows can never enter memory, no forced removal
+is needed (memory starts as clean task-0 rows; U_t covers only the current
+task). The KS drift test and the M_c / M_t masks still see every chunk row, so
+SSF's own drift and selection signals are as published; memory forgetting
+(M_c) is unchanged. No gradient-based unlearning term is added.
+COMBINED LABEL BUDGET (informed SSF), per task: --ssf_num_labeled true task
+labels per round (default 200, 1 round/task) + the detector's annotated set,
+DETECTOR_N_PER_GROUP (60) rows per (class x poison-status) group = up to 240
+poison annotations. Note the detector also draws half of those 240 rows by
+margin under poisoned_baseline, a model trained on ALL task labels, so informed
+SSF indirectly benefits from full supervision (equally true for L2U).
+DEVIATIONS FROM PUBLISHED SSF (Zhang et al., INFOCOM 2025; reference
+xinchen930/SSF-Strategic-Selection-and-Forgetting, UNSW-NB15 path): all of
+"WHAT DIFFERS FROM THE REFERENCE" above (memory sizing over this project's
+task pool, full task-0 pretraining, Adam + project epochs, one round per task,
+shared StandardScaler space) and the reference-bug fixes, plus -- only with the
+new flags -- the shared stream (task-0 scaler from the producer run, producer's
+poison/U_t/adversarial test sets) and the U_t admission block above.
+
 DIAGNOSTICS SPECIFIC TO THIS FILE (logged under "Continual-learning
 baselines step"): drift decision + KS p-value per round, how many chunk rows
 were true-labeled vs. pseudo-labeled, how many of each were oracle-poisoned,
@@ -142,6 +177,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 import madar_pocket_pipeline as base
+import rebuttal_stream as rs
 
 LINEAGE_NAMES = ["clean", "poisoned_baseline", "ssf"]
 BASELINE_NAMES = ["ssf"]  # the one under test; gets the full metrics table
@@ -437,8 +473,19 @@ def optimize_new_mask(control_res, treatment_res, M_c, initialization, lr,
 # each admitted row's global id / oracle category / label source can be
 # carried along for diagnostics. Selection logic is unchanged.
 # ---------------------------------------------------------------------------
-def ssf_select(M_c, M_t, num_labeled, drift, memory_size, rng):
+def ssf_select(M_c, M_t, num_labeled, drift, memory_size, rng, blocked=None, stats=None):
     """Returns (keep_mem_idx, labeled_chunk_idx, pseudo_chunk_idx).
+
+    INFORMED SSF (rebuttal; only when `blocked` is given): `blocked` is a bool
+    mask over chunk rows (the shared detector's U_t). Blocked rows are never
+    chosen for a true-label query or a pseudo-label refill: the label query
+    takes the next-ranked UNBLOCKED representative rows (so the round keeps its
+    full --ssf_num_labeled budget whenever enough unblocked rows exist), and
+    every random fallback/top-up draws from unblocked rows only. Masks, drift
+    and memory forgetting are untouched. blocked=None runs the original code
+    path exactly (same statements, same RNG calls). `stats` (dict) receives
+    n_blocked and n_skipped_from_query (blocked rows that would otherwise have
+    been in the top --ssf_num_labeled representative picks).
 
     keep_mem_idx      -- memory rows that survive this round's forgetting.
     labeled_chunk_idx -- chunk rows admitted with their TRUE label (the
@@ -475,13 +522,24 @@ def ssf_select(M_c, M_t, num_labeled, drift, memory_size, rng):
 
     # --- Selection (new chunk rows to label) ---
     rep_new = np.where(M_t_np >= 0.5)[0]
+    n_query = num_labeled
+    if blocked is not None:
+        blocked = np.asarray(blocked, dtype=bool)
+        top_all = rep_new[np.argsort(-M_t_np[rep_new], kind="stable")][:num_labeled]
+        if stats is not None:
+            stats["n_blocked"] = int(blocked.sum())
+            stats["n_skipped_from_query"] = int(blocked[top_all].sum())
+        rep_new = rep_new[~blocked[rep_new]]
+        n_query = min(num_labeled, int((~blocked).sum()))
     rep_new_sorted = rep_new[np.argsort(-M_t_np[rep_new], kind="stable")]
-    if len(rep_new) < num_labeled:
+    if len(rep_new) < n_query:
         available = np.setdiff1d(np.arange(n_chunk), rep_new)
-        fallback = rng.permutation(available)[:num_labeled - len(rep_new)]
+        if blocked is not None:
+            available = available[~blocked[available]]
+        fallback = rng.permutation(available)[:n_query - len(rep_new)]
         labeled_chunk_idx = np.concatenate([rep_new, fallback])
     else:
-        labeled_chunk_idx = rep_new_sorted[:num_labeled]
+        labeled_chunk_idx = rep_new_sorted[:n_query]
 
     # --- Drift-only memory refill with pseudo-labeled chunk rows ---
     pseudo_chunk_idx = np.array([], dtype=np.int64)
@@ -489,17 +547,24 @@ def ssf_select(M_c, M_t, num_labeled, drift, memory_size, rng):
         n_after = len(keep_mem_idx) + len(labeled_chunk_idx)
         needed = memory_size - n_after
         if needed > 0:
-            if len(rep_new) > num_labeled:
-                remaining = rep_new_sorted[num_labeled:]
+            if len(rep_new) > n_query:
+                remaining = rep_new_sorted[n_query:]
                 if len(remaining) >= needed:
                     pseudo_chunk_idx = remaining[:needed]
                 else:
                     # Reference tops up with random rows drawn from the WHOLE
                     # chunk (may repeat rows already admitted) -- kept as-is.
-                    extra = rng.permutation(n_chunk)[:needed - len(remaining)]
+                    # Informed: drawn from the unblocked rows only.
+                    if blocked is None:
+                        extra = rng.permutation(n_chunk)[:needed - len(remaining)]
+                    else:
+                        extra = rng.permutation(np.where(~blocked)[0])[:needed - len(remaining)]
                     pseudo_chunk_idx = np.concatenate([remaining, extra])
             else:
-                pseudo_chunk_idx = rng.permutation(n_chunk)[:needed]
+                if blocked is None:
+                    pseudo_chunk_idx = rng.permutation(n_chunk)[:needed]
+                else:
+                    pseudo_chunk_idx = rng.permutation(np.where(~blocked)[0])[:needed]
     return keep_mem_idx, labeled_chunk_idx.astype(np.int64), pseudo_chunk_idx.astype(np.int64)
 
 
@@ -538,9 +603,11 @@ class SSFMemory:
 
 
 def ssf_round(lineage, memory, X_chunk, y_chunk, gid_chunk, cat_chunk, args, contrastive, teacher,
-              memory_size, rng):
+              memory_size, rng, blocked=None):
     """One SSF round on one chunk: drift check -> masks -> select/forget ->
-    retrain on memory. Returns this round's diagnostics dict."""
+    retrain on memory. Returns this round's diagnostics dict.
+    `blocked` (informed SSF only): bool mask over chunk rows that may never be
+    labeled, pseudo-labeled or admitted to memory -- see ssf_select."""
     _tlog(f"  [ssf_round] start, memory={len(memory)} rows, chunk={len(y_chunk)} rows")
     mem_out = lineage.malicious_proba(memory.X)
     chunk_out = lineage.malicious_proba(X_chunk)
@@ -554,8 +621,13 @@ def ssf_round(lineage, memory, X_chunk, y_chunk, gid_chunk, cat_chunk, args, con
     _tlog(f"  [ssf_round] chunk mask M_t optimized ({int((M_t.numpy() >= 0.5).sum())}/{len(M_t)} "
           f"representative)")
 
+    sel_stats = {}
     keep_idx, labeled_idx, pseudo_idx = ssf_select(
-        M_c, M_t, args.ssf_num_labeled, drift, memory_size, rng)
+        M_c, M_t, args.ssf_num_labeled, drift, memory_size, rng, blocked=blocked, stats=sel_stats)
+    if blocked is not None:
+        admitted = np.concatenate([labeled_idx, pseudo_idx])
+        if np.asarray(blocked, dtype=bool)[admitted].any():
+            raise AssertionError("informed SSF admitted a flagged (U_t) row to memory")
     _tlog(f"  [ssf_round] selection done (kept {len(keep_idx)}/{len(memory)} memory rows, "
           f"labeled {len(labeled_idx)}, pseudo-labeled {len(pseudo_idx)})")
 
@@ -606,6 +678,9 @@ def ssf_round(lineage, memory, X_chunk, y_chunk, gid_chunk, cat_chunk, args, con
         "pseudo_acc": float(pseudo_correct.mean()) if len(pseudo_correct) else float("nan"),
         "pseudo_acc_poisoned": float(pseudo_correct[pseudo_pois].mean()) if pseudo_pois.any() else float("nan"),
         "memory_after": int(len(memory)),
+        **({"n_flagged_in_chunk": sel_stats.get("n_blocked", 0),
+            "n_flagged_skipped_from_query": sel_stats.get("n_skipped_from_query", 0)}
+           if blocked is not None else {}),
     }
 
 
@@ -693,8 +768,43 @@ def main():
                      help="Disable the interactive breakpoint() pauses: after every task's pocket "
                           "recovery summary, and at the end of tasks "
                           f">= {base.BREAKPOINT_FROM_TASK}. Needed for a non-interactive/headless run.")
+    # --- Rebuttal (informed-SSF comparison) options; all default to the
+    # original SSF port's behavior. See rebuttal_stream.py. ---
+    ap.add_argument("--load_stream", type=str, default=None,
+                     help="Directory written by madar_pocket_pipeline.py --dump_stream. Uses that run's "
+                          "scaler, task-0 ClassifierNN (clean/poisoned_baseline), training rows, poison, "
+                          "detector flags U_t and clean/adversarial test sets for this --seed instead of "
+                          "building its own; ssf still pretrains its OWN AE_classifier on the stream's "
+                          "task-0 training rows. --h5-path, --poison_fraction and --per_feature_epsilon "
+                          "are then ignored. Every loaded array is sha256-checked; refuses to run if the "
+                          "stream has fewer tasks than --num_tasks.")
+    ap.add_argument("--informed_forget", action="store_true",
+                     help="Informed SSF: rows in the shared detector's flagged set U_t (from --load_stream, "
+                          "else base.run_detector, DETECTOR_N_PER_GROUP per (class x poison-status) group) "
+                          "are never true-label queried, pseudo-labeled or admitted to ssf's memory (= its "
+                          "training set). The label query takes the next-ranked unflagged rows, so the "
+                          "--ssf_num_labeled budget is kept. Drift test, masks and memory forgetting are "
+                          "unchanged. Default off = original SSF.")
+    ap.add_argument("--num_tasks", type=int, default=base.NUM_TASKS,
+                     help=f"Run this many tasks (default {base.NUM_TASKS}).")
+    ap.add_argument("--runs_dir", type=str, default=base.RUNS_BASE_DIR,
+                     help=f"Root output directory (default {base.RUNS_BASE_DIR}).")
     args = ap.parse_args()
     hidden_sizes = tuple(int(h) for h in args.hidden_sizes.split(","))
+    if not 1 <= args.num_tasks <= base.NUM_TASKS:
+        ap.error(f"--num_tasks must be in [1, {base.NUM_TASKS}]")
+    reader = None
+    if args.load_stream:
+        reader = rs.StreamReader(args.load_stream, args.seed)
+        print(f"Shared stream {reader.dir}: {reader.num_tasks} task(s) present, {args.num_tasks} requested")
+        if reader.num_tasks < args.num_tasks:
+            ap.error(f"stream {reader.dir} has only {reader.num_tasks} task(s) but --num_tasks is "
+                     f"{args.num_tasks} -- the producer run (madar_pocket_pipeline.py --dump_stream) did not "
+                     f"finish. Re-run it for --seed {args.seed}, or pass --num_tasks {reader.num_tasks}.")
+        if tuple(reader.meta["hidden_sizes"]) != hidden_sizes:
+            ap.error(f"--hidden_sizes {hidden_sizes} != stream's {tuple(reader.meta['hidden_sizes'])}")
+        args.poison_fraction = reader.meta["poison_fraction"]
+        args.per_feature_epsilon = reader.meta["per_feature_epsilon"]
     if not 0 < args.ssf_buffer_percent <= 1:
         raise ValueError(f"--ssf_buffer_percent must be in (0, 1], got {args.ssf_buffer_percent}")
     if args.ssf_rounds_per_task < 1:
@@ -707,7 +817,7 @@ def main():
     poison_fraction = args.poison_fraction
     contrastive = InfoNCELoss(temperature=SSF_TEMPERATURE)
 
-    out_dir = os.path.join(base.RUNS_BASE_DIR, "madar_pocket_ssf", args.log_name)
+    out_dir = os.path.join(args.runs_dir, "madar_pocket_ssf", args.log_name)
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
     log_path = os.path.join(out_dir, "logs", "pipeline_log.txt")
@@ -722,28 +832,43 @@ def main():
                 f"args: {vars(args)}\n\n")
     _tlog("Run starting")
 
-    print(f"Loading {args.h5_path} and building {base.NUM_TASKS} pooled chronological tasks...")
-    tasks, day_mapping, label_mapping = base.load_pooled_chronological_tasks(
-        args.h5_path, base.TASK_FRACTIONS)
-    benign_label = label_mapping["Benign"]
-    mal_label = 1 - benign_label
-    feature_dim = tasks[0]["features"].shape[1]
-    print(f"day_mapping={day_mapping}, feature_dim={feature_dim}, "
-          f"task sizes={[len(t['labels']) for t in tasks]}")
+    if reader is None:
+        print(f"Loading {args.h5_path} and building {base.NUM_TASKS} pooled chronological tasks...")
+        tasks, day_mapping, label_mapping = base.load_pooled_chronological_tasks(
+            args.h5_path, base.TASK_FRACTIONS)
+        benign_label = label_mapping["Benign"]
+        mal_label = 1 - benign_label
+        feature_dim = tasks[0]["features"].shape[1]
+        print(f"day_mapping={day_mapping}, feature_dim={feature_dim}, "
+              f"task sizes={[len(t['labels']) for t in tasks]}")
 
-    task_offsets = np.concatenate([[0], np.cumsum([len(t["labels"]) for t in tasks])[:-1]])
+        task_offsets = np.concatenate([[0], np.cumsum([len(t["labels"]) for t in tasks])[:-1]])
 
-    # Every task's training split, re-derived with the SAME train_test_split
-    # call the loop below makes, so the memory size is sized against the
-    # exact rows that make up the training pool.
-    splits = []
-    for t in range(base.NUM_TASKS):
-        y_t = tasks[t]["labels"].astype(np.int64)
-        splits.append(train_test_split(
-            np.arange(len(y_t)), test_size=base.TASK_TEST_FRAC, random_state=args.seed, stratify=y_t,
-        )[0])
-    total_train = sum(len(s) for s in splits)
-    task0_train = len(splits[0])
+        # Every task's training split, re-derived with the SAME train_test_split
+        # call the loop below makes, so the memory size is sized against the
+        # exact rows that make up the training pool.
+        splits = []
+        for t in range(base.NUM_TASKS):
+            y_t = tasks[t]["labels"].astype(np.int64)
+            splits.append(train_test_split(
+                np.arange(len(y_t)), test_size=base.TASK_TEST_FRAC, random_state=args.seed, stratify=y_t,
+            )[0])
+        total_train = sum(len(s) for s in splits)
+        task0_train = len(splits[0])
+    else:
+        # Stream: labels/feature_dim from its meta; "the whole training set"
+        # for memory sizing = the stream's (possibly --data_fraction-subsampled)
+        # training rows of every task it holds.
+        benign_label, mal_label = int(reader.meta["benign_label"]), int(reader.meta["mal_label"])
+        label_mapping = {"Benign": benign_label}
+        feature_dim = int(reader.meta["feature_dim"])
+        train_sizes = reader.train_sizes()
+        total_train = sum(train_sizes)
+        task0_train = train_sizes[0]
+        print(f"stream training sizes per task: {train_sizes}")
+        if len(train_sizes) < base.NUM_TASKS:
+            print(f"NOTE: stream holds {len(train_sizes)} < {base.NUM_TASKS} tasks; ssf memory is sized "
+                  f"against those tasks only (smoke-test streams).")
     memory_size_requested = int(math.floor(total_train * args.ssf_buffer_percent))
     memory_size = min(memory_size_requested, task0_train)
     memory_note = (
@@ -787,49 +912,80 @@ def main():
         return np.clip(scaler.transform(X_raw.astype(np.float32)), -base.FEATURE_CLIP,
                        base.FEATURE_CLIP).astype(np.float32)
 
-    for t in range(base.NUM_TASKS):
-        print(f"\n{'#' * 60}\n# TASK {t}\n{'#' * 60}")
-        task = tasks[t]
-        X_raw = np.clip(task["features"].astype(np.float32), 0.0, 1.0)
-        y_all = task["labels"].astype(np.int64)
-        gid_all = task_offsets[t] + np.arange(len(y_all), dtype=np.int64)
+    metrics_log = rs.MetricsLog(os.path.join(out_dir, "logs", "rebuttal_metrics.json"), config={
+        "pipeline": "madar_pocket_pipeline_ssf.py", "seed": args.seed,
+        "informed_forget": args.informed_forget, "load_stream": args.load_stream,
+        "num_tasks": args.num_tasks, "ssf_num_labeled": args.ssf_num_labeled,
+        "ssf_rounds_per_task": args.ssf_rounds_per_task, "ssf_buffer_percent": args.ssf_buffer_percent,
+        "ssf_memory_size": memory_size,
+        "stream_meta": reader.meta if reader is not None else None,
+    })
 
+    for t in range(args.num_tasks):
+        print(f"\n{'#' * 60}\n# TASK {t}\n{'#' * 60}")
         _tlog(f"=== Task {t}: start ===")
-        X_train_raw, X_test_raw, y_train, y_test, gid_train, gid_test = train_test_split(
-            X_raw, y_all, gid_all, test_size=base.TASK_TEST_FRAC, random_state=args.seed,
-            stratify=y_all,
-        )
+        if reader is None:
+            task = tasks[t]
+            X_raw = np.clip(task["features"].astype(np.float32), 0.0, 1.0)
+            y_all = task["labels"].astype(np.int64)
+            gid_all = task_offsets[t] + np.arange(len(y_all), dtype=np.int64)
+
+            X_train_raw, X_test_raw, y_train, y_test, gid_train, gid_test = train_test_split(
+                X_raw, y_all, gid_all, test_size=base.TASK_TEST_FRAC, random_state=args.seed,
+                stratify=y_all,
+            )
+        else:
+            stream_task, _stream_hashes = reader.load_task(t)
+            y_train, gid_train = stream_task["y_train"], stream_task["gid_train"]
+            X_test_raw, y_test, gid_test = (stream_task["X_test_raw"], stream_task["y_test"],
+                                            stream_task["gid_test"])
+            print(f"  stream task {t}: {len(y_train)} train rows, {len(y_test)} test rows, "
+                  f"sha256 verified for {len(_stream_hashes)} arrays")
         _tlog(f"Task {t}: train/test split done (train={len(y_train)}, test={len(y_test)})")
 
         # -------------------------------------------------------------
         # Task 0: plain supervised pretraining only, no poisoning yet.
         # -------------------------------------------------------------
         if t == 0:
-            scaler = StandardScaler().fit(X_train_raw)
-            X_train_scaled = to_scaled(X_train_raw)
-            X_test_scaled = to_scaled(X_test_raw)
+            if reader is None:
+                scaler = StandardScaler().fit(X_train_raw)
+                X_train_scaled = to_scaled(X_train_raw)
+                X_test_scaled = to_scaled(X_test_raw)
 
-            base_model = base.ClassifierNN(feature_dim, 2, hidden_sizes=hidden_sizes).to(base.DEVICE)
-            Xt = torch.tensor(X_train_scaled, dtype=torch.float32)
-            yt = torch.tensor(y_train, dtype=torch.long)
-            opt0 = torch.optim.Adam(base_model.parameters(), lr=base.TASK0_LR)
-            loss_fn0 = nn.CrossEntropyLoss()
-            base_model.train()
-            n = len(Xt)
-            _tlog(f"Task 0: pretraining shared ClassifierNN for {base.TASK0_EPOCHS} epochs on {n} rows")
-            for epoch in range(base.TASK0_EPOCHS):
-                perm = torch.randperm(n)
-                for i in range(0, n, base.TASK0_BATCH_SIZE):
-                    idx = perm[i:i + base.TASK0_BATCH_SIZE]
-                    if len(idx) < 2:
-                        continue
-                    opt0.zero_grad()
-                    loss = loss_fn0(base_model(Xt[idx]), yt[idx])
-                    loss.backward()
-                    opt0.step()
-                _tlog(f"  Task 0: pretraining epoch {epoch + 1}/{base.TASK0_EPOCHS} done")
-            base_model.eval()
-            _tlog("Task 0: shared ClassifierNN pretraining done")
+                base_model = base.ClassifierNN(feature_dim, 2, hidden_sizes=hidden_sizes).to(base.DEVICE)
+                Xt = torch.tensor(X_train_scaled, dtype=torch.float32)
+                yt = torch.tensor(y_train, dtype=torch.long)
+                opt0 = torch.optim.Adam(base_model.parameters(), lr=base.TASK0_LR)
+                loss_fn0 = nn.CrossEntropyLoss()
+                base_model.train()
+                n = len(Xt)
+                _tlog(f"Task 0: pretraining shared ClassifierNN for {base.TASK0_EPOCHS} epochs on {n} rows")
+                for epoch in range(base.TASK0_EPOCHS):
+                    perm = torch.randperm(n)
+                    for i in range(0, n, base.TASK0_BATCH_SIZE):
+                        idx = perm[i:i + base.TASK0_BATCH_SIZE]
+                        if len(idx) < 2:
+                            continue
+                        opt0.zero_grad()
+                        loss = loss_fn0(base_model(Xt[idx]), yt[idx])
+                        loss.backward()
+                        opt0.step()
+                    _tlog(f"  Task 0: pretraining epoch {epoch + 1}/{base.TASK0_EPOCHS} done")
+                base_model.eval()
+                _tlog("Task 0: shared ClassifierNN pretraining done")
+            else:
+                # Same scaler and the SAME task-0 ClassifierNN (clean /
+                # poisoned_baseline) as the producer run; ssf's own model is
+                # still pretrained below, on the stream's task-0 rows.
+                extras = reader.load_task0_extras()
+                scaler = extras["scaler"]
+                X_train_scaled = stream_task["X_train_scaled"]
+                X_test_scaled = to_scaled(X_test_raw)
+                base_model = base.ClassifierNN(feature_dim, 2, hidden_sizes=hidden_sizes).to(base.DEVICE)
+                base_model.load_state_dict(extras["model_state_dict"])
+                base_model.eval()
+                n = len(X_train_scaled)
+                _tlog("Task 0: loaded shared ClassifierNN + scaler from stream")
 
             for name in ["clean", "poisoned_baseline"]:
                 lineages[name] = base.AdaptableClassifier(copy.deepcopy(base_model))
@@ -910,7 +1066,10 @@ def main():
         # -------------------------------------------------------------
         # Tasks 1..NUM_TASKS-1: poison -> attack, every task.
         # -------------------------------------------------------------
-        X_train_scaled = to_scaled(X_train_raw)
+        if reader is None:
+            X_train_scaled = to_scaled(X_train_raw)
+        else:
+            X_train_scaled = stream_task["X_train_scaled"]
         X_test_scaled = to_scaled(X_test_raw)
         clean_replay_X, clean_replay_y = base.flatten_replay(clean_replay_buffer)
         baseline_replay_X, baseline_replay_y = base.flatten_replay(baseline_replay_buffer)
@@ -922,9 +1081,15 @@ def main():
 
         # Step 3: craft this task's poison, shared by poisoned_baseline/ssf.
         _tlog(f"Task {t}: step 3 -- crafting poison (poison_fraction={poison_fraction})")
-        X_train_poisoned, idx_poison_ben, idx_poison_mal, _ = base.craft_task_poison(
-            lineages["clean"], X_train_scaled, y_train, benign_label, mal_label, poison_fraction,
-        )
+        if reader is None:
+            X_train_poisoned, idx_poison_ben, idx_poison_mal, _ = base.craft_task_poison(
+                lineages["clean"], X_train_scaled, y_train, benign_label, mal_label, poison_fraction,
+            )
+        else:
+            # Shared poison from the producer run (not re-crafted here).
+            X_train_poisoned = stream_task["X_train_poisoned"]
+            idx_poison_ben = stream_task["idx_poison_ben"]
+            idx_poison_mal = stream_task["idx_poison_mal"]
         poison_idx = np.concatenate([idx_poison_ben, idx_poison_mal])
         category_all = np.where(y_train == benign_label, "benign", "malicious_clean").astype(object)
         category_all[idx_poison_ben] = "benign_perturbed"
@@ -946,6 +1111,28 @@ def main():
         # --ssf_rounds_per_task unlabeled chunks (true labels only reach it
         # through its per-round label budget). Teacher = the model at the
         # end of the previous round, updated after every round (reference).
+        # Informed forget: U_t = the shared detector's flagged set (stream),
+        # or -- without a stream -- base.run_detector on this file's own
+        # poisoned_baseline, exactly as madar_pocket_pipeline.py does.
+        U_t, flagged = None, None
+        if reader is not None:
+            U_t = stream_task["detected_poison_idx"]
+        elif args.informed_forget:
+            U_t, _by_cls, _det_metrics, _det = base.run_detector(
+                lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben,
+                idx_poison_mal, benign_label, mal_label, "xgboost", args.seed,
+            )
+        if args.informed_forget:
+            flagged = np.zeros(len(y_train), dtype=bool)
+            flagged[U_t] = True
+        # The detector's annotated set: DETECTOR_N_PER_GROUP rows per (class x
+        # poison-status) group, capped at the group's size (same rule as
+        # base.build_detector_training_set_mixed).
+        _n_pb, _n_pm = len(idx_poison_ben), len(idx_poison_mal)
+        _n_cb = int((y_train == benign_label).sum()) - _n_pb
+        _n_cm = int((y_train == mal_label).sum()) - _n_pm
+        detector_annotations = int(sum(min(base.DETECTOR_N_PER_GROUP, g) for g in (_n_cb, _n_cm, _n_pb, _n_pm)))
+
         _tlog(f"Task {t}: step 5 -- ssf adapting ({args.ssf_rounds_per_task} round(s))")
         chunk_order = ssf_rng.permutation(len(y_train))
         ssf_rounds = []
@@ -956,36 +1143,43 @@ def main():
             ssf_rounds.append(ssf_round(
                 lineages["ssf"], ssf_memory, X_train_poisoned[chunk], y_train[chunk], gid_train[chunk],
                 category_all[chunk], args, contrastive, ssf_teacher, memory_size, ssf_rng,
+                blocked=flagged[chunk] if flagged is not None else None,
             ))
             ssf_teacher = copy.deepcopy(lineages["ssf"].model).eval()
         _tlog(f"Task {t}: step 5 done")
 
-        # Step 6: craft this task's genuine-pocket test attack, ONCE, against
-        # poisoned_baseline (reference = clean) -- same points re-scored under
-        # every lineage below.
-        _tlog(f"Task {t}: step 6 -- crafting this task's adversarial test attack")
-        eps_this_task = base.typical_class_gap(X_test_scaled, y_test, benign_label,
-                                               mal_label) * base.ATTACK_EPS_MULTIPLIER
-        X_test_adv, succ_pocket, norms_pocket = base.adversarial_attack_pocket(
-            lineages["poisoned_baseline"], lineages["clean"], X_test_scaled, y_test,
-            epsilon_max=eps_this_task, per_feature_epsilon=args.per_feature_epsilon,
-        )
-        _tlog(f"Task {t}: step 6 done (genuine pocket rate {base._fmt_pct(succ_pocket.mean())})")
-
-        # Step 7: spillover check -- re-attack every PRIOR task's test set.
-        _tlog(f"Task {t}: step 7 -- spillover re-attack over {len(task_test_splits)} prior task(s)")
-        historical_adv = {}
-        for s, (Xs_raw, ys) in task_test_splits.items():
-            Xs_scaled = to_scaled(Xs_raw)
-            eps_s = base.typical_class_gap(Xs_scaled, ys, benign_label, mal_label)
-            eps_s = eps_s * base.ATTACK_EPS_MULTIPLIER if eps_s is not None else eps_this_task
-            Xs_adv, succ_s, norms_s = base.adversarial_attack_pocket(
-                lineages["poisoned_baseline"], lineages["clean"], Xs_scaled, ys, epsilon_max=eps_s,
-                per_feature_epsilon=args.per_feature_epsilon,
+        if reader is None:
+            # Step 6: craft this task's genuine-pocket test attack, ONCE, against
+            # poisoned_baseline (reference = clean) -- same points re-scored under
+            # every lineage below.
+            _tlog(f"Task {t}: step 6 -- crafting this task's adversarial test attack")
+            eps_this_task = base.typical_class_gap(X_test_scaled, y_test, benign_label,
+                                                   mal_label) * base.ATTACK_EPS_MULTIPLIER
+            X_test_adv, succ_pocket, norms_pocket = base.adversarial_attack_pocket(
+                lineages["poisoned_baseline"], lineages["clean"], X_test_scaled, y_test,
+                epsilon_max=eps_this_task, per_feature_epsilon=args.per_feature_epsilon,
             )
-            historical_adv[s] = (Xs_adv, ys, succ_s, eps_s)
-            _tlog(f"  Task {t}: step 7 -- re-attacked source task {s} ({len(ys)} rows)")
-        _tlog(f"Task {t}: step 7 done")
+            _tlog(f"Task {t}: step 6 done (genuine pocket rate {base._fmt_pct(succ_pocket.mean())})")
+
+            # Step 7: spillover check -- re-attack every PRIOR task's test set.
+            _tlog(f"Task {t}: step 7 -- spillover re-attack over {len(task_test_splits)} prior task(s)")
+            historical_adv = {}
+            for s, (Xs_raw, ys) in task_test_splits.items():
+                Xs_scaled = to_scaled(Xs_raw)
+                eps_s = base.typical_class_gap(Xs_scaled, ys, benign_label, mal_label)
+                eps_s = eps_s * base.ATTACK_EPS_MULTIPLIER if eps_s is not None else eps_this_task
+                Xs_adv, succ_s, norms_s = base.adversarial_attack_pocket(
+                    lineages["poisoned_baseline"], lineages["clean"], Xs_scaled, ys, epsilon_max=eps_s,
+                    per_feature_epsilon=args.per_feature_epsilon,
+                )
+                historical_adv[s] = (Xs_adv, ys, succ_s, eps_s)
+                _tlog(f"  Task {t}: step 7 -- re-attacked source task {s} ({len(ys)} rows)")
+            _tlog(f"Task {t}: step 7 done")
+        else:
+            # Steps 6-7 from the stream: the producer's adversarial test sets.
+            historical_adv, X_test_adv, succ_pocket, norms_pocket, eps_this_task = \
+                rs.unpack_eval_sets(stream_task)
+            _tlog(f"Task {t}: steps 6-7 loaded from stream ({len(historical_adv)} prior adversarial sets)")
 
         all_clean_sets = {s: (to_scaled(Xs_raw), ys) for s, (Xs_raw, ys) in task_test_splits.items()}
         all_clean_sets[t] = (X_test_scaled, y_test)
@@ -1018,6 +1212,50 @@ def main():
         # lineage's adaptation this task is fully done. ssf's memory was
         # already updated inside its own rounds (SSF curates memory BEFORE
         # training on it, by design).
+        # Rebuttal metrics (read-only).
+        stream_check = None
+        if reader is not None:
+            stream_check = {
+                "sha256_U_t": rs.hash_array(U_t),
+                "sha256_poison_ben": rs.hash_array(idx_poison_ben),
+                "sha256_poison_mal": rs.hash_array(idx_poison_mal),
+                "sha256_X_train_poisoned": rs.hash_array(X_train_poisoned),
+            }
+        n_true_labels = int(sum(r["n_labeled"] for r in ssf_rounds))
+        metrics_log.add_task({
+            "task": t,
+            "U_t_size": int(len(U_t)) if U_t is not None else None,
+            "oracle_poison_size": int(len(poison_idx)),
+            "U_t_true_positives": int(len(np.intersect1d(U_t, poison_idx))) if U_t is not None else None,
+            "informed_forget": bool(args.informed_forget),
+            "stream_check": stream_check,
+            "label_budget": {
+                "ssf_true_label_queries": n_true_labels,
+                "detector_annotations": detector_annotations if args.informed_forget else 0,
+                "combined": n_true_labels + (detector_annotations if args.informed_forget else 0),
+            },
+            "ssf": {
+                "drift_rounds": int(sum(bool(r["drift"]) for r in ssf_rounds)),
+                "n_rounds": len(ssf_rounds),
+                "ks_p_values": [r["ks_p_value"] for r in ssf_rounds],
+                "forgotten_by_ssf_mask": int(sum(r["n_forgotten"] for r in ssf_rounds)),
+                "forgotten_by_ssf_mask_poisoned": int(sum(r["n_forgotten_poisoned"] for r in ssf_rounds)),
+                # U_t rows are blocked at admission, so none is ever in memory to
+                # be force-removed: this count is 0 by construction (logged anyway).
+                "forced_out_by_U_t": 0,
+                "flagged_rows_blocked": int(sum(r.get("n_flagged_in_chunk", 0) for r in ssf_rounds)),
+                "flagged_rows_skipped_from_query": int(sum(r.get("n_flagged_skipped_from_query", 0)
+                                                           for r in ssf_rounds)),
+                "admitted_poisoned": int(sum(r["n_labeled_poisoned"] + r["n_pseudo_poisoned"]
+                                             for r in ssf_rounds)),
+                "memory_composition": ssf_memory.composition(),
+            },
+            "lineages": {name: rs.lineage_metrics(
+                lineages[name], t, all_clean_sets, all_test_sets_full, X_test_scaled, y_test,
+                X_test_adv, succ_pocket, benign_label, mal_label,
+                mean_results[name], pooled_results[name]) for name in LINEAGE_NAMES},
+        })
+
         _tlog(f"Task {t}: step 8 -- updating replay buffers")
         clean_category = np.where(y_train == benign_label, "benign", "malicious_clean")
         clean_replay_buffer = base.update_shared_buffer(
@@ -1085,6 +1323,11 @@ def main():
             _fmt_rounds(ssf_rounds),
             "",
             f"ssf memory composition (category/label source, post-task): {ssf_memory.composition()}",
+            *([f"INFORMED SSF: |U_t|={int(flagged.sum())} flagged rows blocked from labeling/pseudo-labeling/"
+               f"memory; {sum(r.get('n_flagged_skipped_from_query', 0) for r in ssf_rounds)} flagged rows "
+               f"skipped from the top-{args.ssf_num_labeled} query (replaced by next-ranked unflagged rows); "
+               f"label budget this task: {sum(r['n_labeled'] for r in ssf_rounds)} ssf true-label queries + "
+               f"{detector_annotations} detector poison annotations"] if flagged is not None else []),
             "",
             f"{'lineage':<18} {'task acc':>10} {'pooled acc':>12} {'mean acc':>10} "
             f"{'adv acc':>10} {'still-evades %':>16}",
@@ -1264,7 +1507,7 @@ def main():
               f"Log written to {log_path}")
         _tlog(f"=== Task {t}: done (genuine pocket rate {base._fmt_pct(succ_pocket.mean())}) ===")
 
-        if t == base.NUM_TASKS - 1:
+        if t == args.num_tasks - 1:
             _tlog(f"Task {t}: rendering final PCA correctness-grid plot")
             pca_fit = PCA(n_components=2, random_state=args.seed).fit(X_train_scaled)
             panels = [(name, lineages[name], X_test_scaled, y_test) for name in LINEAGE_NAMES]
