@@ -50,6 +50,7 @@ from build_latex_tables import _pct, _pct_pm_std
 # (row label, which run, lineage inside that run)
 METHODS = [
     ("MADAR", "l2u", "poisoned_baseline"),
+    ("Informed MADAR (detector-filtered)", "madar_filtered", "poisoned_baseline_filtered"),
     ("DEDUCE", "deduce", "deduce"),
     ("DEDUCE (informed)", "informed", "deduce"),
     ("L2U (Approximate Unlearning)", "l2u", "amnesiac"),
@@ -59,7 +60,8 @@ METHODS = [
     ("SSF (informed)", "informed_ssf", "ssf"),
 ]
 # run name -> (must have --informed_forget?)  None = not checked (l2u)
-INFORMED_FLAG = {"l2u": None, "deduce": False, "informed": True, "ssf": False, "informed_ssf": True}
+INFORMED_FLAG = {"l2u": None, "deduce": False, "informed": True, "ssf": False, "informed_ssf": True,
+                 "madar_filtered": True}
 HASH_KEYS = ["sha256_U_t", "sha256_poison_ben", "sha256_poison_mal", "sha256_X_train_poisoned"]
 
 
@@ -122,6 +124,9 @@ def main():
     ap.add_argument("--informed", default=None, help="informed DEDUCE run (optional)")
     ap.add_argument("--ssf", default=None, help="original SSF run (optional)")
     ap.add_argument("--informed_ssf", default=None, help="informed SSF run (optional)")
+    ap.add_argument("--madar_filtered", default=None,
+                    help="informed MADAR run: madar_pocket_pipeline_baseline_filtered.py --load_stream "
+                         "--filter_source detector (optional)")
     ap.add_argument("--no_stream_check", action="store_true",
                      help="For runs that did NOT use a shared stream (each crafted its own poison): skip "
                           "the poison/U_t hash comparison. Rows are then NOT on identical data -- the "
@@ -131,7 +136,7 @@ def main():
     args = ap.parse_args()
 
     paths = {"l2u": args.l2u, "deduce": args.deduce, "informed": args.informed, "ssf": args.ssf,
-             "informed_ssf": args.informed_ssf}
+             "informed_ssf": args.informed_ssf, "madar_filtered": args.madar_filtered}
     paths = {k: v for k, v in paths.items() if v}
     methods = [m for m in METHODS if m[1] in paths]
     if args.no_stream_check:
