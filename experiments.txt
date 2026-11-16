@@ -17,10 +17,8 @@ python madar_cl_pipeline.py --seed 42 --log_name madar5*                      MA
 
 python madar_cl_pipeline.py --seed 42 --log_name madar6*                      MADAR   increased MAX.. variable
 python madar_cl_pipeline.py --seed 42 --log_name madar7                       MADAR   Include logic to make poisoning schedule
-python madar_cl_pipeline.py --seed 42 --log_name madar8                       MADAR   make the poisoning schedule more drastic
 
-
-
+python madar_cl_pipeline.py --seed 42 --log_name madar_dual_agent1            MADAR   1 train agent, 1 test agent
 
 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u1         MADAR+U  First iteration of the MADAR+Unlearning pipeline, donut hole implementation (like EMBER): Many issues logged in chat with piplai, need to modify donut, SI, and isolation forest logic
@@ -34,11 +32,8 @@ python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u6_oracle  MAD
 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active1   MADAR+U  Restructured full pipeline, 
 python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active2   MADAR+U   Include logic for poisoning schedule 
-python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active3   MADAR+U   Refull replay buffer with clean malicious samples, and make the poisoning schedule more drastic
-python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_active4   MADAR+U   Refull replay buffer with clean malicious samples, from current and previous tasks
 
-
-
+python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_u_dual_agent
 
 
 Next: 
@@ -47,7 +42,803 @@ python joint_cl_pipeline.py --seed 42 --log_name joint2                       Jo
 
 
 
+python compare_cl_runs.py  runs/madar_unlearning/madar_u_dual_agent/madar_u_dual_agent.json  runs/madar/madar_dual_agent1/madar_dual_agent1.json --out madar_dual_v_madaru_dual.png  --include_table
 python compare_cl_runs.py runs/madar_unlearning/madar_active1/madar_active1.json runs/madar_unlearning/madar_active2/madar_active2.json --out madaru_active2_v_madaru_active3.png  --include_table
+
+
+python3 madar_unlearning_cl_pipeline.py --log_name pocket_targeting_diag_run  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+
+August 31:
+python3 madar_cl_pipeline.py --log_name pocket_target_0831  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+python3 madar_unlearning_cl_pipeline.py --log_name pocket_target_u_0831  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+
+python3 madar_cl_pipeline.py --log_name madar_split_clean_mal_0831  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+python3 madar_unlearning_cl_pipeline.py --log_name madar_u_split_clean_mal_0831  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+
+python3 madar_cl_pipeline.py --log_name madar_split_clean_mal_0901  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+python3 madar_unlearning_cl_pipeline.py --log_name madar_u_split_clean_mal_0901  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+
+
+python compare_accuracy_post_unlearn.py /mnt/erivas6/runs/madar_unlearning/madar_u_split_clean_mal_0901/madar_u_split_clean_mal_0901.json /mnt/erivas6/runs/madar/madar_split_clean_mal_0901/madar_split_clean_mal_0901.json  --out /home/erivas6/CICIDS2017_Unlearning/comparative_plots/madar_u_split_clean_mal_0901.png
+
+
+September 2:
+python3 madar_cl_pipeline.py --log_name madar_new_pipeline_0902  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+python3 madar_unlearning_cl_pipeline.py --log_name madar_u_new_pipeline_0902  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+
+
+September 3:
+python3 madar_cl_pipeline.py --log_name madar_new_pipeline_0903  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+python3 madar_unlearning_cl_pipeline.py --log_name madar_u_new_pipeline_0903  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+
+
+
+python3 madar_cl_pipeline.py --log_name madar_new_pipeline_0904  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+python3 madar_unlearning_cl_pipeline.py --log_name madar_u_new_pipeline_0904  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+
+python compare_accuracy_post_unlearn.py /mnt/erivas6/runs/madar/madar_new_pipeline_0903/madar_new_pipeline_0903.json  /mnt/erivas6/runs/madar_unlearning/madar_u_new_pipeline_0903/madar_u_new_pipeline_0903.json --out /home/erivas6/CICIDS2017_Unlearning/comparative_plots/madar_new_pipeline_0903.png
+
+Next:
+Diagnostic of the test batch creation
+python3 madar_cl_pipeline.py --log_name madar_new_pipeline_0904_2  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+python3 madar_unlearning_cl_pipeline.py --log_name madar_u_new_pipeline_0904_2  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+
+Mini fix for test batch creation
+python3 madar_cl_pipeline.py --log_name madar_new_pipeline_0904_3  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+python3 madar_unlearning_cl_pipeline.py --log_name madar_u_new_pipeline_0904_3  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+
+python3 madar_cl_pipeline.py --log_name madar_new_pipeline_0904_4  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 
+python3 madar_unlearning_cl_pipeline.py --log_name madar_u_new_pipeline_0904_4  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5
+
+
+python3 madar_cl_pipeline.py --log_name madar_new_pipeline_0904_5  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 
+python3 madar_unlearning_cl_pipeline.py --log_name madar_u_new_pipeline_0904_5  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 
+
+Full retrain, no buffer
+python madar_unlearning_cl_pipeline.py --resume_from /mnt/erivas6/runs/madar_unlearning/madar_u_new_pipeline_0904_5/logs/classifier_checkpoint.pt --log_name madar_u_new_pipeline_0904_task89 --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 
+
+
+Full retrain, with buffer
+python madar_unlearning_cl_pipeline.py --resume_from /mnt/erivas6/runs/madar_unlearning/madar_u_new_pipeline_0904_5/logs/classifier_checkpoint.pt --log_name madar_u_new_pipeline_0904_task89_2 --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 
+
+Amnesiac
+python madar_unlearning_cl_pipeline.py --resume_from /mnt/erivas6/runs/madar_unlearning/madar_u_new_pipeline_0904_5/logs/classifier_checkpoint.pt --log_name madar_u_new_pipeline_0904_task89_3 --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --diagnostic_method uncertain_half
+
+Label flip
+python madar_unlearning_cl_pipeline.py --resume_from /mnt/erivas6/runs/madar_unlearning/madar_u_new_pipeline_0904_5/logs/classifier_checkpoint.pt --log_name madar_u_new_pipeline_0904_task89_4 --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --diagnostic_method flip_label
+
+python extract_diagnostic_bundle.py --dataset /mnt/erivas6/processed/subsampled_dataset.h5 --checkpoint /mnt/erivas6/runs/madar_unlearning/madar_u_new_pipeline_0904_5/logs/classifier_checkpoint.pt --out diagnostic_bundle.pt
+
+
+
+
+
+
+
+
+
+
+September 5:
+New pipeline with refill, tasks 1-7
+python3 madar_unlearning_cl_pipeline.py --log_name madar_u_new_pipeline_refill_0905  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --refill_buffer_after_clean
+
+
+Full retrain, with buffer
+python madar_unlearning_cl_pipeline.py --resume_from /mnt/erivas6/runs/madar_unlearning/madar_u_new_pipeline_refill_0905/logs/classifier_checkpoint.pt --log_name madar_u_refill_0905_task89_fullretrain2 --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --diagnostic_method full_retrain --refill_buffer_after_clean
+
+Amnesiac
+python madar_unlearning_cl_pipeline.py --resume_from /mnt/erivas6/runs/madar_unlearning/madar_u_new_pipeline_refill_0905/logs/classifier_checkpoint.pt --log_name madar_u_refill_0905_task89_amnesiac2 --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --diagnostic_method uncertain_half --refill_buffer_after_clean
+
+Label flip
+python madar_unlearning_cl_pipeline.py --resume_from /mnt/erivas6/runs/madar_unlearning/madar_u_new_pipeline_refill_0905/logs/classifier_checkpoint.pt --log_name madar_u_refill_0905_task89_fliplabel2 --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --diagnostic_method flip_label --refill_buffer_after_clean
+
+Full retrain, with buffer
+python madar_unlearning_cl_pipeline.py --resume_from /mnt/erivas6/runs/madar_unlearning/madar_u_new_pipeline_refill_0905/logs/classifier_checkpoint.pt --log_name madar_u_refill_0905_task89_fullretrain --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --diagnostic_method full_retrain 
+
+Amnesiac
+python madar_unlearning_cl_pipeline.py --resume_from /mnt/erivas6/runs/madar_unlearning/madar_u_new_pipeline_refill_0905/logs/classifier_checkpoint.pt --log_name madar_u_refill_0905_task89_amnesiac --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --diagnostic_method uncertain_half 
+
+Label flip
+python madar_unlearning_cl_pipeline.py --resume_from /mnt/erivas6/runs/madar_unlearning/madar_u_new_pipeline_refill_0905/logs/classifier_checkpoint.pt --log_name madar_u_refill_0905_task89_fliplabel --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --diagnostic_method flip_label
+
+Re-do MADAR with all checkpoint logic
+python3 madar_cl_pipeline.py --log_name madar_new_pipeline_0905  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 
+
+
+
+September 6th:
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0906_piplai_pipeline 
+
+Include logs for all test sets
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0906_piplai_pipeline2 
+
+Separate replay buffers baseline and unlearning 
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0906_piplai_pipeline3 
+
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0906_piplai_pipeline4 --seed 69
+
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0906_piplai_pipeline5 --seed 420
+
+python summarize_pipeline_runs.py 
+
+
+
+
+
+
+September 8:
+New logging information (clean and adv data together), only admit clean samples into replay buffer
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline --seed 130
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline1 --seed 131
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline2 --seed 132
+
+
+Allow for pertrubed samples to reach replay buffer
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline3 --seed 130 --joint_buffer_allow_perturbed
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline4 --seed 131 --joint_buffer_allow_perturbed
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline5 --seed 132 --joint_buffer_allow_perturbed
+
+
+Allow for pertrubed samples to reach the replay buffer, clean, then don't refill
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline6 --seed 130 --joint_buffer_purge_after_fill
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline7 --seed 131 --joint_buffer_purge_after_fill
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline8 --seed 132 --joint_buffer_purge_after_fill
+
+
+Smaller NN, single hidden layer,  (original has 4 hidden layers 1024,512,256,12)
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline9 --seed 130 --hidden_sizes 128
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline11 --seed 131 --hidden_sizes 128
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline12 --seed 132 --hidden_sizes 128
+
+
+Smaller NN, two hidden layers,(original has 4 hidden layers 1024,512,256,12)
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline13 --seed 130 --hidden_sizes 64,32
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline10 --seed 131 --hidden_sizes 64,32
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline14 --seed 132 --hidden_sizes 64,32
+
+
+Smaller NN, three hidden layers,(original has 4 hidden layers 1024,512,256,12)
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0925_piplai_pipeline13_2 --seed 130 --hidden_sizes 512,256,128 --no_breakpoint
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0925_piplai_pipeline10_2 --seed 131 --hidden_sizes 512,256,128 --no_breakpoint
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0925_piplai_pipeline14_2 --seed 132 --hidden_sizes 512,256,128 --no_breakpoint
+
+
+Smaller NN, single hidden layer, per feature espilon
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline15 --seed 130 --hidden_sizes 128 --per_feature_epsilon 0.25
+
+Normal NN, per feature epsilon
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline16 --seed 130 --per_feature_epsilon 0.25 |  38 minutes
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipelineTEST --seed 130
+
+
+** Other baselines *** (All with baseline NN, dirty replay buffer, non-limited pertrubations)
+Synaptic Intelligence and AGEM
+python madar_pocket_pipeline_si_agem.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0909_piplai_pipeline17 --seed 130
+python madar_pocket_pipeline_si_agem.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0909_piplai_pipeline18 --seed 131
+python madar_pocket_pipeline_si_agem.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0909_piplai_pipeline19 --seed 132
+
+Naive and Joint
+python madar_pocket_pipeline_naive_joint.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0910_piplai_pipeline20 --seed 130
+python madar_pocket_pipeline_naive_joint.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0910_piplai_pipeline21 --seed 131
+python madar_pocket_pipeline_naive_joint.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0910_piplai_pipeline22 --seed 132
+
+
+DEDUCE on simple Continual Learning
+python madar_pocket_pipeline_deduce.py  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0910_piplai_pipeline23 --seed 130
+python madar_pocket_pipeline_deduce.py  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0910_piplai_pipeline24 --seed 131
+python madar_pocket_pipeline_deduce.py  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0910_piplai_pipeline25 --seed 132
+
+
+Synaptic Intelligence and AGEM, single hidden layer,  (original has 4 hidden layers 1024,512,256,12)
+python madar_pocket_pipeline_si_agem.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline32 --seed 130 --hidden_sizes 128
+python madar_pocket_pipeline_si_agem.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline33 --seed 131 --hidden_sizes 128
+python madar_pocket_pipeline_si_agem.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline34 --seed 132 --hidden_sizes 128
+
+
+DEDUCE Smaller NN, single hidden layer,  (original has 4 hidden layers 1024,512,256,12)
+python madar_pocket_pipeline_deduce.py  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline26 --seed 130 --hidden_sizes 128
+python madar_pocket_pipeline_deduce.py  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline27 --seed 131 --hidden_sizes 128
+python madar_pocket_pipeline_deduce.py  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline28 --seed 132 --hidden_sizes 128
+
+
+Synaptic Intelligence and AGEM, two hidden layers,  (original has 4 hidden layers 1024,512,256,12)
+python madar_pocket_pipeline_si_agem.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline35 --seed 130 --hidden_sizes 64,32
+python madar_pocket_pipeline_si_agem.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline36 --seed 131 --hidden_sizes 64,32
+python madar_pocket_pipeline_si_agem.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline37 --seed 132 --hidden_sizes 64,32
+
+
+Synaptic Intelligence and AGEM, three hidden layers,  (original has 4 hidden layers 1024,512,256,12)
+python madar_pocket_pipeline_si_agem.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline35_2 --seed 130 --hidden_sizes 512,256,128 --no_breakpoint
+python madar_pocket_pipeline_si_agem.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline36_2 --seed 131 --hidden_sizes 512,256,128 --no_breakpoint
+python madar_pocket_pipeline_si_agem.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline37_2 --seed 132 --hidden_sizes 512,256,128 --no_breakpoint
+
+
+
+DEDUCE Smaller NN, two hidden layers,(original has 4 hidden layers 1024,512,256,12)
+python madar_pocket_pipeline_deduce.py  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline29 --seed 130 --hidden_sizes 64,32
+python madar_pocket_pipeline_deduce.py  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline30 --seed 131 --hidden_sizes 64,32
+python madar_pocket_pipeline_deduce.py  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0914_piplai_pipeline31 --seed 132 --hidden_sizes 64,32
+
+
+DEDUCE Smaller NN, three hidden layers,(original has 4 hidden layers 1024,512,256,12)
+python madar_pocket_pipeline_deduce.py  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0925_piplai_pipeline29_2 --seed 130 --hidden_sizes 512,256,128 --no_breakpoint
+python madar_pocket_pipeline_deduce.py  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0925_piplai_pipeline30_2 --seed 131 --hidden_sizes 512,256,128 --no_breakpoint
+python madar_pocket_pipeline_deduce.py  --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0925_piplai_pipeline31_2 --seed 132 --hidden_sizes 512,256,128 --no_breakpoint
+
+
+
+
+
+Need to include in table:
+Joint 131
+python madar_pocket_pipeline_naive_joint.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0910_piplai_pipeline21_2 --seed 133
+
+AGEM 131
+python madar_pocket_pipeline_si_agem.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0909_piplai_pipeline18_2 --seed 133
+
+Dirty Buffer MADAR, Amnesiac, Dropped Rows, FLip Label 131 (Dirty buffer for table 11:)
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline4_2 --seed 133 --joint_buffer_allow_perturbed
+
+Clean Buffer Amnesiac, Dropped Rows, FLip Label 132 (Heuristic L2U Clean Buffer for table 11 and 2)
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline2_2 --seed 133 --no_breakpoint
+
+Unfilled Buffer Amnesiac, Dropped Rows, FLip Label 132  (Unfilled buffer for table 11)
+python madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0908_piplai_pipeline8_2 --seed 133 --joint_buffer_purge_after_fill --no_breakpoint
+
+
+
+Albations with random samples rather than pert classifier
+python3 madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0921_random_ablation1  --seed 130 --detector_type random --no_breakpoint
+python3 madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0921_random_ablation2  --seed 131 --detector_type random --no_breakpoint
+python3 madar_pocket_pipeline.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --log_name 0921_random_ablation3  --seed 132 --detector_type random --no_breakpoint
+
+
+changed to xgboost for Meta runs: 
+python3 madar_pocket_pipeline_meta_detect.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 132 --log_name 0921_meta_pipelineTEST4
+python3 madar_pocket_pipeline_meta_detect.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 132 --log_name 0921_meta_pipelineTEST5 --adapt_epochs 30
+python3 madar_pocket_pipeline_meta_detect.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 132 --log_name 0921_meta_pipelineTEST6 --adapt_epochs 30 #has precision and recall for pert samples
+python3 madar_pocket_pipeline_meta_detect.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 132 --log_name 0921_meta_pipelineTEST7 --adapt_epochs 30 #has precision and recall for clean samples
+
+python3 madar_pocket_pipeline_meta_detect.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 132 --log_name 0921_meta_pipelineTEST8 --adapt_epochs 15 --resume_from /mnt/erivas6/runs/madar_pocket_meta_detect/0921_meta_pipelineTEST7/logs/classifier_checkpoint.pt 
+
+python3 madar_pocket_pipeline_meta_detect.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 132 --log_name 0921_meta_pipelineTEST9 --adapt_epochs 15
+python3 madar_pocket_pipeline_meta_detect.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 132 --log_name 0922_meta_pipeline10 --adapt_epochs 15 --no_breakpoint
+
+
+
+
+testing SSF baseline:
+python madar_pocket_pipeline_ssf.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 132 --log_name ssf_buf1 --ssf_buffer_percent 0.2 --no_breakpoint
+python madar_pocket_pipeline_ssf.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 131 --log_name ssf_buf2 --ssf_buffer_percent 0.2 --no_breakpoint      #not good
+python madar_pocket_pipeline_ssf.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 130 --log_name ssf_buf3 --ssf_buffer_percent 0.2 --no_breakpoint
+python madar_pocket_pipeline_ssf.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 133 --log_name ssf_buf4 --ssf_buffer_percent 0.2 --no_breakpoint      #redo for seed 131
+
+Lowered thingy 
+python madar_pocket_pipeline_ssf.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 132 --log_name ssf_bufTEST --ssf_buffer_percent 0.2 --ssf_num_labeled 240 --no_breakpoint
+
+
+MADAR with scrubbed replau buffer ablation 
+python madar_pocket_pipeline_baseline_purge.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 130 --log_name 0925purge_run --no_breakpoint
+python madar_pocket_pipeline_baseline_purge.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 131 --log_name 0925purge_run2 --no_breakpoint
+python madar_pocket_pipeline_baseline_purge.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 132 --log_name 0925purge_run3 --no_breakpoint
+
+
+
+MADAR with no poison 
+python madar_pocket_pipeline_baseline_filtered.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 130 --log_name 0925filtered_run --no_breakpoint
+python madar_pocket_pipeline_baseline_filtered.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 131 --log_name 0925filtered_run2 --no_breakpoint
+python madar_pocket_pipeline_baseline_filtered.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 132 --log_name 0925filtered_run3 --no_breakpoint
+
+
+
+Informed Baseline Runs SMOKE TESTS
+export H5=/mnt/erivas6/processed/subsampled_dataset.h5 RUNS=/mnt/erivas6/rebuttal_runs STREAM=/mnt/erivas6/rebuttal_stream STREAM_FULL=$HOME/rebuttal_stream_full
+python madar_pocket_pipeline.py --seed 130 --log_name smoke_l2u_s130 --h5-path $H5 --runs_dir $RUNS --data_fraction 0.5 --dump_stream $STREAM --num_tasks 2 --no_breakpoint
+python madar_pocket_pipeline_deduce.py --seed 130 --log_name smoke_deduce_s130 --runs_dir $RUNS --load_stream $STREAM --no_breakpoint
+python madar_pocket_pipeline_deduce.py --seed 130 --log_name smoke_informed_s130 --runs_dir $RUNS --load_stream $STREAM --informed_forget --deduce_delta 0.05 --no_breakpoint
+python build_rebuttal_tables.py --seeds 130 --l2u "$RUNS/madar_pocket_pipeline/smoke_l2u_s{seed}/logs/rebuttal_metrics.json" --deduce "$RUNS/madar_pocket_deduce/smoke_deduce_s{seed}/logs/rebuttal_metrics.json" --informed "$RUNS/madar_pocket_deduce/smoke_informed_s{seed}/logs/rebuttal_metrics.json" --out_csv smoke_rebuttal.csv
+
+
+python madar_pocket_pipeline_deduce.py --seed 130 --log_name val_inf_d0.001_s130 --runs_dir $RUNS --load_stream $STREAM_FULL --informed_forget --deduce_delta 0.001 --val_fraction 0.1 --no_breakpoint
+python madar_pocket_pipeline_deduce.py --seed 130 --log_name val_inf_d0.003_s130 --runs_dir $RUNS --load_stream $STREAM_FULL --informed_forget --deduce_delta 0.003 --val_fraction 0.1 --no_breakpoint
+python madar_pocket_pipeline_deduce.py --seed 130 --log_name val_inf_d0.01_s130 --runs_dir $RUNS --load_stream $STREAM_FULL --informed_forget --deduce_delta 0.01 --val_fraction 0.1 --no_breakpoint
+python madar_pocket_pipeline_deduce.py --seed 130 --log_name val_inf_d0.05_s130 --runs_dir $RUNS --load_stream $STREAM_FULL --informed_forget --deduce_delta 0.05 --val_fraction 0.1 --no_breakpoint
+
+
+
+
+November 6th runs:
+Informed DEDUCE and L2U, half training set:
+    L2U
+python madar_pocket_pipeline.py --seed 130 --log_name rebuttal_l2u_s130 --h5-path $H5 --runs_dir $RUNS --data_fraction 0.5 --dump_stream $STREAM_FULL --no_breakpoint
+python madar_pocket_pipeline.py --seed 131 --log_name rebuttal_l2u_s131 --h5-path $H5 --runs_dir $RUNS --data_fraction 0.5 --dump_stream $STREAM_FULL --no_breakpoint
+python madar_pocket_pipeline.py --seed 132 --log_name rebuttal_l2u_s132 --h5-path $H5 --runs_dir $RUNS --data_fraction 0.5 --dump_stream $STREAM_FULL --no_breakpoint
+
+    DEDUCE- 
+python madar_pocket_pipeline_deduce.py --seed 130 --log_name rebuttal_deduce_s130 --runs_dir $RUNS --load_stream $STREAM_FULL --no_breakpoint
+python madar_pocket_pipeline_deduce.py --seed 131 --log_name rebuttal_deduce_s131 --runs_dir $RUNS --load_stream $STREAM_FULL --no_breakpoint
+python madar_pocket_pipeline_deduce.py --seed 132 --log_name rebuttal_deduce_s132 --runs_dir $RUNS --load_stream $STREAM_FULL --no_breakpoint
+
+
+
+    Informed DEDUCE
+python madar_pocket_pipeline_deduce.py --seed 130 --log_name rebuttal_informed_s130 --runs_dir $RUNS --load_stream $STREAM_FULL --informed_forget --deduce_delta 0.003 --no_breakpoint
+python madar_pocket_pipeline_deduce.py --seed 131 --log_name rebuttal_informed_s131 --runs_dir $RUNS --load_stream $STREAM_FULL --informed_forget --deduce_delta 0.003 --no_breakpoint
+python madar_pocket_pipeline_deduce.py --seed 132 --log_name rebuttal_informed_s132 --runs_dir $RUNS --load_stream $STREAM_FULL --informed_forget --deduce_delta 0.003 --no_breakpoint
+
+
+
+
+
+
+Informed DEDUCE and L2U, full training set:
+export H5=/mnt/erivas6/processed/subsampled_dataset.h5 RUNS=/mnt/erivas6/rebuttal_runs STREAM_FULLDATA=/mnt/erivas6/rebuttal_stream_fulldata
+
+    L2U 
+python madar_pocket_pipeline.py --seed 130 --log_name fulldata_l2u_s130 --h5-path $H5 --runs_dir $RUNS --dump_stream $STREAM_FULLDATA --no_breakpoint
+
+    DEDUCE indepentent poison
+python madar_pocket_pipeline_deduce.py --seed 130 --log_name fulldata_deduce_indep_s130 --h5-path $H5 --runs_dir $RUNS --no_breakpoint
+
+    informed DEDUCE indepentent poison
+python madar_pocket_pipeline_deduce.py --seed 130 --log_name fulldata_informed_indep_s130 --h5-path $H5 --runs_dir $RUNS --informed_forget --deduce_delta 0.003 --no_breakpoint
+
+
+    DEDUCE depentent poison
+python madar_pocket_pipeline_deduce.py --seed 130 --log_name fulldata_deduce_stream_s130 --runs_dir $RUNS --load_stream $STREAM_FULLDATA --no_breakpoint
+
+    informed DEDUCE depentent poison
+python madar_pocket_pipeline_deduce.py --seed 130 --log_name fulldata_informed_stream_s130 --runs_dir $RUNS --load_stream $STREAM_FULLDATA --informed_forget --deduce_delta 0.003 --no_breakpoint
+
+FOR READING RESULTS:
+Results. For runs 1, 4 and 5, which share a stream, this checks the hashes and prints the table:
+python build_rebuttal_tables.py --seeds 130 --l2u "$RUNS/madar_pocket_pipeline/fulldata_l2u_s{seed}/logs/rebuttal_metrics.json" --deduce "$RUNS/madar_pocket_deduce/fulldata_deduce_stream_s{seed}/logs/rebuttal_metrics.json" --informed "$RUNS/madar_pocket_deduce/fulldata_informed_stream_s{seed}/logs/rebuttal_metrics.json" --out_csv fulldata_stream_s130.csv
+
+For runs 2 and 3, which have no shared stream, the existing script reads Mean Acc, Task 10 and Task 1 from each log:
+python build_latex_tables.py --logs $RUNS/madar_pocket_deduce/fulldata_deduce_indep_s130/logs/pipeline_log.txt --seeds 130 --lineage deduce --method-name "DEDUCE (independent)"
+python build_latex_tables.py --logs $RUNS/madar_pocket_deduce/fulldata_informed_indep_s130/logs/pipeline_log.txt --seeds 130 --lineage deduce --method-name "DEDUCE informed (independent)"
+
+
+
+
+
+SSF
+smoke tests
+	ssf dependent
+python madar_pocket_pipeline_ssf.py --seed 130 --log_name smoke_ssf_stream_s130 --runs_dir $RUNS --load_stream $STREAM_FULLDATA --num_tasks 2 --no_breakpoint
+
+	informed ssf dependent
+python madar_pocket_pipeline_ssf.py --seed 130 --log_name smoke_issf_stream_s130 --runs_dir $RUNS --load_stream $STREAM_FULLDATA --informed_forget --num_tasks 2 --no_breakpoint
+
+	ssf independent
+python madar_pocket_pipeline_ssf.py --seed 130 --log_name smoke_ssf_indep_s130 --h5-path $H5 --runs_dir $RUNS --num_tasks 2 --no_breakpoint
+
+	informed ssf independent
+python madar_pocket_pipeline_ssf.py --seed 130 --log_name smoke_issf_indep_s130 --h5-path $H5 --runs_dir $RUNS --informed_forget --num_tasks 2 --no_breakpoint
+
+
+
+full runs
+	ssf dependent
+python madar_pocket_pipeline_ssf.py --seed 130 --log_name fulldata_ssf_stream_s130 --runs_dir $RUNS --load_stream $STREAM_FULLDATA --no_breakpoint
+
+	informed ssf dependent
+python madar_pocket_pipeline_ssf.py --seed 130 --log_name fulldata_issf_stream_s130 --runs_dir $RUNS --load_stream $STREAM_FULLDATA --informed_forget --no_breakpoint
+
+    informed ssf dependent RUN 2
+python madar_pocket_pipeline_ssf.py --seed 130 --log_name fulldata_issf_stream_s130PART2 --runs_dir $RUNS --load_stream $STREAM_FULLDATA --informed_forget --no_breakpoint
+	
+	ssf independent
+python madar_pocket_pipeline_ssf.py --seed 130 --log_name fulldata_ssf_indep_s130 --h5-path $H5 --runs_dir $RUNS --no_breakpoint	
+
+	informed ssf independent
+python madar_pocket_pipeline_ssf.py --seed 130 --log_name fulldata_issf_indep_s130 --h5-path $H5 --runs_dir $RUNS --informed_forget --no_breakpoint
+
+
+TO READ RESULTS
+python build_rebuttal_tables.py --seeds 130 --l2u "$RUNS/madar_pocket_pipeline/fulldata_l2u_s{seed}/logs/rebuttal_metrics.json" --deduce "$RUNS/madar_pocket_deduce/fulldata_deduce_stream_s{seed}/logs/rebuttal_metrics.json" --informed "$RUNS/madar_pocket_deduce/fulldata_informed_stream_s{seed}/logs/rebuttal_metrics.json" --ssf "$RUNS/madar_pocket_ssf/fulldata_ssf_stream_s{seed}/logs/rebuttal_metrics.json" --informed_ssf "$RUNS/madar_pocket_ssf/fulldata_issf_stream_s{seed}/logs/rebuttal_metrics.json" --out_csv fulldata_stream_s130.csv
+
+python build_rebuttal_tables.py --no_stream_check --seeds 130 --l2u "$RUNS/madar_pocket_pipeline/fulldata_l2u_s{seed}/logs/rebuttal_metrics.json" --deduce "$RUNS/madar_pocket_deduce/fulldata_deduce_indep_s{seed}/logs/rebuttal_metrics.json" --informed "$RUNS/madar_pocket_deduce/fulldata_informed_indep_s{seed}/logs/rebuttal_metrics.json" --ssf "$RUNS/madar_pocket_ssf/fulldata_ssf_indep_s{seed}/logs/rebuttal_metrics.json" --informed_ssf "$RUNS/madar_pocket_ssf/fulldata_issf_indep_s{seed}/logs/rebuttal_metrics.json" --out_csv fulldata_indep_s130.csv
+
+
+
+
+
+More seeds for DEDUCE and SSF, informed, not informed, dependent poison and independent poison
+python madar_pocket_pipeline.py --seed $SEED --log_name fulldata_l2u_s$SEED --h5-path $H5 --runs_dir $RUNS --dump_stream $STREAM_FULLDATA --no_breakpoint
+
+
+DEDUCE dependent 
+python madar_pocket_pipeline_deduce.py --seed $SEED --log_name fulldata_deduce_stream_s$SEED --runs_dir $RUNS --load_stream $STREAM_FULLDATA --no_breakpoint
+python madar_pocket_pipeline_deduce.py --seed $SEED --log_name fulldata_informed_stream_s$SEED --runs_dir $RUNS --load_stream $STREAM_FULLDATA --informed_forget --deduce_delta 0.003 --no_breakpoint
+
+DEDUCE independent
+python madar_pocket_pipeline_deduce.py --seed $SEED --log_name fulldata_deduce_indep_s$SEED --h5-path $H5 --runs_dir $RUNS --no_breakpoint
+python madar_pocket_pipeline_deduce.py --seed $SEED --log_name fulldata_informed_indep_s$SEED --h5-path $H5 --runs_dir $RUNS --informed_forget --deduce_delta 0.003 --no_breakpoint
+
+
+SSF dependent
+python madar_pocket_pipeline_ssf.py --seed $SEED --log_name fulldata_ssf_stream_s$SEED --runs_dir $RUNS --load_stream $STREAM_FULLDATA --no_breakpoint
+python madar_pocket_pipeline_ssf.py --seed $SEED --log_name fulldata_issf_stream_s$SEED --runs_dir $RUNS --load_stream $STREAM_FULLDATA --informed_forget --no_breakpoint
+
+
+SSF independent
+python madar_pocket_pipeline_ssf.py --seed $SEED --log_name fulldata_ssf_indep_s$SEED --h5-path $H5 --runs_dir $RUNS --no_breakpoint
+python madar_pocket_pipeline_ssf.py --seed $SEED --log_name fulldata_issf_indep_s$SEED --h5-path $H5 --runs_dir $RUNS --informed_forget --no_breakpoint
+
+next
+To reach these results:
+python build_rebuttal_tables.py --seeds 130 131 132 --l2u "$RUNS/madar_pocket_pipeline/fulldata_l2u_s{seed}/logs/rebuttal_metrics.json" --deduce "$RUNS/madar_pocket_deduce/fulldata_deduce_stream_s{seed}/logs/rebuttal_metrics.json" --informed "$RUNS/madar_pocket_deduce/fulldata_informed_stream_s{seed}/logs/rebuttal_metrics.json" --ssf "$RUNS/madar_pocket_ssf/fulldata_ssf_stream_s{seed}/logs/rebuttal_metrics.json" --informed_ssf "$RUNS/madar_pocket_ssf/fulldata_issf_stream_s{seed}/logs/rebuttal_metrics.json" --out_csv fulldata_stream_3seeds.csv
+python build_rebuttal_tables.py --no_stream_check --seeds 130 131 132 --l2u "$RUNS/madar_pocket_pipeline/fulldata_l2u_s{seed}/logs/rebuttal_metrics.json" --deduce "$RUNS/madar_pocket_deduce/fulldata_deduce_indep_s{seed}/logs/rebuttal_metrics.json" --informed "$RUNS/madar_pocket_deduce/fulldata_informed_indep_s{seed}/logs/rebuttal_metrics.json" --ssf "$RUNS/madar_pocket_ssf/fulldata_ssf_indep_s{seed}/logs/rebuttal_metrics.json" --informed_ssf "$RUNS/madar_pocket_ssf/fulldata_issf_indep_s{seed}/logs/rebuttal_metrics.json" --out_csv fulldata_indep_3seeds.csv
+
+
+
+
+
+
+
+
+
+
+
+
+Trash
+Meta runs
+python3 madar_pocket_pipeline_meta_detect.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 130 --log_name 0921_meta_pipelineTEST
+python3 madar_pocket_pipeline_meta_detect.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 131 --log_name 0921_meta_pipelineTEST2 --no_breakpoint
+python3 madar_pocket_pipeline_meta_detect.py --h5-path /mnt/erivas6/processed/subsampled_dataset.h5 --seed 132 --log_name 0921_meta_pipelineTEST3 --no_breakpoint
+
+
+
+*** Plotting and table stuff **** 
+
+Clean replay buffer, 3 seeds
+python summarize_pipeline_runs.py 
+python plot_pipeline_metrics.py --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline1/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline2/logs/pipeline_log.txt  --pooled-acc --mean-acc --combined-acc  --out-dir /mnt/erivas6/runs/comparative_plots/clean_buffer
+
+Dirty replay buffer 3 seeds
+python plot_pipeline_metrics.py --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline3/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline4/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline5/logs/pipeline_log.txt  --pooled-acc --mean-acc --combined-acc  --out-dir /mnt/erivas6/runs/comparative_plots/dirty_buffer
+
+unfilled replay buffer
+python plot_pipeline_metrics.py --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline6/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline7/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline8/logs/pipeline_log.txt  --pooled-acc --mean-acc --combined-acc  --out-dir /mnt/erivas6/runs/comparative_plots/unfilled_buffer
+
+smaller NN 1 layers
+python plot_pipeline_metrics.py --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline9/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline11/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline12/logs/pipeline_log.txt  --pooled-acc --mean-acc --combined-acc  --out-dir /mnt/erivas6/runs/comparative_plots/1Layer_NN
+
+smaller NN 2 layers
+python plot_pipeline_metrics.py --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline10/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline13/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline14/logs/pipeline_log.txt  --pooled-acc --mean-acc --combined-acc  --out-dir /mnt/erivas6/runs/comparative_plots/2Layer_NN
+
+Limited Pertrubations, Small NN
+python plot_pipeline_metrics.py --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline15/logs/pipeline_log.txt  --pooled-acc --mean-acc --combined-acc  --out-dir /mnt/erivas6/runs/comparative_plots/1Layer_LimitedPerts
+
+Limited perturbations, Normal NN
+python plot_pipeline_metrics.py --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline16/logs/pipeline_log.txt  --pooled-acc --mean-acc --combined-acc  --out-dir /mnt/erivas6/runs/comparative_plots/4Layer_LimitedPerts
+
+SI and AGEM
+python plot_pipeline_metrics.py --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline3/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_si_agem/0909_piplai_pipeline17/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_si_agem/0909_piplai_pipeline18/logs/pipeline_log.txt  /mnt/erivas6/runs/madar_pocket_si_agem/0909_piplai_pipeline19/logs/pipeline_log.txt --pooled-acc --mean-acc --combined-acc  --out-dir /mnt/erivas6/runs/comparative_plots/SI_AGEM_v_MADAR_U
+python plot_pipeline_metrics.py --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_si_agem/0909_piplai_pipeline17/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_si_agem/0909_piplai_pipeline18/logs/pipeline_log.txt  /mnt/erivas6/runs/madar_pocket_si_agem/0909_piplai_pipeline19/logs/pipeline_log.txt --pooled-acc --mean-acc --combined-acc  --out-dir /mnt/erivas6/runs/comparative_plots/SI_AGEM_v_MADAR_U_CLEAAN
+
+Joint and Naive
+python plot_pipeline_metrics.py --logs /mnt/erivas6/runs/madar_pocket_naive_joint/0910_piplai_pipeline20/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_naive_joint/0910_piplai_pipeline21/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_naive_joint/0910_piplai_pipeline22/logs/pipeline_log.txt --pooled-acc --mean-acc --combined-acc  --out-dir /mnt/erivas6/runs/comparative_plots/Joint_Naive
+
+
+
+
+
+
+3 linages (Amnesiac, Dropped Rows, FLip Label), joint, Naive, SI, AGEM, DEDUCE, MADAR | Table 7
+python plot_pipeline_metrics.py --logs \
+  /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline/logs/pipeline_log.txt \
+  /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline1/logs/pipeline_log.txt \
+  /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline2/logs/pipeline_log.txt \
+  /mnt/erivas6/runs/madar_pocket_naive_joint/0910_piplai_pipeline20/logs/pipeline_log.txt \
+  /mnt/erivas6/runs/madar_pocket_naive_joint/0910_piplai_pipeline21/logs/pipeline_log.txt \
+  /mnt/erivas6/runs/madar_pocket_naive_joint/0910_piplai_pipeline22/logs/pipeline_log.txt \
+  /mnt/erivas6/runs/madar_pocket_si_agem/0909_piplai_pipeline17/logs/pipeline_log.txt \
+  /mnt/erivas6/runs/madar_pocket_si_agem/0909_piplai_pipeline18/logs/pipeline_log.txt \
+  /mnt/erivas6/runs/madar_pocket_si_agem/0909_piplai_pipeline19/logs/pipeline_log.txt \
+  /mnt/erivas6/runs/madar_pocket_deduce/0910_piplai_pipeline23/logs/pipeline_log.txt \
+  /mnt/erivas6/runs/madar_pocket_deduce/0910_piplai_pipeline24/logs/pipeline_log.txt \
+  /mnt/erivas6/runs/madar_pocket_deduce/0910_piplai_pipeline25/logs/pipeline_log.txt \
+  --restrict-lineage clean=0,1,2 --restrict-lineage poisoned_baseline=0,1,2 \
+  --rename poisoned_baseline=MADAR \
+  --pooled-acc --mean-acc --combined-acc \
+  --out-dir /mnt/erivas6/runs/comparative_plots/general_table_all_pipelines
+
+
+Replay Buffer Ablation | Table 8 (clean, dirty, unfilled)
+python plot_pipeline_metrics.py --logs \
+    /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline/logs/pipeline_log.txt \
+    /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline1/logs/pipeline_log.txt \
+    /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline2/logs/pipeline_log.txt \
+    /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline3/logs/pipeline_log.txt \
+    /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline4/logs/pipeline_log.txt \
+    /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline5/logs/pipeline_log.txt \
+    /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline6/logs/pipeline_log.txt \
+    /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline7/logs/pipeline_log.txt \
+    /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline8/logs/pipeline_log.txt \
+    --split-lineage "amnesiac:Amnesiac (Clean Buffer)=0,1,2" \
+    --split-lineage "amnesiac:Amnesiac (Dirty Buffer)=3,4,5" \
+    --split-lineage "amnesiac:Amnesiac (Unfilled Buffer)=6,7,8" \
+    --split-lineage "opposite_class:Flip Label (Clean Buffer)=0,1,2" \
+    --split-lineage "opposite_class:Flip Label (Dirty Buffer)=3,4,5" \
+    --split-lineage "opposite_class:Flip Label (Unfilled Buffer)=6,7,8" \
+    --split-lineage "dropped_rows:Full Retrain (Clean Buffer)=0,1,2" \
+    --split-lineage "dropped_rows:Full Retrain (Dirty Buffer)=3,4,5" \
+    --split-lineage "dropped_rows:Full Retrain (Unfilled Buffer)=6,7,8" \
+    --restrict-lineage clean=0,1,2 \
+    --restrict-lineage poisoned_baseline=3,4,5 \
+    --rename clean=Clean --rename poisoned_baseline="MADAR" \
+    --only-lineages "Amnesiac (Clean Buffer),Amnesiac (Dirty Buffer),Amnesiac (Unfilled Buffer),Flip Label (Clean Buffer),Flip Label (Dirty Buffer),Flip Label (Unfilled Buffer),Full Retrain (Clean Buffer),Full Retrain (Dirty Buffer),Full Retrain (Unfilled Buffer),Clean,MADAR" \
+    --mean-acc --pooled-acc --combined-acc \
+    --out-dir /mnt/erivas6/runs/comparative_plots/buffer_ablation_table_2
+
+
+
+
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline1/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline2/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage poisoned_baseline \
+    --method-name "MADAR"
+
+python summarize_pipeline_runs.py --logs /mnt/erivas6/runs/madar_pocket_pipeline/0906_piplai_pipeline3/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_pipeline/0906_piplai_pipeline4/logs/pipeline_log.txt /mnt/erivas6/runs/madar_pocket_pipeline/0906_piplai_pipeline5/logs/pipeline_log.txt
+
+python summarize_pipeline_runs.py \
+    --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline1/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline2/logs/pipeline_log.txt \
+
+
+AGEM and SI for table 5
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_si_agem/0909_piplai_pipeline17/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_si_agem/0909_piplai_pipeline18_2/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_si_agem/0909_piplai_pipeline19/logs/pipeline_log.txt \
+    --seeds 130 133 132 \
+    --lineage agem \
+    --method-name "AGEM"
+
+
+Joint and Naive for table 5
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_naive_joint/0910_piplai_pipeline20/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_naive_joint/0910_piplai_pipeline21_2/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_naive_joint/0910_piplai_pipeline22/logs/pipeline_log.txt \
+    --seeds 130 133 132 \
+    --lineage joint \
+    --method-name "Joint"
+
+
+Heuristic L2U Clean Buffer for table 11 and 2
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline1/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline2_2/logs/pipeline_log.txt \
+    --seeds 130 131 133 \
+    --lineage opposite_class \
+    --method-name "Flip Label"
+
+
+MADAR for table 5
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline1/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline2/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage poisoned_baseline \
+    --method-name "MADAR"
+
+    
+/mnt/erivas6/runs/madar_pocket_deduce/0910_piplai_pipeline23/logs/pipeline_log.txt
+
+
+
+DEDUCE for table 5
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_deduce/0910_piplai_pipeline23/logs/pipeline_log.txt \
+        /mnt/erivas6/runs/madar_pocket_deduce/0910_piplai_pipeline24/logs/pipeline_log.txt \
+        /mnt/erivas6/runs/madar_pocket_deduce/0910_piplai_pipeline25/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage deduce \
+    --method-name "DEDUCE"
+
+
+Clean buffer for table 6:
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline1/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline2/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage poisoned_baseline \
+    --method-name "MADAR"
+
+
+Dirty buffer for table 11:
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline3/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline4_2/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline5/logs/pipeline_log.txt \
+    --seeds 130 133 132 \
+    --lineage amnesiac \
+    --method-name "Amnesiac"
+
+
+
+
+Unfilled buffer for table 11:
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline6/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline7/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline8_2/logs/pipeline_log.txt \
+    --seeds 130 131 133 \
+    --lineage dropped_rows \
+    --method-name "Dropped Rows"
+
+
+
+1 Hidden Layer for table 7:
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline9/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline11/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline12/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage poisoned_baseline \
+    --method-name "MADAR"
+
+
+2 Hidden Layers for table 7:
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline10/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline13/logs/pipeline_log.txt \
+            /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline14/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage opposite_class \
+    --method-name "Flip Label"
+
+
+
+
+Synaptic Intelligence and AGEM, 1 hidden layer for table 7:
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_si_agem/0914_piplai_pipeline32/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_si_agem/0914_piplai_pipeline33/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_si_agem/0914_piplai_pipeline34/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage agem \
+    --method-name "AGEM"
+
+
+DEDUCE Smaller NN,1 hidden layer for table 7:
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_deduce/0914_piplai_pipeline26/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_deduce/0914_piplai_pipeline27/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_deduce/0914_piplai_pipeline28/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage deduce \
+    --method-name "DEDUCE"
+
+
+
+DEDUCE Smaller NN,2 hidden layer for table 7:
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_deduce/0914_piplai_pipeline29/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_deduce/0914_piplai_pipeline30/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_deduce/0914_piplai_pipeline31/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage deduce \
+    --method-name "DEDUCE"
+
+Synaptic Intelligence and AGEM, 2 hidden layers for table 7:
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_si_agem/0914_piplai_pipeline35/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_si_agem/0914_piplai_pipeline36/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_si_agem/0914_piplai_pipeline37/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage si \
+    --method-name "Synaptic Intelligence"
+
+
+Meta all lineages, general table:
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_meta_detect/0921_meta_pipelineTEST/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_meta_detect/0921_meta_pipelineTEST2/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_meta_detect/0921_meta_pipelineTEST3/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage poisoned_baseline \
+    --method-name "MADAR"
+
+
+/mnt/erivas6/runs/madar_pocket_meta_detect/0921_meta_pipelineTEST4/logs/pipeline_log.txt
+
+
+
+Other baselines SSF:
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_ssf/ssf_buf1/logs/pipeline_log.txt \
+    /mnt/erivas6/runs/madar_pocket_ssf/ssf_buf4/logs/pipeline_log.txt \
+    /mnt/erivas6/runs/madar_pocket_ssf/ssf_buf3/logs/pipeline_log.txt \
+    --seeds 130 133 131 \
+    --lineage ssf \
+    --method-name "SSF"
+
+
+
+Meta all lineages, general :
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_meta_detect/0921_meta_pipelineTEST4/logs/pipeline_log.txt \
+    --seeds 132 \
+    --lineage opposite_class \
+    --method-name "flip label"
+
+    
+
+
+Random classifier rather than targetted pert classifier for forget set:
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_pipeline/0921_random_ablation1/logs/pipeline_log.txt \
+   /mnt/erivas6/runs/madar_pocket_pipeline/0921_random_ablation2/logs/pipeline_log.txt \
+    /mnt/erivas6/runs/madar_pocket_pipeline/0921_random_ablation3/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage opposite_class \
+    --method-name "Flip Label"
+
+
+
+Small NN (3 Layers results) MADAR, Heuristic L2U
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_pipeline/0925_piplai_pipeline13_2/logs/pipeline_log.txt\
+   /mnt/erivas6/runs/madar_pocket_pipeline/0925_piplai_pipeline10_2/logs/pipeline_log.txt \
+    /mnt/erivas6/runs/madar_pocket_pipeline/0925_piplai_pipeline14_2/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage poisoned_baseline \
+    --method-name "MADAR"
+
+
+
+Small NN (3 Layers results) DEDUCE
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_deduce/0925_piplai_pipeline29_2/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_deduce/0925_piplai_pipeline30_2/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_deduce/0925_piplai_pipeline31_2/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage deduce \
+    --method-name "DEDUCE"
+
+
+
+Table 11, MADAR unfilled buffer
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_baseline_purge/0925purge_run/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_baseline_purge/0925purge_run2/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_baseline_purge/0925purge_run3/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage poisoned_baseline \
+    --method-name "L2U"
+
+
+Table 11, MADAR filtered buffer
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_baseline_filtered/0925filtered_run/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_baseline_filtered/0925filtered_run2/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_baseline_filtered/0925filtered_run3/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage poisoned_baseline_filtered \
+    --method-name "L2U"
+
+
+Table 11, SI small NN 3 layer
+python build_latex_tables.py \
+    --logs /mnt/erivas6/runs/madar_pocket_si_agem/0914_piplai_pipeline35_2/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_si_agem/0914_piplai_pipeline36_2/logs/pipeline_log.txt \
+           /mnt/erivas6/runs/madar_pocket_si_agem/0914_piplai_pipeline37_2/logs/pipeline_log.txt \
+    --seeds 130 131 132 \
+    --lineage agem \
+    --method-name "AGEM"
+    
+
 
 
 
