@@ -69,7 +69,7 @@ DEVICE = torch.device(TRAIN_DEVICE)
 #       HYPERPARAMETERS & CONFIGURATION
 # ==========================================
 # DATASET_PATH = "./Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset2.pkl"
-DATASET_PATH = "/home/erivas6/Desktop/Unlearning_experiments/Contrastive_Drift/red_agent_output/red_agent_perturbed_dataset2.pkl"
+DATASET_PATH = "./data/red_agent_output/red_agent_perturbed_dataset2.pkl"
 LABEL_COLUMN = "label_binary"
 
 NUM_TASKS = 10                  # "10 batches" -- task 1 = task_id 0, compared against task_ids 1..9

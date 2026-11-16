@@ -5,7 +5,8 @@ Same poisoning, test-time attack, and pocket-targeting criterion as
 madar_pocket_pipeline.py -- imported directly from it below, not
 reimplemented, so the two files cannot drift apart. Adds a third
 continual-learning baseline: DEDUCE (Wang, Benavides-Prado & Koh, ICLR
-2026), ported from EmiliaR8/Meta-Unlearning's core/deduce.py.
+2026), ported from core/deduce.py in
+the authors' prior codebase (anonymized for review).
 
 THREE lineages, all starting from the same task-0 model (see
 madar_pocket_pipeline.py for task 0's plain-pretraining details):

@@ -5,7 +5,7 @@ Same poisoning, test-time attack, and pocket-targeting criterion as
 madar_pocket_pipeline.py -- imported directly from it below, not
 reimplemented, so the two files cannot drift apart. Adds the two
 continual-learning REFERENCE POINTS every other lineage in this project is
-implicitly measured against, ported from EmiliaR8/Meta-Unlearning's
+implicitly measured against, ported from the authors' prior codebase (anonymized for review)'s
 experiments/naive.py and experiments/joint.py:
 
 FOUR lineages, all starting from the same task-0 model (see

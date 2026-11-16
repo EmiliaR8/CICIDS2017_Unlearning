@@ -58,7 +58,7 @@ import pandas as pd
 
 # ---- EDIT THESE PATHS ----
 H5_PATH = "subsampled_dataset.h5"
-LOGS_DIR = Path("/home/aritran/ICLR/logs")
+LOGS_DIR = Path("./checkpoints")
 # ---------------------------
 
 TASK_FRACTIONS = [

@@ -66,8 +66,8 @@ import rebuttal_stream as rs
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-H5_DATASET_PATH = "/mnt/processed_data/subsampled_dataset.h5"
-RUNS_BASE_DIR = "/mnt/erivas6/runs"
+H5_DATASET_PATH = "./data/subsampled_dataset.h5"
+RUNS_BASE_DIR = "./runs"
 
 NUM_TASKS = 10
 TASK_FRACTIONS = [0.3000, 0.0918, 0.0883, 0.0848, 0.0813, 0.0778, 0.0743, 0.0708, 0.0673, 0.0638]

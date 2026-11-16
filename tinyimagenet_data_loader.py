@@ -5,7 +5,7 @@ TinyImageNet-200 loading + class-incremental task scheduling for
 madar_pocket_pipeline_tinyimagenet.py.
 
 Two pieces are ported (with attribution) from a sister project,
-EmiliaR8/Meta-Unlearning (code/core/tasks.py and code/core/data/{base,tinyimagenet}.py),
+the authors' prior codebase (anonymized for review) (code/core/tasks.py and code/core/data/{base,tinyimagenet}.py),
 which already runs class-incremental continual learning on this exact dataset
 (no poisoning/attack layer there -- that's what this repo's pipeline adds on top):
 

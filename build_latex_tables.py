@@ -52,9 +52,9 @@ method per run, so it prints each method's row body only; add the
 USAGE
 ===========================================================================
   python build_latex_tables.py \\
-      --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline/logs/pipeline_log.txt \\
-             /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline1/logs/pipeline_log.txt \\
-             /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline2/logs/pipeline_log.txt \\
+      --logs runs/madar_pocket_pipeline/l2u_s130/logs/pipeline_log.txt \\
+             runs/madar_pocket_pipeline/l2u_s131/logs/pipeline_log.txt \\
+             runs/madar_pocket_pipeline/l2u_s132/logs/pipeline_log.txt \\
       --seeds 130 131 132 \\
       --lineage poisoned_baseline \\
       --method-name "MADAR"

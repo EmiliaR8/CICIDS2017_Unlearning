@@ -3,7 +3,7 @@ naive_cl_pipeline.py
 
 Usage:
     python naive_cl_pipeline.py --seed 42 --log_name naive_10task_run \\
-        --h5-path /mnt/processed_data/subsampled_dataset.h5
+        --h5-path ./data/subsampled_dataset.h5
 
 NEW naive continual-learning pipeline over the pooled/chronological 10-task
 split of subsampled_dataset.h5 / full_dataset.h5 (see h5_data_loader.py's
@@ -66,7 +66,7 @@ from h5_data_loader import load_pooled_chronological_tasks
 # clmd_cicids_*_cd.py scripts): hyperparameters live here, not as CLI flags.
 # Only --seed and --log_name are CLI.
 # ---------------------------------------------------------------------------
-H5_DATASET_PATH = "/mnt/processed_data/subsampled_dataset.h5"
+H5_DATASET_PATH = "./data/subsampled_dataset.h5"
 
 NUM_TASKS = 10
 # task0 = 30% warm start; tasks1-9 taper 9.18% -> 6.38% of the pooled dataset.
