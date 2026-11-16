@@ -225,7 +225,7 @@ POST_FIX_RE = re.compile(
     re.MULTILINE,
 )
 GENUINE_POCKETS_RE = re.compile(rf"genuine pockets found: \d+/\d+ \(({NUM})%\)")
-CLASS_MARKER_RE = re.compile(rf"\[({NAME})\] classification report")
+CLASS_MARKER_RE = re.compile(rf"\[({NAME})\] classification report \(this task's clean test\)")
 CLASS_ROW_RE = re.compile(rf"^\s*(Benign|Malicious)\s+{NUM}\s+({NUM})\s+{NUM}\s+\d+\s*$", re.MULTILINE)
 # The parenthesized phrase varies by pipeline ("post-unlearning" in the
 # detector+fix-variant pipeline, "post-adaptation" in the SI/A-GEM one).
@@ -292,7 +292,13 @@ def _parse_recall(chunk):
     out = {}
     for m in CLASS_MARKER_RE.finditer(chunk):
         name = m.group(1)
-        window = chunk[m.end():m.end() + 600]
+        # Bounded at the next "classification report" (e.g. this same lineage's
+        # adversarial-test report, added right after the clean one) so its
+        # Benign/Malicious rows can't bleed into this window and silently
+        # overwrite the clean-test values below.
+        next_report = chunk.find("classification report", m.end())
+        window_end = next_report if next_report != -1 else m.end() + 600
+        window = chunk[m.end():window_end]
         rows = {row.group(1): float(row.group(2)) for row in CLASS_ROW_RE.finditer(window)}
         if rows:
             out[name] = rows

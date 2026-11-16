@@ -31,6 +31,7 @@ same log files -- only --lineage changes:
   Synaptic Intelligence        --> madar_pocket_pipeline_si_agem.py logs,     --lineage si
   A-GEM                        --> madar_pocket_pipeline_si_agem.py logs,     --lineage agem
   DEDUCE                       --> madar_pocket_pipeline_deduce.py logs,      --lineage deduce
+  SSF                          --> madar_pocket_pipeline_ssf.py logs,         --lineage ssf
   MADAR                        --> madar_pocket_pipeline.py logs,             --lineage poisoned_baseline
   MADAR + Unlearning (Dropped Rows)  --> madar_pocket_pipeline.py logs,       --lineage dropped_rows
   MADAR + Unlearning (Amnesiac)      --> madar_pocket_pipeline.py logs,       --lineage amnesiac

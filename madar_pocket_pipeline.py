@@ -61,6 +61,7 @@ except ModuleNotFoundError:
     _XGBOOST_AVAILABLE = False
 
 from h5_data_loader import load_pooled_chronological_tasks
+import rebuttal_stream as rs
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -328,6 +329,67 @@ def run_detector(poisoned_baseline, X_train_poisoned, y_train, idx_poison_ben, i
         "n_oracle": len(idx_poison_ben) + len(idx_poison_mal),
     }
     return detected_poison_idx, detected_by_class, metrics, detector
+
+
+class RandomDetector:
+    """Stand-in for a trained detector's .predict(), used only by
+    run_random_detector() and by the --joint_buffer_purge_after_fill ablation
+    when combined with --detector_type random: flags each row independently
+    at a fixed rate, ignoring X entirely (there is no learned signal here)."""
+
+    def __init__(self, flagged_rate, seed):
+        self.flagged_rate = flagged_rate
+        self.seed = seed
+
+    def predict(self, X):
+        rng = np.random.default_rng(self.seed)
+        return (rng.random(len(X)) < self.flagged_rate).astype(int)
+
+
+def run_random_detector(X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
+                         benign_label, mal_label, seed, n_flag_by_class=None, matched_to=None):
+    """Same interface/return shape as run_detector(), but the forget-set is
+    chosen uniformly at random per class instead of via a trained classifier
+    -- ablation for --detector_type random.
+
+    n_flag_by_class ({label: count}) sets how many rows to flag per class. The
+    default ablation (--random_forget_size matched) passes the per-class
+    counts the trained detector (`matched_to`) flagged on this same task, so
+    random and trained forget-sets are the SAME SIZE and differ only in WHICH
+    rows are chosen. None falls back to the original sizing
+    (--random_forget_size budget): min(DETECTOR_N_PER_GROUP, class size) per
+    class, i.e. matched to the detector's LABELING budget, which makes the
+    random forget-set far smaller than the trained detector's."""
+    rng = np.random.default_rng(seed)
+    detected_by_class = {}
+    class_metrics = {}
+    for cls, true_poison_this_class in [(benign_label, idx_poison_ben), (mal_label, idx_poison_mal)]:
+        class_indices = np.where(y_train == cls)[0]
+        n_target = DETECTOR_N_PER_GROUP if n_flag_by_class is None else n_flag_by_class[cls]
+        n_flag = min(n_target, len(class_indices))
+        flagged = rng.choice(class_indices, size=n_flag, replace=False)
+        detected_by_class[cls] = flagged
+        tp = len(np.intersect1d(flagged, true_poison_this_class))
+        precision = tp / max(len(flagged), 1)
+        recall = tp / max(len(true_poison_this_class), 1)
+        class_metrics[cls] = {"n_flagged": len(flagged), "tp": tp, "precision": precision, "recall": recall}
+
+    detected_poison_idx = np.concatenate([detected_by_class[benign_label], detected_by_class[mal_label]])
+    flagged_rate = len(detected_poison_idx) / max(len(X_train_poisoned), 1)
+    metrics = {
+        "detector_type": ("random (budget-sized: DETECTOR_N_PER_GROUP per class)" if matched_to is None
+                          else f"random (size-matched to {matched_to} detector's forget-set)"),
+        "train_accuracy": float("nan"),
+        "composition": {"random_benign": len(detected_by_class[benign_label]),
+                         "random_malicious": len(detected_by_class[mal_label]),
+                         **({f"{matched_to}_flagged_benign": int(n_flag_by_class[benign_label]),
+                             f"{matched_to}_flagged_malicious": int(n_flag_by_class[mal_label])}
+                            if n_flag_by_class is not None else {})},
+        "class_metrics": class_metrics,
+        "n_detected": len(detected_poison_idx),
+        "n_oracle": len(idx_poison_ben) + len(idx_poison_mal),
+    }
+    return detected_poison_idx, detected_by_class, metrics, RandomDetector(flagged_rate, seed)
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +664,24 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log_name", type=str, default="madar_pocket_pipeline_run")
     ap.add_argument("--h5-path", type=str, default=H5_DATASET_PATH)
-    ap.add_argument("--detector_type", type=str, default="xgboost", choices=["xgboost", "logistic"])
+    ap.add_argument("--detector_type", type=str, default="xgboost",
+                     choices=["xgboost", "logistic", "random"],
+                     help="'random' is an ablation: picks the forget-set uniformly at random per "
+                          "class instead of using the trained detector's flags, to isolate how much "
+                          "the classifier's selection signal matters. Its size per class is set by "
+                          "--random_forget_size.")
+    ap.add_argument("--random_forget_size", type=str, default="matched", choices=["matched", "budget"],
+                     help="Only used with --detector_type random. 'matched' (default): each task, "
+                          "first train the --random_match_detector detector exactly as a normal run "
+                          "would and count how many rows it flags per class, then flag that SAME "
+                          "number per class at random -- random and trained forget-sets are the same "
+                          "size, differing only in which rows. 'budget': the original sizing, "
+                          f"min({DETECTOR_N_PER_GROUP}, class size) per class (matches the detector's "
+                          "labeling budget, NOT its forget-set size; kept to reproduce older runs).")
+    ap.add_argument("--random_match_detector", type=str, default="xgboost", choices=["xgboost", "logistic"],
+                     help="Which trained detector's per-class forget-set size the random ablation "
+                          "matches under --random_forget_size matched. Its flags are used ONLY for "
+                          "the counts, never for which rows are forgotten.")
     ap.add_argument("--poison_fraction", type=float, default=POISON_FRACTION)
     ap.add_argument("--no_breakpoint", action="store_true",
                      help="Disable the interactive breakpoint() pause at the end of tasks >= "
@@ -635,15 +714,38 @@ def main():
                           "convention (its action space was Box(-epsilon, epsilon, shape=(feature_dim,))). "
                           "Off by default (None) -- existing behavior (L2 budget only) is unchanged unless "
                           "you pass this, e.g. --per_feature_epsilon 0.25.")
+    # --- Rebuttal (informed-DEDUCE comparison) options; all default to the
+    # existing behavior. See rebuttal_stream.py's module docstring. ---
+    ap.add_argument("--data_fraction", type=float, default=1.0,
+                     help="Keep this fraction of EVERY task's training split (task 0 included, so "
+                          "the scaler/task-0 model see the subset too), stratified by label, drawn "
+                          "with --data_subset_seed (independent of --seed), kept in timestamp order. "
+                          "Applied before poisoning and before --dump_stream. Test splits are "
+                          "unchanged. Default 1.0 = no subsampling.")
+    ap.add_argument("--data_subset_seed", type=int, default=0,
+                     help="Fixed RNG seed for --data_fraction's row choice.")
+    ap.add_argument("--dump_stream", type=str, default=None,
+                     help="Directory: save, per task, the scaler + task-0 model, clean/poisoned "
+                          "training arrays, ground-truth poisoned indices, the detector's flagged "
+                          "set U_t, and every clean/adversarial test set, to <dir>/seed<seed>/ -- "
+                          "consumed by madar_pocket_pipeline_deduce.py --load_stream so both files "
+                          "train and score on identical data.")
+    ap.add_argument("--num_tasks", type=int, default=NUM_TASKS,
+                     help=f"Stop after this many tasks (default {NUM_TASKS} = all). Task boundaries "
+                          f"are unchanged -- this only truncates the run (e.g. 2 for a smoke test).")
+    ap.add_argument("--runs_dir", type=str, default=RUNS_BASE_DIR,
+                     help=f"Root output directory (default {RUNS_BASE_DIR}).")
     args = ap.parse_args()
     hidden_sizes = tuple(int(h) for h in args.hidden_sizes.split(","))
+    if not 1 <= args.num_tasks <= NUM_TASKS:
+        ap.error(f"--num_tasks must be in [1, {NUM_TASKS}]")
 
     SEED = args.seed
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     poison_fraction = args.poison_fraction
 
-    out_dir = os.path.join(RUNS_BASE_DIR, "madar_pocket_pipeline", args.log_name)
+    out_dir = os.path.join(args.runs_dir, "madar_pocket_pipeline", args.log_name)
     os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
     log_path = os.path.join(out_dir, "logs", "pipeline_log.txt")
@@ -659,6 +761,13 @@ def main():
             "training only -- no poisoning/detection/unlearning yet.\n"
             f"Classifier hidden layer sizes: {hidden_sizes}\n"
             f"Per-feature epsilon cap: {args.per_feature_epsilon}\n"
+            f"Detector: {args.detector_type}"
+            + (f" (random_forget_size={args.random_forget_size}"
+               + (f", size-matched to {args.random_match_detector}" if args.random_forget_size == "matched" else "")
+               + ")" if args.detector_type == "random" else "")
+            + "\n"
+            + f"data_fraction={args.data_fraction} (subset seed {args.data_subset_seed}), "
+              f"num_tasks={args.num_tasks}, dump_stream={args.dump_stream}\n"
         )
 
     print(f"Loading {args.h5_path} and building {NUM_TASKS} pooled chronological tasks...")
@@ -693,7 +802,25 @@ def main():
     LINEAGE_NAMES = ["clean", "poisoned_baseline", "dropped_rows", "amnesiac", "opposite_class"]
     FIX_NAMES = ["dropped_rows", "amnesiac", "opposite_class"]
 
-    for t in range(NUM_TASKS):
+    stream = None
+    if args.dump_stream:
+        stream = rs.StreamWriter(args.dump_stream, SEED, meta={
+            "producer": "madar_pocket_pipeline.py", "data_fraction": args.data_fraction,
+            "data_subset_seed": args.data_subset_seed, "poison_fraction": poison_fraction,
+            "detector_type": args.detector_type, "detector_n_per_group": DETECTOR_N_PER_GROUP,
+            "hidden_sizes": list(hidden_sizes), "per_feature_epsilon": args.per_feature_epsilon,
+            "num_tasks": args.num_tasks, "feature_dim": int(feature_dim),
+            "benign_label": int(benign_label), "mal_label": int(mal_label),
+            "joint_buffer_allow_perturbed": args.joint_buffer_allow_perturbed,
+            "joint_buffer_purge_after_fill": args.joint_buffer_purge_after_fill,
+        })
+    metrics_log = rs.MetricsLog(os.path.join(out_dir, "logs", "rebuttal_metrics.json"), config={
+        "pipeline": "madar_pocket_pipeline.py", "seed": SEED, "data_fraction": args.data_fraction,
+        "data_subset_seed": args.data_subset_seed, "num_tasks": args.num_tasks,
+        "detector_type": args.detector_type, "dump_stream": args.dump_stream,
+    })
+
+    for t in range(args.num_tasks):
         print(f"\n{'#' * 60}\n# TASK {t}\n{'#' * 60}")
         task = tasks[t]
         X_raw = np.clip(task["features"].astype(np.float32), 0.0, 1.0)
@@ -703,6 +830,11 @@ def main():
         X_train_raw, X_test_raw, y_train, y_test, gid_train, gid_test = train_test_split(
             X_raw, y_all, gid_all, test_size=TASK_TEST_FRAC, random_state=SEED, stratify=y_all,
         )
+        if args.data_fraction < 1.0:
+            n_before = len(y_train)
+            X_train_raw, y_train, gid_train = rs.subsample_train_split(
+                X_train_raw, y_train, gid_train, args.data_fraction, [args.data_subset_seed, t])
+            print(f"  --data_fraction {args.data_fraction}: train split {n_before} -> {len(y_train)} rows")
 
         # -------------------------------------------------------------
         # Task 0: plain supervised pretraining only, no poisoning yet.
@@ -769,6 +901,12 @@ def main():
             ])
 
             results.append({"task": t, "task_acc": task_acc})
+            if stream is not None:
+                stream.save_task(0, {
+                    "X_train_scaled": X_train_scaled, "y_train": y_train, "gid_train": gid_train,
+                    "X_test_raw": X_test_raw, "y_test": y_test, "gid_test": gid_test,
+                })
+                stream.save_task0_extras(scaler, base_model.state_dict())
             torch.save({
                 "task_id": t, "seed": SEED, "feature_dim": feature_dim, "scaler": scaler,
                 "label_mapping": label_mapping,
@@ -855,11 +993,29 @@ def main():
         pocket_info_by_source = {s: (v[2], v[3]) for s, v in historical_adv.items()}
         pocket_info_by_source[t] = (succ_pocket, eps_this_task)
 
-        # Step 7: ONE shared detector per task, trained from poisoned_baseline.
-        detected_poison_idx, detected_by_class, det_metrics, detector = run_detector(
-            lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
-            benign_label, mal_label, args.detector_type, SEED,
-        )
+        # Step 7: ONE shared detector per task, trained from poisoned_baseline
+        # (or, for the --detector_type random ablation, a random forget-set --
+        # size-matched per class to the trained detector's by default).
+        if args.detector_type == "random":
+            n_flag_by_class, matched_to = None, None
+            if args.random_forget_size == "matched":
+                # Trained detector run ONLY to size the random forget-set --
+                # its flagged rows are discarded, only the counts are kept.
+                _, sizing_by_class, sizing_metrics, _ = run_detector(
+                    lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
+                    benign_label, mal_label, args.random_match_detector, SEED,
+                )
+                n_flag_by_class = {cls: len(v) for cls, v in sizing_by_class.items()}
+                matched_to = sizing_metrics["detector_type"]  # actual type (xgboost may fall back)
+            detected_poison_idx, detected_by_class, det_metrics, detector = run_random_detector(
+                X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal, benign_label, mal_label, SEED,
+                n_flag_by_class=n_flag_by_class, matched_to=matched_to,
+            )
+        else:
+            detected_poison_idx, detected_by_class, det_metrics, detector = run_detector(
+                lineages["poisoned_baseline"], X_train_poisoned, y_train, idx_poison_ben, idx_poison_mal,
+                benign_label, mal_label, args.detector_type, SEED,
+            )
 
         # Step 8: each fix lineage adapts on poisoned data from ITS OWN prior
         # weights first (this lineage's own "just got poisoned" state) --
@@ -962,6 +1118,35 @@ def main():
 
         task_test_splits[t] = (X_test_raw, y_test)
         task_test_gids[t] = gid_test
+
+        # Rebuttal: shared stream dump + machine-readable metrics (no effect on
+        # training -- everything below only reads state).
+        if stream is not None:
+            stream.save_task(t, {
+                "X_train_scaled": X_train_scaled, "X_train_poisoned": X_train_poisoned,
+                "y_train": y_train, "gid_train": gid_train,
+                "idx_poison_ben": idx_poison_ben, "idx_poison_mal": idx_poison_mal,
+                "detected_poison_idx": detected_poison_idx,
+                "X_test_raw": X_test_raw, "y_test": y_test, "gid_test": gid_test,
+                **rs.pack_eval_sets(historical_adv, X_test_adv, succ_pocket, norms_pocket, eps_this_task),
+            })
+        metrics_log.add_task({
+            "task": t, "U_t_size": int(len(detected_poison_idx)),
+            "U_t_by_class": {"benign": int(len(detected_by_class[benign_label])),
+                             "malicious": int(len(detected_by_class[mal_label]))},
+            "oracle_poison_size": int(len(poison_idx)),
+            "U_t_true_positives": int(len(np.intersect1d(detected_poison_idx, poison_idx))),
+            "stream_check": {
+                "sha256_U_t": rs.hash_array(detected_poison_idx),
+                "sha256_poison_ben": rs.hash_array(idx_poison_ben),
+                "sha256_poison_mal": rs.hash_array(idx_poison_mal),
+                "sha256_X_train_poisoned": rs.hash_array(X_train_poisoned),
+            },
+            "lineages": {name: rs.lineage_metrics(
+                lineages[name], t, all_clean_sets, all_test_sets_full, X_test_scaled, y_test,
+                X_test_adv, succ_pocket, benign_label, mal_label,
+                mean_results[name], pooled_results[name]) for name in LINEAGE_NAMES},
+        })
 
         # ---------------------------------------------------------------
         # Logging
@@ -1158,7 +1343,7 @@ def main():
               f"Log written to {log_path}")
 
         # Final task: PCA correctness plots.
-        if t == NUM_TASKS - 1:
+        if t == args.num_tasks - 1:
             pca_fit = PCA(n_components=2, random_state=SEED).fit(X_train_scaled)
             panels = [(name, lineages[name], X_test_scaled, y_test) for name in LINEAGE_NAMES]
             plot_correctness_grid(os.path.join(out_dir, "plots", f"task{t}_correctness.png"), pca_fit, panels)
