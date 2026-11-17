@@ -3,7 +3,7 @@ joint_cl_pipeline.py
 
 Usage:
     python joint_cl_pipeline.py --seed 42 --log_name joint_10task_run \\
-        --h5-path /mnt/processed_data/subsampled_dataset.h5
+        --h5-path ./data/subsampled_dataset.h5
 
 Joint-retraining ("oracle") counterpart to naive_cl_pipeline.py, over the
 same pooled/chronological 10-task split of subsampled_dataset.h5 /
@@ -78,7 +78,7 @@ from h5_data_loader import load_pooled_chronological_tasks
 # scripts): hyperparameters live here, not as CLI flags. Only --seed and
 # --log_name are CLI.
 # ---------------------------------------------------------------------------
-H5_DATASET_PATH = "/mnt/processed_data/subsampled_dataset.h5"
+H5_DATASET_PATH = "./data/subsampled_dataset.h5"
 
 NUM_TASKS = 10
 # task0 = 30% warm start; tasks1-9 taper 9.18% -> 6.38% of the pooled dataset.

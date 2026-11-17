@@ -3,7 +3,7 @@ madar_cl_pipeline.py
 
 Usage:
     python madar_cl_pipeline.py --seed 42 --log_name madar_10task_run \\
-        --h5-path /mnt/processed_data/subsampled_dataset.h5
+        --h5-path ./data/subsampled_dataset.h5
 
 MADAR (ER + Knowledge Distillation + Synaptic Intelligence, buffer selection via
 IsolationForest over the classifier's latent space) counterpart to naive_cl_pipeline.py
@@ -109,7 +109,7 @@ from h5_data_loader import load_pooled_chronological_tasks
 # naive_cl_pipeline.py / joint_cl_pipeline.py wherever the two share behavior,
 # so runs are directly comparable. Only --seed and --log_name are CLI.
 # ---------------------------------------------------------------------------
-H5_DATASET_PATH = "/mnt/processed_data/subsampled_dataset.h5"
+H5_DATASET_PATH = "./data/subsampled_dataset.h5"
 
 SEED = 42  # overwritten from --seed at the top of main(); module-level so
            # update_buffer_madar's IsolationForest(random_state=SEED) sees it.

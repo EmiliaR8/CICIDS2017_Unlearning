@@ -53,7 +53,7 @@ POST_FIX_RE = re.compile(
     rf"^({NAME})\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})%\s*$",
     re.MULTILINE,
 )
-CLASS_MARKER_RE = re.compile(rf"\[({NAME})\] classification report")
+CLASS_MARKER_RE = re.compile(rf"\[({NAME})\] classification report \(this task's clean test\)")
 MACRO_ROW_RE = re.compile(rf"^\s*macro avg\s+({NUM})\s+({NUM})\s+({NUM})\s+\d+\s*$", re.MULTILINE)
 # The parenthesized phrase varies by pipeline ("post-unlearning" vs "post-adaptation").
 ADV_BREAKDOWN_HEADER_RE = re.compile(
@@ -94,7 +94,12 @@ def _final_task_macro_prf1(chunk):
     out = {}
     for m in CLASS_MARKER_RE.finditer(chunk):
         name = m.group(1)
-        window = chunk[m.end():m.end() + 700]
+        # Bounded at the next "classification report" (e.g. this same lineage's
+        # adversarial-test report, added right after the clean one) so its own
+        # "macro avg" row can't be found instead of the clean-test one.
+        next_report = chunk.find("classification report", m.end())
+        window_end = next_report if next_report != -1 else m.end() + 700
+        window = chunk[m.end():window_end]
         row = MACRO_ROW_RE.search(window)
         if row:
             out[name] = tuple(float(x) for x in row.groups())

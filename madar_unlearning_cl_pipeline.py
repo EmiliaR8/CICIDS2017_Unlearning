@@ -3,7 +3,7 @@ madar_unlearning_cl_pipeline.py
 
 Usage:
     python madar_unlearning_cl_pipeline.py --seed 42 --log_name madar_unlearn_10task_run \\
-        --h5-path /mnt/processed_data/subsampled_dataset.h5
+        --h5-path ./data/subsampled_dataset.h5
 
 MADAR+Unlearning: adds a targeted-forgetting phase after each CL task's regular
 MADAR training, per the project's phasing plan (naive -> joint -> MADAR ->
@@ -20,7 +20,7 @@ madar_cl_pipeline.py's foundation rather than a fix-up of either -- several
 decisions below deliberately diverge from both, spelled out here so they're easy
 to correct rather than silently baked in.
 
-BRANCH NOTE (claude/oracle-unlearn-sample-tracking): main's version of this
+BRANCH NOTE (oracle-unlearn-sample-tracking variant): the default version of this
 file uses detect_poison_if_latent (phi1, iteration 1). This branch swaps
 detection back to detect_poison_oracle (Df_t = poison_idx exactly) to
 isolate a still-open question -- does the unlearning MECHANISM (steps
@@ -259,7 +259,7 @@ from h5_data_loader import load_pooled_chronological_tasks
 # value to madar_cl_pipeline.py wherever shared, so runs are directly
 # comparable. Only --seed and --log_name are CLI.
 # ---------------------------------------------------------------------------
-H5_DATASET_PATH = "/mnt/processed_data/subsampled_dataset.h5"
+H5_DATASET_PATH = "./data/subsampled_dataset.h5"
 
 SEED = 42  # overwritten from --seed at the top of main(); module-level so
            # update_buffer_madar's IsolationForest(random_state=SEED) sees it.

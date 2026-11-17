@@ -31,6 +31,7 @@ same log files -- only --lineage changes:
   Synaptic Intelligence        --> madar_pocket_pipeline_si_agem.py logs,     --lineage si
   A-GEM                        --> madar_pocket_pipeline_si_agem.py logs,     --lineage agem
   DEDUCE                       --> madar_pocket_pipeline_deduce.py logs,      --lineage deduce
+  SSF                          --> madar_pocket_pipeline_ssf.py logs,         --lineage ssf
   MADAR                        --> madar_pocket_pipeline.py logs,             --lineage poisoned_baseline
   MADAR + Unlearning (Dropped Rows)  --> madar_pocket_pipeline.py logs,       --lineage dropped_rows
   MADAR + Unlearning (Amnesiac)      --> madar_pocket_pipeline.py logs,       --lineage amnesiac
@@ -51,9 +52,9 @@ method per run, so it prints each method's row body only; add the
 USAGE
 ===========================================================================
   python build_latex_tables.py \\
-      --logs /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline/logs/pipeline_log.txt \\
-             /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline1/logs/pipeline_log.txt \\
-             /mnt/erivas6/runs/madar_pocket_pipeline/0908_piplai_pipeline2/logs/pipeline_log.txt \\
+      --logs runs/madar_pocket_pipeline/l2u_s130/logs/pipeline_log.txt \\
+             runs/madar_pocket_pipeline/l2u_s131/logs/pipeline_log.txt \\
+             runs/madar_pocket_pipeline/l2u_s132/logs/pipeline_log.txt \\
       --seeds 130 131 132 \\
       --lineage poisoned_baseline \\
       --method-name "MADAR"

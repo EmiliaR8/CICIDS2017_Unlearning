@@ -11,7 +11,7 @@ mechanic. What actually changes:
   1. DATA: TinyImageNet-200 images (tinyimagenet_data_loader.py) instead of
      CICIDS network-flow feature vectors. Class-incremental task schedule
      ("<task0>+<step>x<n_increments>", ported from the sister project
-     EmiliaR8/Meta-Unlearning's core/tasks.py -- see that repo's
+     (the authors' prior codebase (anonymized for review)) core/tasks.py -- see that codebase's
      core/data/{base,tinyimagenet}.py for the non-poisoned original this
      pipeline's data loading is adapted from) REPLACES the chronological
      timestamp-shard split. Default "20+20x9": 10 tasks, 20 NEW classes
@@ -123,8 +123,8 @@ from tinyimagenet_data_loader import (
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DATA_ROOT = "/home/erivas6"
-RUNS_BASE_DIR = "/home/erivas6/imagenet_runs"
+DATA_ROOT = "./data"
+RUNS_BASE_DIR = "./imagenet_runs"
 
 IMAGE_SHAPE = (3, 64, 64)
 
